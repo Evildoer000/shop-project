@@ -1,0 +1,172 @@
+x-backend-env: &backend-env
+  APP_ENV: docker
+  DATABASE_URL: postgresql+psycopg://rag:rag@postgres:5432/ecommerce_rag
+  MILVUS_URI: http://milvus:19530
+  MILVUS_TOKEN: ${MILVUS_TOKEN:-}
+  MILVUS_COLLECTION: ${MILVUS_COLLECTION:-product_chunks}
+  TEXT_MILVUS_COLLECTION: ${TEXT_MILVUS_COLLECTION:-product_chunks}
+  IMAGE_MILVUS_COLLECTION: ${IMAGE_MILVUS_COLLECTION:-product_image_chunks}
+  ORGANIZER_DATASET_DIR: /data/ecommerce_agent_dataset
+  LLM_API_KEY: ${LLM_API_KEY:-}
+  LLM_BASE_URL: ${LLM_BASE_URL:-}
+  LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
+  LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-30}
+  LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
+  LLM_RETRY_BACKOFF_SECONDS: ${LLM_RETRY_BACKOFF_SECONDS:-0.8}
+  LLM_THINKING_TYPE: ${LLM_THINKING_TYPE:-disabled}
+  EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+  EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+  EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+  EMBEDDING_TIMEOUT_SECONDS: ${EMBEDDING_TIMEOUT_SECONDS:-30}
+  DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+  IMAGE_EMBEDDING_BACKEND: ${IMAGE_EMBEDDING_BACKEND:-dashscope}
+  IMAGE_EMBEDDING_API_KEY: ${IMAGE_EMBEDDING_API_KEY:-}
+  IMAGE_EMBEDDING_MODEL: ${IMAGE_EMBEDDING_MODEL:-tongyi-embedding-vision-flash-2026-03-06}
+  CLIP_MODEL_NAME: ${CLIP_MODEL_NAME:-ViT-B-16}
+  CLIP_DEVICE: ${CLIP_DEVICE:-auto}
+  IMAGE_EMBEDDING_DIM: ${IMAGE_EMBEDDING_DIM:-768}
+  IMAGE_RELEVANCE_THRESHOLD: ${IMAGE_RELEVANCE_THRESHOLD:-0.20}
+  VLM_API_KEY: ${VLM_API_KEY:-}
+  VLM_BASE_URL: ${VLM_BASE_URL:-https://ark.cn-beijing.volces.com/api/v3}
+  VLM_MODEL: ${VLM_MODEL:-ep-20260617162507-dxgg2}
+  VLM_TIMEOUT_SECONDS: ${VLM_TIMEOUT_SECONDS:-10}
+  VLM_MAX_RETRIES: ${VLM_MAX_RETRIES:-0}
+  EVIDENCE_CACHE_TTL_SECONDS: ${EVIDENCE_CACHE_TTL_SECONDS:-3600}
+  EVIDENCE_CACHE_RECENT_TURNS: ${EVIDENCE_CACHE_RECENT_TURNS:-20}
+  EVIDENCE_CACHE_MAX_CANDIDATES_PER_TURN: ${EVIDENCE_CACHE_MAX_CANDIDATES_PER_TURN:-20}
+  RERANK_BACKEND: ${RERANK_BACKEND:-hybrid}
+  RERANK_API_KEY: ${RERANK_API_KEY:-}
+  RERANK_BASE_URL: ${RERANK_BASE_URL:-}
+  RERANK_MODEL: ${RERANK_MODEL:-}
+  RERANK_TIMEOUT_SECONDS: ${RERANK_TIMEOUT_SECONDS:-30}
+  ENABLE_TRAJECTORY_LOG: ${ENABLE_TRAJECTORY_LOG:-true}
+  TRAJECTORY_LOG_PATH: /app/logs/multihop_trajectories.jsonl
+  LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+  LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+  LANGFUSE_HOST: ${LANGFUSE_HOST:-}
+  BOOTSTRAP_WAIT_SECONDS: ${BOOTSTRAP_WAIT_SECONDS:-180}
+  BOOTSTRAP_FORCE_REINDEX: ${BOOTSTRAP_FORCE_REINDEX:-false}
+  BOOTSTRAP_FORCE_IMAGE_REINDEX: ${BOOTSTRAP_FORCE_IMAGE_REINDEX:-false}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ecommerce-rag-postgres
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag
+      POSTGRES_DB: ecommerce_rag
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d ecommerce_rag"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.18
+    container_name: ecommerce-rag-etcd
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    volumes:
+      - etcd_data:/etcd
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: ecommerce-rag-minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: minio server /minio_data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/minio_data
+
+  milvus:
+    image: milvusdb/milvus:v2.5.12
+    container_name: ecommerce-rag-milvus
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: minioadmin
+      MINIO_SECRET_ACCESS_KEY: minioadmin
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      - etcd
+      - minio
+    volumes:
+      - milvus_data:/var/lib/milvus
+
+  backend-bootstrap:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: ecommerce-rag-backend-bootstrap
+    command: ["python", "scripts/docker_bootstrap.py"]
+    environment:
+      <<: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      etcd:
+        condition: service_started
+      minio:
+        condition: service_started
+      milvus:
+        condition: service_started
+    volumes:
+      - ./ecommerce_agent_dataset:/data/ecommerce_agent_dataset:ro
+      - backend_logs:/app/logs
+      - backend_uploads:/data/uploads
+    restart: "no"
+
+  backend:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: ecommerce-rag-backend
+    environment:
+      <<: *backend-env
+    ports:
+      - "8000:8000"
+    depends_on:
+      backend-bootstrap:
+        condition: service_completed_successfully
+    volumes:
+      - ./ecommerce_agent_dataset:/data/ecommerce_agent_dataset:ro
+      - backend_logs:/app/logs
+      - backend_uploads:/data/uploads
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  postgres_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
+  backend_logs:
+  backend_uploads:

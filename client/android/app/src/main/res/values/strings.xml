@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">智购助手</string>
+    <string name="chat_input_hint">告诉我你想买什么…</string>
+    <string name="chat_send">发送</string>
+    <string name="chat_clear">新会话</string>
+    <string name="trace_panel_title">决策过程</string>
+    <string name="trace_panel_show">查看决策过程</string>
+    <string name="trace_panel_hide">收起决策过程</string>
+    <string name="trace_section_understanding">需求理解</string>
+    <string name="trace_section_memory">使用到的用户记忆</string>
+    <string name="trace_section_filters">过滤条件</string>
+    <string name="trace_section_retrieval">检索摘要</string>
+    <string name="trace_section_rerank">重排因子</string>
+    <string name="trace_section_reason">最终依据</string>
+    <string name="product_detail_title">商品详情</string>
+    <string name="product_detail_price">价格</string>
+    <string name="product_detail_rating">评分</string>
+    <string name="product_detail_brand">品牌</string>
+    <string name="product_detail_category">类目</string>
+    <string name="product_detail_tags">标签</string>
+    <string name="product_detail_description">描述</string>
+    <string name="product_detail_review">用户评价摘要</string>
+    <string name="product_detail_suitable">适用人群</string>
+    <string name="product_detail_avoid">不适用</string>
+    <string name="product_detail_ingredients">成分/材质</string>
+    <string name="product_detail_loading">正在加载商品详情…</string>
+    <string name="product_detail_error">商品详情加载失败</string>
+    <string name="product_detail_retry">重试</string>
+    <string name="streaming_indicator">回答生成中…</string>
+    <string name="error_generic">出错了，请稍后再试</string>
+    <string name="empty_chat_hint">输入一句话开始购物，例如“预算 150 元以内，推荐一款夏天清爽的防晒”</string>
+    <string name="cd_back">返回</string>
+    <string name="cd_product_image">商品图片</string>
+</resources>

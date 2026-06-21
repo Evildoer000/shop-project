@@ -1,0 +1,10 @@
+# Copy to local.properties and adjust to match your environment.
+# DO NOT commit local.properties — it is in .gitignore.
+
+# Path to the Android SDK on your machine
+sdk.dir=
+
+# Optional: override the default backend URL (defaults to http://10.0.2.2:8000/
+# for the Android emulator). For a real device on the same LAN, point it at
+# your dev machine's LAN IP.
+#API_BASE_URL=http://192.168.31.100:8000/

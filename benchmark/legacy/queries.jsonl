@@ -1,0 +1,4 @@
+{"query":"我是油皮，预算150以内，推荐一款夏天用不闷的防晒","expected_categories":["防晒"],"must_constraints":{"price_max":150},"exclude":[]}
+{"query":"下周去三亚玩，帮我配一套防晒和晒后修复，预算300，不要酒精味重的","expected_categories":["防晒","晒后修复"],"must_constraints":{"price_max":300},"exclude":["酒精味重"]}
+{"query":"推荐一副通勤用的降噪蓝牙耳机，预算500以内","expected_categories":["蓝牙耳机"],"must_constraints":{"price_max":500},"exclude":[]}
+
