@@ -20,19 +20,30 @@ class EmbeddingClient:
     _clip_model = None
     _clip_preprocess = None
     _clip_device = "cpu"
+    _text_remote_disabled = False
+    _text_remote_warning_printed = False
 
     def __init__(self) -> None:
         self.settings = get_settings()
 
     def embed(self, text: str) -> list[float]:
-        if not self._is_configured():
+        if not self._is_configured() or self.__class__._text_remote_disabled:
             return self._hash_embedding(text)
+        last_error: Exception | None = None
         for attempt in range(2):
             try:
                 return self._remote_embedding(text)
-            except Exception:
+            except Exception as exc:
+                last_error = exc
                 if attempt == 0:
                     continue
+        self.__class__._text_remote_disabled = True
+        if not self.__class__._text_remote_warning_printed:
+            print(
+                f"Remote text embedding failed; using hash embeddings for this process: {last_error}",
+                flush=True,
+            )
+            self.__class__._text_remote_warning_printed = True
         return self._hash_embedding(text)
 
     def embed_image(self, image_path: str | Path) -> list[float]:

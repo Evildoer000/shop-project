@@ -5,7 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import DateTime, Float, Index, Integer, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import DateTime, Float, Index, Integer, Numeric, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -23,7 +23,7 @@ class Product(Base):
     sub_category: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
     brand: Mapped[str] = mapped_column(String(128), nullable=False)
     price: Mapped[Decimal] = mapped_column(Numeric(10, 2), index=True, nullable=False)
-    stock: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stock: Mapped[int | None] = mapped_column(Integer, default=1, server_default=text("1"), nullable=True)
     image_url: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     specs: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
@@ -53,6 +53,17 @@ class Product(Base):
             f"{self.suitable_for} {self.avoid_for} {tags} {self.review_summary} "
             f"{self.image_caption} {attrs}"
         )
+
+
+class AppUser(Base):
+    __tablename__ = "app_users"
+    __table_args__ = (UniqueConstraint("phone", name="uq_app_users_phone"),)
+
+    user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    phone: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    display_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class UserMemory(Base):
@@ -109,6 +120,53 @@ class SessionMemoryState(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+
+class AgentRun(Base):
+    __tablename__ = "agent_runs"
+
+    run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    session_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    turn_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    query_summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    route: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    plan_type: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="running", nullable=False)
+    total_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    first_token_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    product_ids: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    evaluation_summary: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class AgentRunSpan(Base):
+    __tablename__ = "agent_run_spans"
+    __table_args__ = (
+        Index("ix_agent_run_spans_run", "run_id"),
+        Index("ix_agent_run_spans_name", "name"),
+    )
+
+    span_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(96), nullable=False)
+    label: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    agent: Mapped[str] = mapped_column(String(96), default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="running", nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    input_summary: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    output_summary: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    metrics: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    error_type: Mapped[str] = mapped_column(String(96), default="", nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class UserEvent(Base):

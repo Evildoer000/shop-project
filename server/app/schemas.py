@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 
@@ -24,6 +25,18 @@ class ImageUploadResponse(BaseModel):
     image_id: str
     image_url: str
     bytes: int
+
+
+class LoginRequest(BaseModel):
+    phone: str = Field(min_length=5, max_length=32)
+    password: str = Field(min_length=1, max_length=64)
+
+
+class LoginResponse(BaseModel):
+    ok: bool = True
+    user_id: str
+    phone: str
+    display_name: str
 
 
 class EventReportRequest(BaseModel):
@@ -235,6 +248,58 @@ class RecommendationResponse(BaseModel):
     products: list[RecommendationCard] = Field(default_factory=list)
     stage: str = "cold"
     total_events: int = 0
+
+
+class ProductSubCategorySummary(BaseModel):
+    name: str
+    count: int = 0
+
+
+class ProductCategorySummary(BaseModel):
+    name: str
+    count: int = 0
+    sub_categories: list[ProductSubCategorySummary] = Field(default_factory=list)
+
+
+class ProductCategoriesResponse(BaseModel):
+    categories: list[ProductCategorySummary] = Field(default_factory=list)
+
+
+class ProductCatalogResponse(BaseModel):
+    products: list[RecommendationCard] = Field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    page_size: int = 24
+
+
+class ChatSessionSummary(BaseModel):
+    session_id: str
+    title: str
+    last_message: str
+    turn_count: int
+    updated_at: datetime | None = None
+
+
+class ChatSessionListResponse(BaseModel):
+    sessions: list[ChatSessionSummary] = Field(default_factory=list)
+
+
+class ChatSessionTurn(BaseModel):
+    turn_id: int
+    user_message: str
+    assistant_message: str
+    route: str = ""
+    product_ids: list[str] = Field(default_factory=list)
+    products: list[RecommendationCard] = Field(default_factory=list)
+    rewrite_summary: dict = Field(default_factory=dict)
+    trace_summary: dict = Field(default_factory=dict)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class ChatSessionDetailResponse(BaseModel):
+    session_id: str
+    turns: list[ChatSessionTurn] = Field(default_factory=list)
 
 
 class DecisionTrace(BaseModel):

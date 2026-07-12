@@ -88,6 +88,7 @@ class EcommerceOrchestrator:
         self.harness = HarnessRuntime.from_settings()
         self.budget_manager = self.harness.budget_manager
         self.trace_recorder = self.harness.trace_recorder
+        self.span_recorder = self.harness.span_recorder
         self.tool_registry = self.harness.tool_registry
         self.evidence_cache = self.harness.evidence_cache
         self.tool_registry.register(
@@ -109,13 +110,19 @@ class EcommerceOrchestrator:
         self.langfuse_tracer = LangfuseTracer()
 
     async def stream(self, request: ChatStreamRequest) -> AsyncGenerator[dict, None]:
+        task = self._new_task(request)
         normalized_input = self.input_processor.normalize(request)
         query = normalized_input.text
         image_path = normalized_input.image_path
         image_attributes = ImageAttributes()
         image_attributes_task: asyncio.Task[ImageAttributes] | None = None
         image_fast_path = image_path is not None and not query
-        task = self._new_task(request)
+        self.span_recorder.start_run(
+            user_id=request.user_id,
+            session_id=request.session_id,
+            turn_id=task.turn_id,
+            query_summary=query or request.message or ("图片检索" if request.image_id else ""),
+        )
         answer_parts: list[str] = []
         product_ids: list[str] = []
         profile_narrative = ""
@@ -131,14 +138,41 @@ class EcommerceOrchestrator:
             session_id=request.session_id,
             metadata={"endpoint": "chat_stream"},
         )
-        task.add_step("input", "succeeded", output_summary={"normalized_query": query, "image_path_resolved": bool(image_path)})
+        input_span = self.span_recorder.start_span(
+            "input_normalize",
+            label="输入标准化",
+            agent="InputProcessor",
+            input_summary={"has_image_id": bool(request.image_id), "message_length": len(request.message or "")},
+        )
+        input_payload = {"normalized_query": query, "image_path_resolved": bool(image_path)}
+        input_timing = self._finish_span(input_span, output_summary=input_payload)
+        task.add_step("input", "succeeded", output_summary=input_payload)
         await trace_run.span("input", output_payload={"normalized_query": query, "image_path_resolved": bool(image_path)})
+        yield self._timing_event(input_timing)
         yield self._trace_event("input", "已标准化用户输入")
         await asyncio.sleep(0.01)
 
+        context_span = self.span_recorder.start_span(
+            "memory_context_load",
+            label="读取会话与长期记忆",
+            agent="MemoryManager",
+            input_summary={"user_id": request.user_id, "session_id": request.session_id},
+        )
         conversation_context = self.memory_manager.build_context(request.user_id, request.session_id)
         profile_narrative = conversation_context.long_term_narrative
+        context_payload = conversation_context.trace_payload()
+        context_timing = self._finish_span(
+            context_span,
+            output_summary=context_payload,
+            metrics={
+                "recent_turns": len(conversation_context.recent_turns),
+                "pending_summary_turns": len(conversation_context.pending_summary_turns),
+                "long_term_memory_items": len(conversation_context.long_term_profile),
+                "has_session_summary": bool(conversation_context.session_summary),
+            },
+        )
         await trace_run.span("context_assembler", output_payload=conversation_context.trace_payload())
+        yield self._timing_event(context_timing)
 
         if request.image_id and image_path is None:
             async for event in self._stream_missing_image(
@@ -158,7 +192,24 @@ class EcommerceOrchestrator:
         elif image_path is not None:
             for chunk in self._visible_text_chunks("我先识别图片里的商品类型、颜色和风格。"):
                 yield self._agent_update(stage="planner", title="理解图片", content_delta=chunk, done=False)
+            image_span = self.span_recorder.start_span(
+                "image_attribute_extraction",
+                label="图片属性理解",
+                agent="ImageAttributeExtractor",
+                input_summary={"has_query": bool(query), "image_path_resolved": bool(image_path)},
+            )
             image_attributes = await self._extract_image_attributes(image_path, query, trace_run, task)
+            yield self._timing_event(
+                self._finish_span(
+                    image_span,
+                    output_summary=self._image_attribute_trace_payload(image_attributes),
+                    metrics={
+                        "available": image_attributes.available,
+                        "confidence": image_attributes.confidence,
+                        "category_guess": image_attributes.category_guess,
+                    },
+                )
+            )
             for chunk in self._visible_text_chunks(self._image_attribute_update_text(image_attributes)):
                 yield self._agent_update(stage="planner", title="理解图片", content_delta=chunk, done=False)
             yield self._trace_event(
@@ -168,11 +219,34 @@ class EcommerceOrchestrator:
             )
 
         if image_fast_path:
+            planner_span = self.span_recorder.start_span(
+                "intent_planning",
+                label="图片快路径计划生成",
+                agent="Orchestrator",
+                input_summary={"image_only": True},
+            )
             intent_plan = self._image_only_intent_plan(None)
+            yield self._timing_event(
+                self._finish_span(
+                    planner_span,
+                    output_summary=intent_plan.model_dump(),
+                    metrics=self._planner_rule_metrics(intent_plan),
+                )
+            )
         else:
             self.budget_manager.record_planner_call(task)
             try:
                 intent_plan = None
+                planner_span = self.span_recorder.start_span(
+                    "intent_planning",
+                    label="意图识别与计划生成",
+                    agent="IntentPlanner",
+                    input_summary={
+                        "query_length": len(query),
+                        "has_image_attributes": image_path is not None,
+                        "recent_turns": len(conversation_context.recent_turns),
+                    },
+                )
                 planner_context = self._planner_context(
                     conversation_context,
                     request.session_id,
@@ -210,7 +284,23 @@ class EcommerceOrchestrator:
                         data=None,
                         content="",
                     )
+                yield self._timing_event(
+                    self._finish_span(
+                        planner_span,
+                        output_summary=intent_plan.model_dump(),
+                        metrics=self._planner_rule_metrics(intent_plan),
+                    )
+                )
             except StructuredLlmValidationError as exc:
+                if "planner_span" in locals():
+                    yield self._timing_event(
+                        self._finish_span(
+                            planner_span,
+                            status="failed",
+                            error_type="StructuredLlmValidationError",
+                            error_message=str(exc),
+                        )
+                    )
                 async for event in self._stream_planner_failure(
                     request=request,
                     query=query,
@@ -248,11 +338,28 @@ class EcommerceOrchestrator:
 
         if intent_plan.profile_lookup.requested:
             decision = self.decide_profile_lookup(task, intent_plan)
+            profile_span = self.span_recorder.start_span(
+                "profile_lookup",
+                label="读取长期画像",
+                agent="ProfileLookupTool",
+                input_summary={
+                    "query": intent_plan.profile_lookup.query or query,
+                    "requested": intent_plan.profile_lookup.requested,
+                    "approved": decision.approved,
+                },
+            )
             profile_memory = self.profile_lookup_tool.lookup(
                 request.user_id,
                 intent_plan.profile_lookup.query or query,
             )
             self.budget_manager.record_tool_call(task)
+            yield self._timing_event(
+                self._finish_span(
+                    profile_span,
+                    output_summary={"profile_memory_found": bool(profile_memory)},
+                    metrics={"approved": decision.approved, "memory_length": len(profile_memory or "")},
+                )
+            )
             await trace_run.span(
                 "profile_lookup",
                 input_payload={
@@ -275,6 +382,12 @@ class EcommerceOrchestrator:
             profile_narrative = self._merge_profile_narrative(profile_narrative, profile_memory)
             if profile_memory and self.budget_manager.can_call_planner(task):
                 self.budget_manager.record_planner_call(task)
+                refine_span = self.span_recorder.start_span(
+                    "intent_planning_profile_refine",
+                    label="画像增强后重新规划",
+                    agent="IntentPlanner",
+                    input_summary={"profile_memory_found": bool(profile_memory), "query_length": len(query)},
+                )
                 intent_plan = await self.intent_planner.plan(
                     query,
                     self._planner_context(
@@ -286,6 +399,13 @@ class EcommerceOrchestrator:
                     ),
                 )
                 self._update_planner_proposal(task, intent_plan)
+                yield self._timing_event(
+                    self._finish_span(
+                        refine_span,
+                        output_summary=intent_plan.model_dump(),
+                        metrics=self._planner_rule_metrics(intent_plan),
+                    )
+                )
                 await trace_run.span(
                     "intent_planning_profile_refine",
                     input_payload={"query": query, "profile_memory": profile_memory},
@@ -344,6 +464,12 @@ class EcommerceOrchestrator:
                 ]
                 if context_cards:
                     yield {"type": "product_cards", "products": [card.model_dump() for card in context_cards]}
+                answer_span = self.span_recorder.start_span(
+                    "answer_generation",
+                    label="生成最终回答",
+                    agent="AnswerGenerator",
+                    input_summary={"route": "direct_answer", "product_count": len(context_cards)},
+                )
                 async for token in self.answer_generator.stream_direct_text(
                     query,
                     "direct",
@@ -355,8 +481,16 @@ class EcommerceOrchestrator:
                     },
                     profile_narrative=profile_narrative,
                 ):
+                    self.span_recorder.mark_first_token()
                     answer_parts.append(token)
                     yield {"type": "token", "content": token}
+                yield self._timing_event(
+                    self._finish_span(
+                        answer_span,
+                        output_summary={"answer_length": len("".join(answer_parts))},
+                        metrics={"first_token_latency_ms": self.span_recorder.first_token_latency_ms},
+                    )
+                )
                 product_ids = loaded_ids
                 self._schedule_memory_update(
                     request=request,
@@ -374,6 +508,12 @@ class EcommerceOrchestrator:
                         products=self._products_brief_from_products(referenced_products),
                     ),
                     metadata=self._trace_metadata(),
+                )
+                yield self._finish_monitoring_event(
+                    route="direct_answer",
+                    intent_plan=intent_plan,
+                    trace=trace,
+                    product_ids=product_ids,
                 )
                 yield {"type": "done"}
                 return
@@ -399,6 +539,12 @@ class EcommerceOrchestrator:
             )
             self._finish_trace(trace, task, route=route)
             yield self._decision_trace_event(trace)
+            answer_span = self.span_recorder.start_span(
+                "answer_generation",
+                label="生成澄清/直接回答",
+                agent="AnswerGenerator",
+                input_summary={"route": route, "mode": mode},
+            )
             async for token in self.answer_generator.stream_direct_text(
                 query,
                 mode,
@@ -406,8 +552,16 @@ class EcommerceOrchestrator:
                 intent_plan,
                 profile_narrative=profile_narrative,
             ):
+                self.span_recorder.mark_first_token()
                 answer_parts.append(token)
                 yield {"type": "token", "content": token}
+            yield self._timing_event(
+                self._finish_span(
+                    answer_span,
+                    output_summary={"answer_length": len("".join(answer_parts))},
+                    metrics={"first_token_latency_ms": self.span_recorder.first_token_latency_ms},
+                )
+            )
             self._schedule_memory_update(
                 request=request,
                 query=query,
@@ -421,10 +575,34 @@ class EcommerceOrchestrator:
                 output_payload=self._trace_output(route=route, reason=reason),
                 metadata=self._trace_metadata(),
             )
+            yield self._finish_monitoring_event(
+                route=route,
+                intent_plan=intent_plan,
+                trace=trace,
+                product_ids=[],
+            )
             yield {"type": "done"}
             return
 
+        retrieval_plan_span = self.span_recorder.start_span(
+            "retrieval_plan_builder",
+            label="构建检索参数",
+            agent="RetrievalPlanBuilder",
+            input_summary={"plan_type": intent_plan.plan_type, "need_slot_count": len(intent_plan.need_slots)},
+        )
         plan = self._retrieval_plan_builder().plan(intent_plan)
+        yield self._timing_event(
+            self._finish_span(
+                retrieval_plan_span,
+                output_summary=plan.model_dump(),
+                metrics={
+                    "use_vector": plan.retrieval_strategy.use_vector,
+                    "use_keyword": plan.retrieval_strategy.use_keyword,
+                    "candidate_limit": plan.retrieval_strategy.candidate_limit,
+                    "final_top_k": plan.retrieval_strategy.final_top_k,
+                },
+            )
+        )
         if intent_plan.plan_type == "image_retrieval" and image_path is not None:
             async for event in self._stream_image_retrieval(
                 request=request,
@@ -488,7 +666,25 @@ class EcommerceOrchestrator:
             done=False,
         )
         await asyncio.sleep(0.01)
+        retrieval_span = self.span_recorder.start_span(
+            "single_retrieval_worker_execution",
+            label="单需求商品召回",
+            agent="RetrievalWorker",
+            input_summary={"plan_type": intent_plan.plan_type, "query": query[:120]},
+        )
         evidence = self.retrieval_worker.run_single_initial(query, intent_plan, plan)
+        yield self._timing_event(
+            self._finish_span(
+                retrieval_span,
+                output_summary=evidence.summary(intent_plan, plan),
+                metrics={
+                    "recall_count": evidence.after_rerank,
+                    "tool_call_count": evidence.tool_call_count,
+                    "vector_score_count": len(evidence.vector_scores),
+                    "keyword_score_count": len(evidence.keyword_scores),
+                },
+            )
+        )
         self.budget_manager.record_tool_call(task, evidence.tool_call_count)
         yield self._trace_event(
             "single_retrieval_worker_execution",
@@ -511,6 +707,12 @@ class EcommerceOrchestrator:
             done=False,
         )
         await asyncio.sleep(0.01)
+        corrective_span = self.span_recorder.start_span(
+            "corrective_reflection",
+            label="证据校验",
+            agent="CorrectiveAgent",
+            input_summary={"candidate_count": len(evidence.ranked), "route_before": task.execution_path},
+        )
         reflection = await self.corrective_agent.review(
             query,
             intent_plan,
@@ -518,6 +720,13 @@ class EcommerceOrchestrator:
             evidence.ranked,
             evidence.vector_scores,
             evidence.keyword_scores,
+        )
+        yield self._timing_event(
+            self._finish_span(
+                corrective_span,
+                output_summary=reflection.model_dump(),
+                metrics=self._corrective_rule_metrics(reflection, len(evidence.ranked)),
+            )
         )
         yield self._trace_event(
             "corrective_reflection",
@@ -534,6 +743,12 @@ class EcommerceOrchestrator:
             if not repair_decision.approved:
                 break
             self.budget_manager.record_repair_attempt(task)
+            repair_plan_span = self.span_recorder.start_span(
+                "repair_plan_generated",
+                label="生成修复检索计划",
+                agent="RepairAgent",
+                input_summary={"trigger": trigger, "repair_attempt": task.budget.repair_attempt_count},
+            )
             repair_plan = await self._run_repair_agent(
                 original_query=query,
                 intent_plan=intent_plan,
@@ -543,6 +758,13 @@ class EcommerceOrchestrator:
                 reflection_result=reflection,
                 previous_candidates=self._single_previous_candidates(evidence.ranked),
             )
+            yield self._timing_event(
+                self._finish_span(
+                    repair_plan_span,
+                    output_summary=repair_plan.summary() if repair_plan else {},
+                    metrics={"has_repair_queries": bool(repair_plan and any(repair_plan.queries_by_slot.values()))},
+                )
+            )
             if not repair_plan or not any(repair_plan.queries_by_slot.values()):
                 break
             repair_plans.append(repair_plan)
@@ -551,7 +773,20 @@ class EcommerceOrchestrator:
                 "RepairAgent 已生成被批准的 RepairPlan",
                 repair_plan=repair_plan.summary(),
             )
+            repair_search_span = self.span_recorder.start_span(
+                "repair_search_executed",
+                label="执行修复召回",
+                agent="RetrievalWorker",
+                input_summary=repair_plan.summary(),
+            )
             repair_evidence = self.retrieval_worker.run_single_repair(query, intent_plan, plan, repair_plan)
+            yield self._timing_event(
+                self._finish_span(
+                    repair_search_span,
+                    output_summary=repair_evidence.summary(intent_plan, plan),
+                    metrics={"recall_count": repair_evidence.after_rerank, "tool_call_count": repair_evidence.tool_call_count},
+                )
+            )
             repair_evidences.append(repair_evidence)
             self.budget_manager.record_tool_call(task, repair_evidence.tool_call_count)
             yield self._trace_event(
@@ -563,6 +798,12 @@ class EcommerceOrchestrator:
             merged_vector_scores = self._merge_score_maps(evidence.vector_scores, repair_evidence.vector_scores)
             merged_keyword_scores = self._merge_score_maps(evidence.keyword_scores, repair_evidence.keyword_scores)
             self.budget_manager.record_corrective_call(task)
+            repair_corrective_span = self.span_recorder.start_span(
+                "corrective_reflection_after_repair",
+                label="修复后证据校验",
+                agent="CorrectiveAgent",
+                input_summary={"merged_candidate_count": len(merged_ranked)},
+            )
             reflection = await self.corrective_agent.review(
                 query,
                 intent_plan,
@@ -570,6 +811,13 @@ class EcommerceOrchestrator:
                 merged_ranked,
                 merged_vector_scores,
                 merged_keyword_scores,
+            )
+            yield self._timing_event(
+                self._finish_span(
+                    repair_corrective_span,
+                    output_summary=reflection.model_dump(),
+                    metrics=self._corrective_rule_metrics(reflection, len(merged_ranked)),
+                )
             )
             evidence.ranked = merged_ranked
             evidence.vector_scores = merged_vector_scores
@@ -636,7 +884,14 @@ class EcommerceOrchestrator:
                 done=False,
             )
             self.budget_manager.record_answer_call(task)
+            answer_span = self.span_recorder.start_span(
+                "answer_generation",
+                label="生成推荐回答",
+                agent="AnswerGenerator",
+                input_summary={"route": final_route, "product_count": len(final_ranked)},
+            )
             async for token in self.answer_generator.stream_text(plan, final_ranked, profile_narrative=profile_narrative):
+                self.span_recorder.mark_first_token()
                 answer_parts.append(token)
                 yield {"type": "token", "content": token}
         else:
@@ -648,6 +903,12 @@ class EcommerceOrchestrator:
                 content_delta="正在整理回复。",
                 done=False,
             )
+            answer_span = self.span_recorder.start_span(
+                "answer_generation",
+                label="生成兜底/澄清回答",
+                agent="AnswerGenerator",
+                input_summary={"route": final_route, "mode": mode, "near_miss_count": len(evidence.ranked)},
+            )
             async for token in self.answer_generator.stream_direct_text(
                 query,
                 mode,
@@ -656,8 +917,16 @@ class EcommerceOrchestrator:
                 extra_context=self._single_near_miss_context(evidence.ranked, reflection),
                 profile_narrative=profile_narrative,
             ):
+                self.span_recorder.mark_first_token()
                 answer_parts.append(token)
                 yield {"type": "token", "content": token}
+        yield self._timing_event(
+            self._finish_span(
+                answer_span,
+                output_summary={"answer_length": len("".join(answer_parts))},
+                metrics={"first_token_latency_ms": self.span_recorder.first_token_latency_ms},
+            )
+        )
 
         self._schedule_memory_update(
             request=request,
@@ -687,6 +956,12 @@ class EcommerceOrchestrator:
             ),
             metadata=self._trace_metadata(),
         )
+        yield self._finish_monitoring_event(
+            route=final_route,
+            intent_plan=intent_plan,
+            trace=trace,
+            product_ids=product_ids,
+        )
         yield {"type": "done"}
 
     async def _stream_image_retrieval(
@@ -712,11 +987,29 @@ class EcommerceOrchestrator:
             done=False,
         )
         await asyncio.sleep(0.01)
+        image_retrieval_span = self.span_recorder.start_span(
+            "image_retrieval_worker_execution",
+            label="图片相似商品召回",
+            agent="ImageRetrievalWorker",
+            input_summary={"query": query[:120], "image_path_resolved": bool(image_path)},
+        )
         evidence = self.retrieval_worker.run_image_initial(
             original_query=query,
             intent_plan=intent_plan,
             plan=plan,
             image_path=image_path,
+        )
+        yield self._timing_event(
+            self._finish_span(
+                image_retrieval_span,
+                output_summary=evidence.summary(intent_plan, plan),
+                metrics={
+                    "recall_count": evidence.after_rerank,
+                    "tool_call_count": evidence.tool_call_count,
+                    "vector_score_count": len(evidence.vector_scores),
+                    "keyword_score_count": len(evidence.keyword_scores),
+                },
+            )
         )
         self.budget_manager.record_tool_call(task, evidence.tool_call_count)
         yield self._trace_event(
@@ -771,6 +1064,12 @@ class EcommerceOrchestrator:
             done=False,
         )
         await asyncio.sleep(0.01)
+        image_corrective_span = self.span_recorder.start_span(
+            "corrective_reflection",
+            label="图片候选证据校验",
+            agent="CorrectiveAgent",
+            input_summary={"candidate_count": len(evidence.ranked), "has_image_attributes": bool(image_attributes and image_attributes.available)},
+        )
         reflection = await self.corrective_agent.review(
             query,
             intent_plan,
@@ -779,6 +1078,13 @@ class EcommerceOrchestrator:
             evidence.vector_scores,
             evidence.keyword_scores,
             image_attributes=self._image_attributes_for_prompt(image_attributes),
+        )
+        yield self._timing_event(
+            self._finish_span(
+                image_corrective_span,
+                output_summary=reflection.model_dump(),
+                metrics=self._corrective_rule_metrics(reflection, len(evidence.ranked)),
+            )
         )
         yield self._trace_event(
             "corrective_reflection",
@@ -840,12 +1146,19 @@ class EcommerceOrchestrator:
                 done=False,
             )
             self.budget_manager.record_answer_call(task)
+            answer_span = self.span_recorder.start_span(
+                "answer_generation",
+                label="生成图片推荐回答",
+                agent="AnswerGenerator",
+                input_summary={"route": final_route, "product_count": len(final_ranked)},
+            )
             async for token in self.answer_generator.stream_text(
                 plan,
                 final_ranked,
                 profile_narrative=profile_narrative,
                 image_attributes=self._image_attributes_for_prompt(image_attributes),
             ):
+                self.span_recorder.mark_first_token()
                 answer_parts.append(token)
                 yield {"type": "token", "content": token}
         else:
@@ -856,6 +1169,12 @@ class EcommerceOrchestrator:
                 title="生成回答",
                 content_delta="正在整理回复。",
                 done=False,
+            )
+            answer_span = self.span_recorder.start_span(
+                "answer_generation",
+                label="生成图片兜底/澄清回答",
+                agent="AnswerGenerator",
+                input_summary={"route": final_route, "mode": mode, "near_miss_count": len(evidence.ranked)},
             )
             async for token in self.answer_generator.stream_direct_text(
                 query,
@@ -868,8 +1187,16 @@ class EcommerceOrchestrator:
                 },
                 profile_narrative=profile_narrative,
             ):
+                self.span_recorder.mark_first_token()
                 answer_parts.append(token)
                 yield {"type": "token", "content": token}
+        yield self._timing_event(
+            self._finish_span(
+                answer_span,
+                output_summary={"answer_length": len("".join(answer_parts))},
+                metrics={"first_token_latency_ms": self.span_recorder.first_token_latency_ms},
+            )
+        )
 
         self._schedule_memory_update(
             request=request,
@@ -899,6 +1226,12 @@ class EcommerceOrchestrator:
             ),
             metadata=self._trace_metadata(),
         )
+        yield self._finish_monitoring_event(
+            route=final_route,
+            intent_plan=intent_plan,
+            trace=trace,
+            product_ids=product_ids,
+        )
         yield {"type": "done"}
 
     async def _stream_multi_need(
@@ -921,7 +1254,25 @@ class EcommerceOrchestrator:
             done=False,
         )
         await asyncio.sleep(0.01)
+        multi_retrieval_span = self.span_recorder.start_span(
+            "multi_need_retrieval",
+            label="多需求分槽召回",
+            agent="RetrievalWorker",
+            input_summary={"slot_count": len(slots), "plan_type": intent_plan.plan_type},
+        )
         state = await self.retrieval_worker.run_multi_initial(query, intent_plan, plan, slots)
+        yield self._timing_event(
+            self._finish_span(
+                multi_retrieval_span,
+                output_summary=self._multi_need_trace(state),
+                metrics={
+                    "slot_count": len(state.slots),
+                    "search_calls": int(state.budgets.get("search_calls", 0)),
+                    "tool_call_count": len(state.tool_calls),
+                    "candidate_count": sum(len(items) for items in state.candidates_by_slot.values()),
+                },
+            )
+        )
         self.budget_manager.record_tool_call(task, int(state.budgets.get("search_calls", 0)))
         await trace_run.span("multi_need_retrieval", output_payload=self._multi_need_trace(state))
         yield self._trace_event(
@@ -944,7 +1295,26 @@ class EcommerceOrchestrator:
             done=False,
         )
         await asyncio.sleep(0.01)
+        multi_corrective_span = self.span_recorder.start_span(
+            "corrective_reflection",
+            label="多需求证据校验",
+            agent="CorrectiveAgent",
+            input_summary={
+                "slot_count": len(state.slots),
+                "candidate_count": sum(len(items) for items in state.candidates_by_slot.values()),
+            },
+        )
         reflection = await self.corrective_agent.review_slots(query, intent_plan, plan, state)
+        yield self._timing_event(
+            self._finish_span(
+                multi_corrective_span,
+                output_summary=reflection.model_dump(),
+                metrics=self._corrective_rule_metrics(
+                    reflection,
+                    sum(len(items) for items in state.candidates_by_slot.values()),
+                ),
+            )
+        )
         await trace_run.span("corrective_reflection", output_payload=reflection.model_dump())
         yield self._trace_event(
             "corrective_reflection",
@@ -960,6 +1330,12 @@ class EcommerceOrchestrator:
             if not repair_decision.approved:
                 break
             self.budget_manager.record_repair_attempt(task)
+            repair_plan_span = self.span_recorder.start_span(
+                "repair_plan_generated",
+                label="生成多需求修复计划",
+                agent="RepairAgent",
+                input_summary={"trigger": trigger, "repair_attempt": task.budget.repair_attempt_count},
+            )
             repair_plan = await self._run_repair_agent(
                 original_query=query,
                 intent_plan=intent_plan,
@@ -968,6 +1344,13 @@ class EcommerceOrchestrator:
                 trigger=trigger,
                 reflection_result=reflection,
                 previous_candidates=self._multi_previous_candidates(state),
+            )
+            yield self._timing_event(
+                self._finish_span(
+                    repair_plan_span,
+                    output_summary=repair_plan.summary() if repair_plan else {},
+                    metrics={"has_repair_queries": bool(repair_plan and any(repair_plan.queries_by_slot.values()))},
+                )
             )
             if not repair_plan or not any(repair_plan.queries_by_slot.values()):
                 break
@@ -980,7 +1363,23 @@ class EcommerceOrchestrator:
                 "RepairAgent 已为多需求失败 slot 生成 RepairPlan",
                 repair_plan=repair_plan.summary(),
             )
+            repair_search_span = self.span_recorder.start_span(
+                "repair_search_executed",
+                label="执行多需求修复召回",
+                agent="RetrievalWorker",
+                input_summary=repair_plan.summary(),
+            )
             state = self.retrieval_worker.run_multi_repair(state, repair_plan)
+            yield self._timing_event(
+                self._finish_span(
+                    repair_search_span,
+                    output_summary=self._multi_need_trace(state),
+                    metrics={
+                        "search_calls": self._repair_plan_query_count(repair_plan),
+                        "candidate_count": sum(len(items) for items in state.candidates_by_slot.values()),
+                    },
+                )
+            )
             self.budget_manager.record_tool_call(task, self._repair_plan_query_count(repair_plan))
             yield self._trace_event(
                 "repair_search_executed",
@@ -988,7 +1387,26 @@ class EcommerceOrchestrator:
                 multi_need=self._multi_need_trace(state),
             )
             self.budget_manager.record_corrective_call(task)
+            repair_corrective_span = self.span_recorder.start_span(
+                "corrective_reflection_after_repair",
+                label="多需求修复后校验",
+                agent="CorrectiveAgent",
+                input_summary={
+                    "slot_count": len(state.slots),
+                    "candidate_count": sum(len(items) for items in state.candidates_by_slot.values()),
+                },
+            )
             reflection = await self.corrective_agent.review_slots(query, intent_plan, plan, state)
+            yield self._timing_event(
+                self._finish_span(
+                    repair_corrective_span,
+                    output_summary=reflection.model_dump(),
+                    metrics=self._corrective_rule_metrics(
+                        reflection,
+                        sum(len(items) for items in state.candidates_by_slot.values()),
+                    ),
+                )
+            )
             trigger = self._repair_trigger("", reflection, default="slot_rejected")
             await trace_run.span("corrective_reflection_after_repair", output_payload=reflection.model_dump())
             yield self._trace_event(
@@ -1021,6 +1439,12 @@ class EcommerceOrchestrator:
             )
 
         self.budget_manager.record_answer_call(task)
+        answer_span = self.span_recorder.start_span(
+            "answer_generation",
+            label="生成多需求回答",
+            agent="AnswerGenerator",
+            input_summary={"route": final_route, "selected_product_count": len(product_ids), "slot_count": len(state.slots)},
+        )
         if not selection.flat_candidates and final_route in {"no_product", "clarify", "direct_answer"}:
             mode = "clarification" if final_route == "clarify" else ("direct" if final_route == "direct_answer" else "no_product")
             yield self._agent_update(
@@ -1037,6 +1461,7 @@ class EcommerceOrchestrator:
                 extra_context={"reflection_result": reflection.model_dump(), "multi_need_trace": self._multi_need_trace(state)},
                 profile_narrative=profile_narrative,
             ):
+                self.span_recorder.mark_first_token()
                 answer_parts.append(token)
                 yield {"type": "token", "content": token}
         else:
@@ -1050,8 +1475,16 @@ class EcommerceOrchestrator:
                 reflection.combo_summary,
                 profile_narrative=profile_narrative,
             ):
+                self.span_recorder.mark_first_token()
                 answer_parts.append(token)
                 yield {"type": "token", "content": token}
+        yield self._timing_event(
+            self._finish_span(
+                answer_span,
+                output_summary={"answer_length": len("".join(answer_parts))},
+                metrics={"first_token_latency_ms": self.span_recorder.first_token_latency_ms},
+            )
+        )
 
         self._schedule_memory_update(
             request=request,
@@ -1079,6 +1512,12 @@ class EcommerceOrchestrator:
                 products=self._products_brief_from_slot_candidates(cards),
             ),
             metadata=self._trace_metadata(),
+        )
+        yield self._finish_monitoring_event(
+            route=final_route,
+            intent_plan=intent_plan,
+            trace=trace,
+            product_ids=product_ids,
         )
         yield {"type": "done"}
 
@@ -1452,6 +1891,199 @@ class EcommerceOrchestrator:
     def _decision_trace_event(self, trace: DecisionTrace) -> dict[str, Any]:
         return {"type": "decision_trace", "trace": self._client_safe_trace_payload(trace)}
 
+    def _finish_span(
+        self,
+        span: Any,
+        *,
+        status: str = "succeeded",
+        output_summary: dict[str, Any] | None = None,
+        metrics: dict[str, Any] | None = None,
+        error_type: str = "",
+        error_message: str = "",
+    ) -> dict[str, Any]:
+        return self.span_recorder.finish_span(
+            span,
+            status=status,
+            output_summary=output_summary,
+            metrics=metrics,
+            error_type=error_type,
+            error_message=error_message,
+        )
+
+    def _timing_event(self, span_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.span_recorder.timing_event(span_payload)
+
+    def _finish_monitoring_event(
+        self,
+        *,
+        route: str,
+        intent_plan: IntentPlan,
+        trace: DecisionTrace,
+        product_ids: list[str],
+        status: str = "succeeded",
+    ) -> dict[str, Any]:
+        evaluation = self._rule_evaluation_summary(intent_plan, trace, product_ids)
+        self.span_recorder.finish_run(
+            route=route,
+            plan_type=intent_plan.plan_type,
+            product_ids=product_ids,
+            evaluation_summary=evaluation,
+            status=status,
+        )
+        return self._timing_event()
+
+    def _planner_rule_metrics(self, intent_plan: IntentPlan) -> dict[str, Any]:
+        return {
+            "plan_type": intent_plan.plan_type,
+            "plan_type_valid": intent_plan.plan_type
+            in {"direct_answer", "clarify", "single_retrieval", "multi_retrieval", "image_retrieval"},
+            "need_slot_count": len(intent_plan.need_slots),
+            "budget_extracted": intent_plan.budget_min is not None or intent_plan.budget_max is not None,
+            "budget_min": intent_plan.budget_min,
+            "budget_max": intent_plan.budget_max,
+            "budget_scope": intent_plan.budget_scope,
+            "referenced_product_count": len(intent_plan.referenced_product_ids),
+        }
+
+    def _corrective_rule_metrics(self, reflection: ReflectionResult, candidate_count: int) -> dict[str, Any]:
+        passed_count = len(reflection.passed_product_ids)
+        rejected_count = len(self._rejected_product_ids(reflection))
+        denominator = max(candidate_count, passed_count + rejected_count, 0)
+        pass_rate = round(passed_count / denominator, 4) if denominator else 0.0
+        return {
+            "candidate_count": candidate_count,
+            "passed_product_count": passed_count,
+            "rejected_product_count": rejected_count,
+            "corrective_pass_rate": pass_rate,
+            "fallback_plan": reflection.fallback_plan,
+            "repairable": reflection.repair_hint.repairable,
+        }
+
+    def _rule_evaluation_summary(
+        self,
+        intent_plan: IntentPlan,
+        trace: DecisionTrace,
+        product_ids: list[str],
+    ) -> dict[str, Any]:
+        retrieval = trace.retrieval_summary or {}
+        candidate_counts = trace.candidate_counts or {}
+        reflection = retrieval.get("reflection_result") if isinstance(retrieval.get("reflection_result"), dict) else {}
+        passed_ids = self._as_string_list(
+            retrieval.get("passed_product_ids")
+            or reflection.get("passed_product_ids")
+            or retrieval.get("loaded_product_ids")
+            or retrieval.get("referenced_product_ids")
+        )
+        rejected = reflection.get("rejected_products") or retrieval.get("rejected_products") or []
+        rejected_count = len(rejected) if isinstance(rejected, list) else 0
+        recall_count = self._first_int(
+            candidate_counts.get("after_rerank"),
+            candidate_counts.get("after_corrective"),
+            candidate_counts.get("initial"),
+            retrieval.get("after_rerank"),
+            retrieval.get("candidate_count"),
+            len(passed_ids) + rejected_count if passed_ids or rejected_count else None,
+        )
+        corrective_denominator = max(recall_count or 0, len(passed_ids) + rejected_count)
+        corrective_pass_rate = (
+            round(len(passed_ids) / corrective_denominator, 4)
+            if corrective_denominator
+            else None
+        )
+        evidence_ids = set(passed_ids)
+        evidence_ids.update(self._as_string_list(retrieval.get("loaded_product_ids")))
+        evidence_ids.update(self._as_string_list(retrieval.get("referenced_product_ids")))
+        final_ids = set(product_ids or [])
+        if final_ids and evidence_ids:
+            products_from_evidence = final_ids.issubset(evidence_ids)
+            products_from_evidence_status = "passed" if products_from_evidence else "warning"
+            products_from_evidence_value = f"{len(final_ids & evidence_ids)}/{len(final_ids)}"
+        elif final_ids:
+            products_from_evidence_status = "skipped"
+            products_from_evidence_value = "缺少可对照证据集合"
+        else:
+            products_from_evidence_status = "skipped"
+            products_from_evidence_value = "本轮未输出商品"
+
+        checks = [
+            {
+                "key": "plan_type",
+                "label": "plan_type（计划类型）",
+                "value": intent_plan.plan_type,
+                "status": "passed"
+                if intent_plan.plan_type
+                in {"direct_answer", "clarify", "single_retrieval", "multi_retrieval", "image_retrieval"}
+                else "warning",
+                "description": "IntentPlanner 判断本轮应该直接回答、澄清、单商品检索、多需求检索或图片检索。",
+            },
+            {
+                "key": "need_slot_count",
+                "label": "need_slots（需求槽位数）",
+                "value": len(intent_plan.need_slots),
+                "status": "passed" if intent_plan.plan_type != "multi_retrieval" or len(intent_plan.need_slots) >= 2 else "warning",
+                "description": "多需求场景应该拆出多个 slot；单需求/direct/clarify 可以为 0 或 1。",
+            },
+            {
+                "key": "budget_extracted",
+                "label": "budget（预算识别）",
+                "value": self._budget_value(intent_plan),
+                "status": "passed" if intent_plan.budget_min is not None or intent_plan.budget_max is not None else "skipped",
+                "description": "只表示是否从用户话术中识别到预算，不代表必须有预算。",
+            },
+            {
+                "key": "recall_count",
+                "label": "recall_count（召回数量）",
+                "value": recall_count if recall_count is not None else "未进入召回",
+                "status": "passed" if (recall_count or 0) > 0 else ("skipped" if intent_plan.plan_type in {"direct_answer", "clarify"} else "warning"),
+                "description": "检索阶段进入校验前的候选规模，用于判断是召回太少还是后续校验太严。",
+            },
+            {
+                "key": "corrective_pass_rate",
+                "label": "corrective_pass_rate（证据校验通过率）",
+                "value": corrective_pass_rate if corrective_pass_rate is not None else "未执行校验",
+                "status": "passed" if corrective_pass_rate is None or corrective_pass_rate > 0 else "warning",
+                "description": "CorrectiveAgent 通过商品数 / 候选商品数，低值通常说明召回偏离或约束过严。",
+            },
+            {
+                "key": "products_from_evidence",
+                "label": "products_from_evidence（最终商品来自证据集）",
+                "value": products_from_evidence_value,
+                "status": products_from_evidence_status,
+                "description": "检查最终展示的商品 ID 是否能在通过校验/历史引用证据中找到。",
+            },
+        ]
+        return {
+            "checks": checks,
+            "raw": {
+                "passed_product_ids": passed_ids,
+                "rejected_count": rejected_count,
+                "candidate_counts": candidate_counts,
+                "route": trace.route,
+            },
+        }
+
+    def _budget_value(self, intent_plan: IntentPlan) -> str:
+        if intent_plan.budget_min is None and intent_plan.budget_max is None:
+            return "未识别"
+        lower = "-" if intent_plan.budget_min is None else str(intent_plan.budget_min)
+        upper = "-" if intent_plan.budget_max is None else str(intent_plan.budget_max)
+        return f"{lower} ~ {upper} / {intent_plan.budget_scope}"
+
+    def _as_string_list(self, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item) for item in value if item]
+
+    def _first_int(self, *values: Any) -> int | None:
+        for value in values:
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
     def _trace_output(
         self,
         *,
@@ -1675,6 +2307,12 @@ class EcommerceOrchestrator:
         self._finish_trace(trace, task, route=final_route)
         yield self._decision_trace_event(trace)
         answer_parts: list[str] = []
+        answer_span = self.span_recorder.start_span(
+            "answer_generation",
+            label="生成缺图澄清回答",
+            agent="AnswerGenerator",
+            input_summary={"route": final_route, "failure_stage": "input"},
+        )
         async for token in self.answer_generator.stream_direct_text(
             query,
             "clarification",
@@ -1682,8 +2320,16 @@ class EcommerceOrchestrator:
             intent_plan,
             profile_narrative=profile_narrative,
         ):
+            self.span_recorder.mark_first_token()
             answer_parts.append(token)
             yield {"type": "token", "content": token}
+        yield self._timing_event(
+            self._finish_span(
+                answer_span,
+                output_summary={"answer_length": len("".join(answer_parts))},
+                metrics={"first_token_latency_ms": self.span_recorder.first_token_latency_ms},
+            )
+        )
         self._schedule_memory_update(
             request=request,
             query=query,
@@ -1696,6 +2342,13 @@ class EcommerceOrchestrator:
         await trace_run.end(
             output_payload=self._trace_output(route=final_route, reason=reason),
             metadata=self._trace_metadata(),
+        )
+        yield self._finish_monitoring_event(
+            route=final_route,
+            intent_plan=intent_plan,
+            trace=trace,
+            product_ids=[],
+            status="failed",
         )
         yield {"type": "done"}
 
@@ -1755,6 +2408,7 @@ class EcommerceOrchestrator:
         self.trace_recorder.apply_failure_trace(trace, task)
         yield self._trace_event("intent_planning", reason)
         yield self._decision_trace_event(trace)
+        self.span_recorder.mark_first_token()
         yield {"type": "token", "content": answer_text}
         self._schedule_memory_update(
             request=request,
@@ -1768,6 +2422,13 @@ class EcommerceOrchestrator:
         await trace_run.end(
             output_payload=self._trace_output(route="planner_failed", reason=reason),
             metadata=self._trace_metadata(),
+        )
+        yield self._finish_monitoring_event(
+            route="planner_failed",
+            intent_plan=IntentPlan(original_query=query, plan_type="direct_answer", plan_reason=reason),
+            trace=trace,
+            product_ids=[],
+            status="failed",
         )
         yield {"type": "done"}
 

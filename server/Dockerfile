@@ -1,9 +1,11 @@
-# syntax=docker/dockerfile:1.7
-FROM python:3.11-slim
+FROM dockerproxy.net/library/python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+ENV PIP_DEFAULT_TIMEOUT=120
 
 WORKDIR /app
 

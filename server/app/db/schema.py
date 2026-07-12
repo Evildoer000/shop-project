@@ -9,6 +9,7 @@ from app.db.models import Base
 def ensure_database_schema(engine: Engine) -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_session_memory_distilled_at(engine)
+    _ensure_product_stock_defaults(engine)
 
 
 def _ensure_session_memory_distilled_at(engine: Engine) -> None:
@@ -23,3 +24,11 @@ def _ensure_session_memory_distilled_at(engine: Engine) -> None:
         connection.execute(
             text(f"ALTER TABLE session_memory_states ADD COLUMN distilled_at {column_type}")
         )
+
+
+def _ensure_product_stock_defaults(engine: Engine) -> None:
+    inspector = inspect(engine)
+    if not inspector.has_table("products"):
+        return
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE products SET stock = 1 WHERE stock IS NULL"))

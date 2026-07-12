@@ -12,6 +12,14 @@ class OrganizerDatasetError(RuntimeError):
     pass
 
 
+ACTIVE_DATASET_SUBDIRS = (
+    "1_beauty_skincare",
+    "2_digital_electronics",
+    "3_clothing_sports",
+    "4_food_lifestyle",
+)
+
+
 def resolve_dataset_dir() -> Path:
     settings = get_settings()
     candidates = []
@@ -43,13 +51,20 @@ def _downloads_candidates() -> list[Path]:
 
 def load_organizer_products(dataset_dir: Path | None = None) -> list[dict[str, Any]]:
     root = dataset_dir or resolve_dataset_dir()
-    files = sorted(root.glob("*_/data/*.json"))
+    files = _active_dataset_files(root)
     if not files:
         files = sorted(root.glob("*/data/*.json"))
     products = [_normalize_product(path, root) for path in files]
     if not products:
         raise OrganizerDatasetError(f"No product JSON files found under {root}")
     return products
+
+
+def _active_dataset_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    for subdir in ACTIVE_DATASET_SUBDIRS:
+        files.extend((root / subdir / "data").glob("*.json"))
+    return sorted(files)
 
 
 def _normalize_product(path: Path, root: Path) -> dict[str, Any]:
@@ -75,7 +90,7 @@ def _normalize_product(path: Path, root: Path) -> dict[str, Any]:
         "sub_category": raw.get("sub_category"),
         "brand": raw["brand"],
         "price": raw["base_price"],
-        "stock": None,
+        "stock": 1,
         "image_url": image_url,
         "description": knowledge.get("marketing_description", ""),
         "specs": {

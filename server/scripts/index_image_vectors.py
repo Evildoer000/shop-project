@@ -100,30 +100,71 @@ def bootstrap_image_index(
         )
         return True
 
-    rows = []
+    strict_remote = _remote_image_embedding_configured(settings) and not allow_hash_fallback
     embedder = EmbeddingClient()
-    for product, image_path in image_items:
-        vector = embedder.embed_image(image_path)
-        rows.append(
-            {
-                "id": product.product_id,
-                "product_id": product.product_id,
-                "vector": vector,
-                "category": product.category,
-                "sub_category": product.sub_category or "",
-                "image_path": str(image_path),
-            }
+    client = _ensure_milvus_collection(
+        collection_name=collection_name,
+        dim=int(settings.image_embedding_dim),
+        overwrite=should_force,
+    )
+    total = len(image_items)
+    indexed_count = 0
+    skipped_count = 0
+    pending_rows: list[dict[str, Any]] = []
+    for start in range(0, total, 50):
+        chunk = image_items[start : start + 50]
+        existing_ids = set() if should_force else _existing_ids(
+            client,
+            collection_name,
+            [product.product_id for product, _ in chunk],
+        )
+        for product, image_path in chunk:
+            if product.product_id in existing_ids:
+                skipped_count += 1
+                continue
+            try:
+                vector = _embed_image_for_index(embedder, image_path, strict_remote=strict_remote)
+            except Exception:
+                if pending_rows:
+                    _upsert_milvus_rows(client, collection_name, pending_rows)
+                    client.flush(collection_name)
+                raise
+            pending_rows.append(
+                {
+                    "id": product.product_id,
+                    "product_id": product.product_id,
+                    "vector": vector,
+                    "category": product.category,
+                    "sub_category": product.sub_category or "",
+                    "image_path": str(image_path),
+                }
+            )
+            indexed_count += 1
+        if pending_rows:
+            _upsert_milvus_rows(client, collection_name, pending_rows)
+            client.flush(collection_name)
+            pending_rows = []
+        processed = min(start + len(chunk), total)
+        print(
+            f"Prepared image vectors {processed}/{total} "
+            f"(new={indexed_count}, skipped={skipped_count}).",
+            flush=True,
         )
 
-    _write_milvus_collection(
-        collection_name=collection_name,
-        rows=rows,
-        dim=int(settings.image_embedding_dim),
-        overwrite=True,
-    )
+    client.flush(collection_name)
+    collection_count = _collection_row_count(collection_name)
+    if collection_count < total:
+        print(
+            f"Image index is incomplete: Milvus has {collection_count}/{total} rows in '{collection_name}'.",
+            flush=True,
+        )
+        return False
     _write_bootstrap_metadata(engine, IMAGE_INDEX_FINGERPRINT_KEY, fingerprint)
-    _write_bootstrap_metadata(engine, IMAGE_INDEX_PRODUCT_COUNT_KEY, str(len(rows)))
-    print(f"Indexed {len(rows)} product images into Milvus collection '{collection_name}'.")
+    _write_bootstrap_metadata(engine, IMAGE_INDEX_PRODUCT_COUNT_KEY, str(total))
+    print(
+        f"Indexed {collection_count} product images into Milvus collection '{collection_name}' "
+        f"(new={indexed_count}, skipped={skipped_count})."
+    )
     return True
 
 
@@ -248,6 +289,12 @@ def _write_milvus_collection(
     dim: int,
     overwrite: bool,
 ) -> None:
+    client = _ensure_milvus_collection(collection_name=collection_name, dim=dim, overwrite=overwrite)
+    _upsert_milvus_rows(client, collection_name, rows)
+    client.flush(collection_name)
+
+
+def _ensure_milvus_collection(*, collection_name: str, dim: int, overwrite: bool):
     from pymilvus import DataType, MilvusClient
 
     settings = get_settings()
@@ -264,14 +311,40 @@ def _write_milvus_collection(
         index_params = client.prepare_index_params()
         index_params.add_index(field_name="vector", index_type="AUTOINDEX", metric_type="COSINE")
         client.create_collection(collection_name=collection_name, schema=schema, index_params=index_params)
+    return client
 
+
+def _upsert_milvus_rows(client, collection_name: str, rows: list[dict[str, Any]]) -> None:
     for start in range(0, len(rows), 100):
         batch = rows[start : start + 100]
         if hasattr(client, "upsert"):
             client.upsert(collection_name=collection_name, data=batch)
         else:
             client.insert(collection_name=collection_name, data=batch)
-    client.flush(collection_name)
+
+
+def _existing_ids(client, collection_name: str, product_ids: list[str]) -> set[str]:
+    if not product_ids or not client.has_collection(collection_name):
+        return set()
+    expression = "id in " + json.dumps(product_ids, ensure_ascii=False)
+    rows = client.query(
+        collection_name=collection_name,
+        filter=expression,
+        output_fields=["id"],
+        limit=len(product_ids),
+    )
+    return {str(row.get("id")) for row in rows if row.get("id")}
+
+
+def _embed_image_for_index(
+    embedder: EmbeddingClient,
+    image_path: Path,
+    *,
+    strict_remote: bool,
+) -> list[float]:
+    if strict_remote:
+        return embedder._remote_image_embedding(image_path)
+    return embedder.embed_image(image_path)
 
 
 if __name__ == "__main__":

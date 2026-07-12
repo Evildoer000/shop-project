@@ -9,7 +9,7 @@ httpx==0.28.1
 sse-starlette==2.3.5
 python-multipart==0.0.20
 dashscope==1.25.18
-llama-index==0.12.38
+llama-index-core==0.12.38
 llama-index-vector-stores-milvus==0.8.4
 pymilvus==2.5.10
 pillow==11.2.1

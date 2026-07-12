@@ -45,11 +45,11 @@ DATASET_DIR = Path(os.getenv("ORGANIZER_DATASET_DIR", "./ecommerce_agent_dataset
 
 # 5 张图: 跑鞋A / 咖啡 / Macbook / 耳机 / 跑鞋B
 IMAGE_PATHS = [
-    DATASET_DIR / "3_服饰运动/images/p_clothes_007_live.jpg",   # T2: Nike Pegasus 41 跑步鞋
-    DATASET_DIR / "4_食品生活/images/p_food_001_live.jpg",       # T5: 三顿半咖啡
-    DATASET_DIR / "2_数码电子/images/p_digital_006_live.jpg",    # T9: MacBook Pro 14
-    DATASET_DIR / "2_数码电子/images/p_digital_018_live.jpg",    # T13: AirPods Pro 3
-    DATASET_DIR / "3_服饰运动/images/p_clothes_008_live.jpg",   # T15: Adidas Ultraboost 5
+    DATASET_DIR / "3_clothing_sports/images/p_clothes_007_live.jpg",       # T2: Nike Pegasus 41 跑步鞋
+    DATASET_DIR / "4_food_lifestyle/images/p_food_00001_live.jpg",         # T5: 三顿半咖啡
+    DATASET_DIR / "2_digital_electronics/images/p_digital_00006_live.jpg", # T9: MacBook Pro 14
+    DATASET_DIR / "2_digital_electronics/images/p_digital_00018_live.png", # T13: AirPods Pro 3
+    DATASET_DIR / "3_clothing_sports/images/p_clothes_008_live.jpg",       # T15: Adidas Ultraboost 5
 ]
 
 

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from app.core.config import Settings, get_settings
 from app.harness.budget_manager import BudgetManager
 from app.harness.evidence_cache import EvidenceCache, InMemoryEvidenceCache
+from app.harness.span_recorder import SpanRecorder
 from app.harness.tool_registry import ToolRegistry
 from app.harness.trace_recorder import TraceRecorder
 
@@ -17,6 +18,7 @@ class HarnessRuntime:
 
     budget_manager: BudgetManager
     trace_recorder: TraceRecorder
+    span_recorder: SpanRecorder
     tool_registry: ToolRegistry
     evidence_cache: EvidenceCache
 
@@ -26,6 +28,7 @@ class HarnessRuntime:
         return cls(
             budget_manager=BudgetManager(),
             trace_recorder=TraceRecorder(),
+            span_recorder=SpanRecorder(),
             tool_registry=ToolRegistry(),
             evidence_cache=cls._build_evidence_cache(resolved),
         )

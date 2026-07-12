@@ -1,0 +1,11 @@
+services:
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${WEB_API_BASE_URL:-http://localhost:8000}
+    container_name: ecommerce-rag-web
+    ports:
+      - "${WEB_PORT:-3000}:80"
+    restart: unless-stopped

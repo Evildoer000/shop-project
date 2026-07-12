@@ -7,6 +7,7 @@ from app.harness.evidence_cache import (
     InMemoryEvidenceCache,
 )
 from app.harness.runtime import HarnessRuntime
+from app.harness.span_recorder import SpanRecorder
 from app.harness.tool_registry import ToolRegistration, ToolRegistry
 from app.harness.trace_recorder import TraceRecorder
 
@@ -18,6 +19,7 @@ __all__ = [
     "EvidenceSlot",
     "HarnessRuntime",
     "InMemoryEvidenceCache",
+    "SpanRecorder",
     "ToolRegistration",
     "ToolRegistry",
     "TraceRecorder",

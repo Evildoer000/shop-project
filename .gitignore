@@ -5,6 +5,10 @@
 *.zip
 *.doc
 *.docx
+*.md
+*.markdown
+*.png
+*.tex
 *.apk
 *.apk*
 *.aab
@@ -17,6 +21,10 @@ server/pip_conf/
 **/.venv/
 **/.venv
 .idea/
+node_modules/
+web/node_modules/
+web/.vite/
+web/dist/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -32,3 +40,4 @@ data/processed/*
 !data/processed/.gitkeep
 milvus/
 postgres/
+ecommerce_agent_dataset/

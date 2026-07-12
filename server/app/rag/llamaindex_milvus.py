@@ -17,37 +17,71 @@ class LlamaIndexMilvusRetriever:
         self.embedding_client = EmbeddingClient()
 
     def index_products(self, products: list[Product], overwrite: bool = True) -> None:
-        from llama_index.core import Settings, StorageContext, VectorStoreIndex
-        from llama_index.core.embeddings import BaseEmbedding
         from llama_index.core.schema import TextNode
-        from llama_index.vector_stores.milvus import MilvusVectorStore
+        from pymilvus import DataType, MilvusClient
 
-        nodes = [
-            TextNode(
-                text=product.search_text(),
-                metadata={
-                    "product_id": product.product_id,
-                    "category": product.category,
-                    "brand": product.brand,
-                    "price": float(product.price),
-                    "tags": product.tags,
-                },
-            )
-            for product in products
-        ]
-        if not nodes:
+        if not products:
             return
 
-        Settings.embed_model = self._remote_embedding_model(BaseEmbedding)
-        vector_store = MilvusVectorStore(
-            uri=self.settings.milvus_uri,
-            token=self.settings.milvus_token,
-            collection_name=self.settings.text_milvus_collection or self.settings.milvus_collection,
-            dim=self.settings.embedding_dim,
-            overwrite=overwrite,
-        )
-        storage_context = StorageContext.from_defaults(vector_store=vector_store)
-        VectorStoreIndex(nodes, storage_context=storage_context, embed_model=Settings.embed_model)
+        collection_name = self.settings.text_milvus_collection or self.settings.milvus_collection
+        client = MilvusClient(uri=self.settings.milvus_uri, token=self.settings.milvus_token)
+        if overwrite and client.has_collection(collection_name):
+            client.drop_collection(collection_name)
+        if not client.has_collection(collection_name):
+            schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=True)
+            schema.add_field(field_name="id", datatype=DataType.VARCHAR, is_primary=True, max_length=65535)
+            schema.add_field(field_name="doc_id", datatype=DataType.VARCHAR, max_length=65535)
+            schema.add_field(field_name="text", datatype=DataType.VARCHAR, max_length=65535)
+            schema.add_field(field_name="embedding", datatype=DataType.FLOAT_VECTOR, dim=int(self.settings.embedding_dim))
+            index_params = client.prepare_index_params()
+            index_params.add_index(field_name="embedding", index_type="AUTOINDEX", metric_type="COSINE")
+            client.create_collection(
+                collection_name=collection_name,
+                schema=schema,
+                index_params=index_params,
+                consistency_level="Bounded",
+            )
+
+        total = len(products)
+        batch: list[dict[str, Any]] = []
+        for index, product in enumerate(products, start=1):
+            text = product.search_text()
+            metadata = {
+                "product_id": product.product_id,
+                "category": product.category,
+                "brand": product.brand,
+                "price": float(product.price),
+                "tags": product.tags,
+            }
+            node = TextNode(text="", id_=product.product_id, metadata=metadata)
+            batch.append(
+                {
+                    "id": product.product_id,
+                    "doc_id": "None",
+                    "text": text,
+                    "embedding": self.embedding_client.embed(text),
+                    **metadata,
+                    "_node_content": node.to_json(),
+                    "_node_type": "TextNode",
+                    "document_id": "None",
+                    "ref_doc_id": "None",
+                }
+            )
+            if len(batch) >= 100:
+                self._upsert_batch(client, collection_name, batch)
+                print(f"Indexed text vectors {index}/{total}.", flush=True)
+                batch = []
+        if batch:
+            self._upsert_batch(client, collection_name, batch)
+            print(f"Indexed text vectors {total}/{total}.", flush=True)
+        client.flush(collection_name)
+        self._index_cache.clear()
+
+    def _upsert_batch(self, client: Any, collection_name: str, batch: list[dict[str, Any]]) -> None:
+        if hasattr(client, "upsert"):
+            client.upsert(collection_name=collection_name, data=batch)
+        else:
+            client.insert(collection_name=collection_name, data=batch)
 
     def retrieve(
         self,
