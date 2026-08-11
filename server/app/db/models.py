@@ -150,10 +150,26 @@ class AgentRunSpan(Base):
     __table_args__ = (
         Index("ix_agent_run_spans_run", "run_id"),
         Index("ix_agent_run_spans_name", "name"),
+        Index("ix_agent_run_spans_parent", "parent_span_key"),
+        Index("ix_agent_run_spans_task", "task_id"),
     )
 
     span_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # span_key is the application-level tree node ID; span_id remains the DB surrogate key.
+    span_key: Mapped[str | None] = mapped_column(String(96), index=True, nullable=True)
+    parent_span_key: Mapped[str | None] = mapped_column(String(96), nullable=True)
+    task_id: Mapped[str] = mapped_column(String(128), default="", server_default=text("''"), nullable=False)
+    agent_id: Mapped[str] = mapped_column(String(96), default="", server_default=text("''"), index=True, nullable=False)
+    span_type: Mapped[str] = mapped_column(String(32), default="stage", server_default=text("'stage'"), nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, default=1, server_default=text("1"), nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
+    trace_schema_version: Mapped[str] = mapped_column(
+        String(32),
+        default="v1",
+        server_default=text("'v1'"),
+        nullable=False,
+    )
     name: Mapped[str] = mapped_column(String(96), nullable=False)
     label: Mapped[str] = mapped_column(String(128), default="", nullable=False)
     agent: Mapped[str] = mapped_column(String(96), default="", nullable=False)
@@ -166,6 +182,12 @@ class AgentRunSpan(Base):
     metrics: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
     error_type: Mapped[str] = mapped_column(String(96), default="", nullable=False)
     error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    termination_reason: Mapped[str] = mapped_column(
+        String(128),
+        default="",
+        server_default=text("''"),
+        nullable=False,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

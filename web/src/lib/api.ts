@@ -1,5 +1,7 @@
 import type {
   CartResponse,
+  AgentRunDetailResponse,
+  AgentRunListResponse,
   ChatSessionDetailResponse,
   ChatSessionListResponse,
   DecisionTrace,
@@ -105,6 +107,27 @@ export async function getChatSession(userId: string, sessionId: string): Promise
 export async function getCart(userId: string, sessionId = "all"): Promise<CartResponse> {
   const query = new URLSearchParams({ user_id: userId, session_id: sessionId });
   return requestJson<CartResponse>(`/api/cart?${query.toString()}`);
+}
+
+export async function getAgentRuns(
+  userId: string | null,
+  params: { sessionId?: string; status?: string; limit?: number; offset?: number } = {},
+): Promise<AgentRunListResponse> {
+  const query = new URLSearchParams();
+  if (userId) query.set("user_id", userId);
+  if (params.sessionId) query.set("session_id", params.sessionId);
+  if (params.status) query.set("status", params.status);
+  if (params.limit != null) query.set("limit", String(params.limit));
+  if (params.offset != null) query.set("offset", String(params.offset));
+  return requestJson<AgentRunListResponse>(`/api/debug/agent-runs?${query.toString()}`);
+}
+
+export async function getAgentRun(userId: string | null, runId: string): Promise<AgentRunDetailResponse> {
+  const query = new URLSearchParams();
+  if (userId) query.set("user_id", userId);
+  return requestJson<AgentRunDetailResponse>(
+    `/api/debug/agent-runs/${encodeURIComponent(runId)}?${query.toString()}`,
+  );
 }
 
 export async function reportEvent(payload: EventReportRequest): Promise<EventReportResponse> {

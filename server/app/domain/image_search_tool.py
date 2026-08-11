@@ -28,6 +28,11 @@ class ImageSearchTool:
         self.image_retriever = image_retriever or ImageRetriever()
         self.settings = get_settings()
 
+    def _retrieval_products(self, plan: QueryPlan) -> list:
+        if hasattr(self.product_repository, "list_available_products"):
+            return self.product_repository.list_available_products()
+        return self.product_repository.list_for_plan(plan, limit=max(plan.retrieval_strategy.candidate_limit, 1_000_000))
+
     def search(
         self,
         slot: NeedSlot,
@@ -39,7 +44,7 @@ class ImageSearchTool:
         plan = base_plan.model_copy(deep=True)
         plan.retrieval_strategy.candidate_limit = max(plan.retrieval_strategy.candidate_limit, 200)
 
-        products = self.product_repository.list_for_plan(plan, limit=plan.retrieval_strategy.candidate_limit)
+        products = self._retrieval_products(plan)
         before_filter = self.product_repository.count_available()
         if not products:
             return SlotSearchResult(
@@ -90,7 +95,7 @@ class ImageSearchTool:
             if product is None:
                 continue
             candidates.append(
-            SlotCandidate(
+                SlotCandidate(
                     product=product,
                     product_id=product.product_id,
                     name=product.name,

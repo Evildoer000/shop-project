@@ -6,6 +6,10 @@ x-backend-env: &backend-env
   MILVUS_COLLECTION: ${MILVUS_COLLECTION:-product_chunks}
   TEXT_MILVUS_COLLECTION: ${TEXT_MILVUS_COLLECTION:-product_chunks}
   IMAGE_MILVUS_COLLECTION: ${IMAGE_MILVUS_COLLECTION:-product_image_chunks}
+  ELASTICSEARCH_ENABLED: ${ELASTICSEARCH_ENABLED:-true}
+  ELASTICSEARCH_URL: ${ELASTICSEARCH_URL:-http://elasticsearch:9200}
+  ELASTICSEARCH_INDEX: ${ELASTICSEARCH_INDEX:-products}
+  ELASTICSEARCH_TIMEOUT_SECONDS: ${ELASTICSEARCH_TIMEOUT_SECONDS:-10}
   ORGANIZER_DATASET_DIR: /data/ecommerce_agent_dataset
   LLM_API_KEY: ${LLM_API_KEY:-}
   LLM_BASE_URL: ${LLM_BASE_URL:-}
@@ -47,6 +51,7 @@ x-backend-env: &backend-env
   LANGFUSE_HOST: ${LANGFUSE_HOST:-}
   BOOTSTRAP_WAIT_SECONDS: ${BOOTSTRAP_WAIT_SECONDS:-180}
   BOOTSTRAP_FORCE_REINDEX: ${BOOTSTRAP_FORCE_REINDEX:-false}
+  BOOTSTRAP_FORCE_ES_REINDEX: ${BOOTSTRAP_FORCE_ES_REINDEX:-false}
   BOOTSTRAP_FORCE_IMAGE_REINDEX: ${BOOTSTRAP_FORCE_IMAGE_REINDEX:-false}
 
 services:
@@ -112,6 +117,26 @@ services:
     volumes:
       - milvus_data:/var/lib/milvus
 
+  elasticsearch:
+    build:
+      context: ./elasticsearch
+      dockerfile: Dockerfile
+    image: shop-agent-elasticsearch:8.15.5-ik
+    container_name: ecommerce-rag-elasticsearch
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200 >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
   backend-bootstrap:
     build:
       context: ./server
@@ -169,10 +194,40 @@ services:
       timeout: 3s
       retries: 20
 
+  evaluator:
+    profiles: ["eval"]
+    build:
+      context: ./server
+      dockerfile: Dockerfile.eval
+    image: shop-agent-evaluator:latest
+    container_name: ecommerce-rag-evaluator
+    working_dir: /workspace
+    environment:
+      <<: *backend-env
+      PYTHONPATH: /workspace/server:/workspace
+      DEEPEVAL_TELEMETRY_OPT_OUT: "YES"
+      DEEPEVAL_DISABLE_DOTENV: "1"
+    volumes:
+      - ./:/workspace
+      - ./ecommerce_agent_dataset:/data/ecommerce_agent_dataset:ro
+    command:
+      [
+        "python",
+        "-m",
+        "pytest",
+        "-c",
+        "benchmark/v2/pytest.ini",
+        "benchmark/v2/tests",
+        "-m",
+        "not semantic",
+        "-q",
+      ]
+
 volumes:
   postgres_data:
   etcd_data:
   minio_data:
   milvus_data:
+  elasticsearch_data:
   backend_logs:
   backend_uploads:

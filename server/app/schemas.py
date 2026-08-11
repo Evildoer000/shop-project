@@ -302,6 +302,80 @@ class ChatSessionDetailResponse(BaseModel):
     turns: list[ChatSessionTurn] = Field(default_factory=list)
 
 
+class AgentRunSummary(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    run_id: str
+    user_id: str
+    session_id: str
+    turn_id: str
+    query_summary: str = ""
+    route: str = ""
+    plan_type: str = ""
+    status: str = "running"
+    total_latency_ms: float | None = None
+    first_token_latency_ms: float | None = None
+    product_ids: list[str] = Field(default_factory=list)
+    evaluation_summary: dict = Field(default_factory=dict)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class AgentRunSpanResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    span_id: int
+    run_id: str
+    span_key: str | None = None
+    parent_span_key: str | None = None
+    task_id: str = ""
+    agent_id: str = ""
+    span_type: str = "stage"
+    attempt: int = 1
+    sequence: int = 0
+    trace_schema_version: str = "v1"
+    name: str
+    label: str = ""
+    agent: str = ""
+    status: str = "running"
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    duration_ms: float | None = None
+    input_summary: dict = Field(default_factory=dict)
+    output_summary: dict = Field(default_factory=dict)
+    metrics: dict = Field(default_factory=dict)
+    error_type: str = ""
+    error_message: str = ""
+    termination_reason: str = ""
+
+
+class AgentRunConversation(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    turn_id: int
+    user_message: str
+    assistant_message: str = ""
+    route: str = ""
+    product_ids: list[str] = Field(default_factory=list)
+    rewrite_summary: dict = Field(default_factory=dict)
+    trace_summary: dict = Field(default_factory=dict)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class AgentRunListResponse(BaseModel):
+    runs: list[AgentRunSummary] = Field(default_factory=list)
+    total: int = 0
+    limit: int = 50
+    offset: int = 0
+
+
+class AgentRunDetailResponse(BaseModel):
+    run: AgentRunSummary
+    spans: list[AgentRunSpanResponse] = Field(default_factory=list)
+    conversation: AgentRunConversation | None = None
+
+
 class DecisionTrace(BaseModel):
     query_understanding: dict = Field(default_factory=dict)
     image_attributes: dict = Field(default_factory=dict)

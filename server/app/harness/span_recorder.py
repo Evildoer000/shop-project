@@ -17,6 +17,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ActiveSpan:
+    span_key: str
+    parent_span_key: str | None
+    task_id: str
+    agent_id: str
+    span_type: str
+    attempt: int
+    sequence: int
+    trace_schema_version: str
     name: str
     label: str
     agent: str
@@ -34,6 +42,7 @@ class SpanRecorder:
 
     def __init__(self) -> None:
         self.run_id = f"run_{uuid.uuid4().hex}"
+        self.trace_schema_version = "v1"
         self.user_id = ""
         self.session_id = ""
         self.turn_id = ""
@@ -48,6 +57,9 @@ class SpanRecorder:
         self.product_ids: list[str] = []
         self.evaluation_summary: dict[str, Any] = {}
         self.spans: list[dict[str, Any]] = []
+        self._sequence = 0
+        self._root_span: ActiveSpan | None = None
+        self._last_span_by_name: dict[str, ActiveSpan] = {}
 
     def start_run(self, *, user_id: str, session_id: str, turn_id: str, query_summary: str) -> dict[str, Any]:
         self.user_id = user_id
@@ -56,6 +68,24 @@ class SpanRecorder:
         self.query_summary = self._compact(query_summary, 500)
         self.started_at = datetime.now(timezone.utc)
         self.started_perf = time.perf_counter()
+        self._sequence = 0
+        self.spans = []
+        self._last_span_by_name = {}
+        self._root_span = ActiveSpan(
+            span_key=f"span_{uuid.uuid4().hex}",
+            parent_span_key=None,
+            task_id=turn_id or self.run_id,
+            agent_id="EcommerceOrchestrator",
+            span_type="run",
+            attempt=1,
+            sequence=0,
+            trace_schema_version=self.trace_schema_version,
+            name="orchestrator_run",
+            label="本次请求执行根节点",
+            agent="EcommerceOrchestrator",
+            started_at=self.started_at,
+            started_perf=self.started_perf,
+        )
         self._persist_run()
         return self.run_payload()
 
@@ -66,15 +96,149 @@ class SpanRecorder:
         label: str = "",
         agent: str = "",
         input_summary: dict[str, Any] | None = None,
+        parent_span_key: str | None = None,
+        task_id: str = "",
+        agent_id: str = "",
+        span_type: str = "",
+        attempt: int = 1,
     ) -> ActiveSpan:
-        return ActiveSpan(
+        safe_input = self._json_safe(input_summary or {})
+        inferred_agent_id = agent_id or agent or self._infer_agent_id(name)
+        inferred_span_type = span_type or self._infer_span_type(agent=inferred_agent_id, name=name)
+        inferred_attempt = self._infer_attempt(name, safe_input, attempt)
+        self._sequence += 1
+        span = ActiveSpan(
+            span_key=f"span_{uuid.uuid4().hex}",
+            parent_span_key=parent_span_key if parent_span_key is not None else self._infer_parent_span_key(name),
+            task_id=task_id or self.turn_id or self.run_id,
+            agent_id=inferred_agent_id,
+            span_type=inferred_span_type,
+            attempt=inferred_attempt,
+            sequence=self._sequence,
+            trace_schema_version=self.trace_schema_version,
             name=name,
             label=label or name,
             agent=agent,
             started_at=datetime.now(timezone.utc),
             started_perf=time.perf_counter(),
-            input_summary=self._json_safe(input_summary or {}),
+            input_summary=safe_input,
         )
+        self._last_span_by_name[name] = span
+        return span
+
+    def child_span(
+        self,
+        parent: ActiveSpan,
+        name: str,
+        *,
+        label: str = "",
+        agent: str = "",
+        input_summary: dict[str, Any] | None = None,
+        task_id: str = "",
+        agent_id: str = "",
+        span_type: str = "",
+        attempt: int = 1,
+    ) -> ActiveSpan:
+        """Start a span with an explicit parent for nested or concurrent work."""
+        return self.start_span(
+            name,
+            label=label,
+            agent=agent,
+            input_summary=input_summary,
+            parent_span_key=parent.span_key,
+            task_id=task_id,
+            agent_id=agent_id,
+            span_type=span_type,
+            attempt=attempt,
+        )
+
+    def _infer_parent_span_key(self, name: str) -> str | None:
+        parent_names: dict[str, tuple[str, ...]] = {
+            "input_normalize": (),
+            "memory_context_load": (),
+            "image_attribute_extraction": (),
+            "intent_planning": (),
+            "profile_lookup": ("intent_planning",),
+            "intent_planning_profile_refine": ("profile_lookup", "intent_planning"),
+            "retrieval_plan_builder": ("intent_planning_profile_refine", "intent_planning"),
+            "single_retrieval_worker_execution": ("retrieval_plan_builder", "intent_planning"),
+            "image_retrieval_worker_execution": ("retrieval_plan_builder", "intent_planning"),
+            "multi_need_retrieval": ("retrieval_plan_builder", "intent_planning"),
+            "corrective_reflection": (
+                "single_retrieval_worker_execution",
+                "image_retrieval_worker_execution",
+                "multi_need_retrieval",
+            ),
+            "repair_plan_generated": (
+                "corrective_reflection_after_repair",
+                "corrective_reflection",
+            ),
+            "repair_search_executed": ("repair_plan_generated",),
+            "corrective_reflection_after_repair": ("repair_search_executed",),
+            "answer_generation": (
+                "corrective_reflection_after_repair",
+                "corrective_reflection",
+                "multi_need_retrieval",
+                "image_retrieval_worker_execution",
+                "single_retrieval_worker_execution",
+                "intent_planning_profile_refine",
+                "intent_planning",
+            ),
+        }
+        for parent_name in parent_names.get(name, ()):
+            parent = self._last_span_by_name.get(parent_name)
+            if parent is not None:
+                return parent.span_key
+        return self._root_span.span_key if self._root_span is not None else None
+
+    def _infer_agent_id(self, name: str) -> str:
+        return {
+            "input_normalize": "InputProcessor",
+            "memory_context_load": "MemoryManager",
+            "image_attribute_extraction": "ImageAttributeExtractor",
+            "intent_planning": "IntentPlanner",
+            "intent_planning_profile_refine": "IntentPlanner",
+            "profile_lookup": "ProfileLookupTool",
+            "retrieval_plan_builder": "RetrievalPlanBuilder",
+            "single_retrieval_worker_execution": "RetrievalWorker",
+            "image_retrieval_worker_execution": "ImageRetrievalWorker",
+            "multi_need_retrieval": "RetrievalWorker",
+            "corrective_reflection": "CorrectiveAgent",
+            "repair_plan_generated": "RepairAgent",
+            "repair_search_executed": "RetrievalWorker",
+            "corrective_reflection_after_repair": "CorrectiveAgent",
+            "answer_generation": "AnswerGenerator",
+        }.get(name, "EcommerceOrchestrator")
+
+    def _infer_span_type(self, *, agent: str, name: str) -> str:
+        if name == "orchestrator_run":
+            return "run"
+        if agent.endswith("Tool"):
+            return "tool"
+        if agent in {
+            "InputProcessor",
+            "MemoryManager",
+            "RetrievalPlanBuilder",
+        }:
+            return "stage"
+        if agent:
+            return "agent"
+        return "stage"
+
+    def _infer_attempt(self, name: str, input_summary: dict[str, Any], attempt: int) -> int:
+        if attempt > 1:
+            return int(attempt)
+        raw_attempt = input_summary.get("repair_attempt")
+        if raw_attempt is not None:
+            try:
+                return max(1, int(raw_attempt))
+            except (TypeError, ValueError):
+                pass
+        if name == "corrective_reflection_after_repair":
+            repair_span = self._last_span_by_name.get("repair_plan_generated")
+            if repair_span is not None:
+                return repair_span.attempt
+        return 1
 
     def finish_span(
         self,
@@ -85,11 +249,23 @@ class SpanRecorder:
         metrics: dict[str, Any] | None = None,
         error_type: str = "",
         error_message: str = "",
+        termination_reason: str = "",
     ) -> dict[str, Any]:
         finished_at = datetime.now(timezone.utc)
         duration_ms = max(0.0, (time.perf_counter() - span.started_perf) * 1000)
+        resolved_termination_reason = termination_reason
+        if not resolved_termination_reason and status not in {"succeeded", "running"}:
+            resolved_termination_reason = status
         payload = {
             "run_id": self.run_id,
+            "span_key": span.span_key,
+            "parent_span_key": span.parent_span_key,
+            "task_id": span.task_id,
+            "agent_id": span.agent_id,
+            "span_type": span.span_type,
+            "attempt": span.attempt,
+            "sequence": span.sequence,
+            "trace_schema_version": span.trace_schema_version,
             "name": span.name,
             "label": span.label,
             "agent": span.agent,
@@ -102,6 +278,7 @@ class SpanRecorder:
             "metrics": self._json_safe(metrics or {}),
             "error_type": error_type,
             "error_message": self._compact(error_message, 500),
+            "termination_reason": self._compact(resolved_termination_reason, 128),
         }
         self.spans.append(payload)
         self._persist_span(payload, span.started_at, finished_at)
@@ -127,6 +304,7 @@ class SpanRecorder:
         product_ids: list[str] | None = None,
         evaluation_summary: dict[str, Any] | None = None,
         status: str = "succeeded",
+        termination_reason: str = "",
     ) -> dict[str, Any]:
         self.status = status
         self.route = route
@@ -134,6 +312,20 @@ class SpanRecorder:
         self.product_ids = list(dict.fromkeys(product_ids or []))
         self.evaluation_summary = self._json_safe(evaluation_summary or {})
         self.finished_at = datetime.now(timezone.utc)
+        if self._root_span is not None and not any(
+            item.get("span_key") == self._root_span.span_key for item in self.spans
+        ):
+            self.finish_span(
+                self._root_span,
+                status=status,
+                output_summary={
+                    "route": route,
+                    "plan_type": plan_type,
+                    "product_count": len(self.product_ids),
+                },
+                metrics={"completed_child_spans": len(self.spans)},
+                termination_reason=termination_reason,
+            )
         self._persist_run()
         payload = self.run_payload()
         logger.info(
@@ -157,6 +349,8 @@ class SpanRecorder:
                 "total_latency_ms": self.total_latency_ms(),
                 "first_token_latency_ms": self.first_token_latency_ms,
                 "completed_spans": len(self.spans),
+                "root_span_key": self._root_span.span_key if self._root_span is not None else None,
+                "trace_schema_version": self.trace_schema_version,
             },
             "evaluation": self.evaluation_summary,
         }
@@ -214,6 +408,14 @@ class SpanRecorder:
                 db.add(
                     AgentRunSpan(
                         run_id=self.run_id,
+                        span_key=str(payload.get("span_key") or ""),
+                        parent_span_key=payload.get("parent_span_key"),
+                        task_id=str(payload.get("task_id") or ""),
+                        agent_id=str(payload.get("agent_id") or ""),
+                        span_type=str(payload.get("span_type") or "stage"),
+                        attempt=int(payload.get("attempt") or 1),
+                        sequence=int(payload.get("sequence") or 0),
+                        trace_schema_version=str(payload.get("trace_schema_version") or self.trace_schema_version),
                         name=str(payload["name"]),
                         label=str(payload["label"]),
                         agent=str(payload["agent"]),
@@ -226,6 +428,7 @@ class SpanRecorder:
                         metrics=payload["metrics"],
                         error_type=str(payload.get("error_type") or ""),
                         error_message=str(payload.get("error_message") or ""),
+                        termination_reason=str(payload.get("termination_reason") or ""),
                     )
                 )
                 db.commit()

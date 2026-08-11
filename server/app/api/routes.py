@@ -9,14 +9,19 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sse_starlette.sse import EventSourceResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.db.models import AppUser, ConversationTurn
+from app.db.models import AgentRun, AgentRunSpan, AppUser, ConversationTurn
 from app.db.session import get_db, get_sessionmaker
 from app.domain.orchestrator import EcommerceOrchestrator
 from app.domain.recommendation_service import RecommendationService
 from app.schemas import (
+    AgentRunConversation,
+    AgentRunDetailResponse,
+    AgentRunListResponse,
+    AgentRunSpanResponse,
+    AgentRunSummary,
     CartResponse,
     ChatSessionDetailResponse,
     ChatSessionListResponse,
@@ -83,6 +88,85 @@ def _normalize_phone(phone: str) -> str:
 
 def _user_id_from_phone(phone: str) -> str:
     return f"phone_{phone}"
+
+
+@router.get("/debug/agent-runs", response_model=AgentRunListResponse)
+def list_agent_runs(
+    user_id: str | None = None,
+    session_id: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+) -> AgentRunListResponse:
+    """Read-only historical Agent run list for local debugging."""
+    safe_limit = max(1, min(limit, 100))
+    safe_offset = max(0, offset)
+    filters = []
+    if user_id:
+        filters.append(AgentRun.user_id == user_id)
+    if session_id:
+        filters.append(AgentRun.session_id == session_id)
+    if status:
+        filters.append(AgentRun.status == status)
+
+    total = int(db.scalar(select(func.count()).select_from(AgentRun).where(*filters)) or 0)
+    rows = db.scalars(
+        select(AgentRun)
+        .where(*filters)
+        .order_by(AgentRun.created_at.desc(), AgentRun.run_id.desc())
+        .offset(safe_offset)
+        .limit(safe_limit)
+    ).all()
+    return AgentRunListResponse(
+        runs=[AgentRunSummary.model_validate(row) for row in rows],
+        total=total,
+        limit=safe_limit,
+        offset=safe_offset,
+    )
+
+
+@router.get("/debug/agent-runs/{run_id}", response_model=AgentRunDetailResponse)
+def get_agent_run(
+    run_id: str,
+    user_id: str | None = None,
+    db: Session = Depends(get_db),
+) -> AgentRunDetailResponse:
+    """Read-only historical Agent run detail, including its span chain."""
+    filters = [AgentRun.run_id == run_id]
+    if user_id:
+        filters.append(AgentRun.user_id == user_id)
+    run = db.scalar(select(AgentRun).where(*filters))
+    if run is None:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+
+    spans = db.scalars(
+        select(AgentRunSpan)
+        .where(AgentRunSpan.run_id == run_id)
+        .order_by(AgentRunSpan.sequence.asc(), AgentRunSpan.span_id.asc())
+    ).all()
+
+    # AgentRun.turn_id is the orchestrator task ID, while ConversationTurn has
+    # its own DB integer ID. Match the persisted turn by the same user/session/query.
+    conversation_row = db.scalar(
+        select(ConversationTurn)
+        .where(
+            ConversationTurn.user_id == run.user_id,
+            ConversationTurn.session_id == run.session_id,
+            ConversationTurn.user_message == run.query_summary,
+        )
+        .order_by(ConversationTurn.created_at.desc(), ConversationTurn.turn_id.desc())
+    )
+    conversation = (
+        AgentRunConversation.model_validate(conversation_row)
+        if conversation_row is not None
+        else None
+    )
+    return AgentRunDetailResponse(
+        run=AgentRunSummary.model_validate(run),
+        spans=[AgentRunSpanResponse.model_validate(span) for span in spans],
+        conversation=conversation,
+    )
 
 
 @router.post("/images", response_model=ImageUploadResponse)
@@ -215,7 +299,7 @@ def list_products(
     sort: str = "popular",
     db: Session = Depends(get_db),
 ) -> ProductCatalogResponse:
-    products, total = ProductRepository(db).list_catalog(
+    result = ProductRepository(db).list_catalog_with_scores(
         category=category,
         sub_category=sub_category,
         query=q,
@@ -226,8 +310,8 @@ def list_products(
     normalized_page = max(page, 1)
     normalized_page_size = min(max(page_size, 1), 60)
     return ProductCatalogResponse(
-        products=[_product_to_card(product) for product in products],
-        total=total,
+        products=[_product_to_card(product, score=result.scores.get(product.product_id, 0.0)) for product in result.products],
+        total=result.total,
         page=normalized_page,
         page_size=normalized_page_size,
     )
@@ -295,7 +379,7 @@ async def _update_affinity_async(payload: EventReportRequest) -> None:
         LOGGER.warning("affinity update failed: %s", exc, exc_info=True)
 
 
-def _product_to_card(product) -> RecommendationCard:
+def _product_to_card(product, score: float = 0.0) -> RecommendationCard:
     tags = product.tags or []
     return RecommendationCard(
         product_id=product.product_id,
@@ -308,7 +392,7 @@ def _product_to_card(product) -> RecommendationCard:
         tags=tags[:6] if isinstance(tags, list) else [],
         rating=float(product.rating or 0),
         reason=product.review_summary or product.description[:80],
-        score=0.0,
+        score=round(float(score or 0.0), 4),
     )
 
 

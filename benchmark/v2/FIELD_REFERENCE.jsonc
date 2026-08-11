@@ -1,0 +1,193 @@
+{
+  // 本文件只是“字段说明模板”，不会被评估脚本当成正式测试数据。
+  // 正式数据在 datasets/*.jsonl。JSONL 每一行都是一个完整 JSON 对象，不能写注释。
+  "schema_version": "2.0",
+
+  // 全局唯一。建议前缀：
+  // st_ = 单轮；mt_ = 多轮；adv_ = 异常/对抗。
+  "id": "st_beauty_001",
+
+  // single_turn：普通单轮；multi_turn：连续对话；adversarial：异常或故障注入。
+  "case_kind": "single_turn",
+
+  // 临时不想跑某条时改成 false，不要删除历史样例。
+  "enabled": true,
+
+  "review": {
+    // needs_review：机器草稿，不能作为正式回归门禁。
+    // approved：人工逐项确认过，可以参与正式指标。
+    // rejected：样例设计不合理，保留记录但不运行。
+    "status": "needs_review",
+    "reviewer": "",
+    "reviewed_at": "",
+    "risk": "high",
+    "review_notes": ""
+  },
+
+  "coverage": {
+    // 用于看四大商品域、多轮、异常等覆盖是否均衡。
+    "domain": "beauty_skincare",
+    "scenario": "fine_grained_sunscreen",
+    "difficulty": "hard",
+
+    // 声明这条用例想测哪些链路节点，方便按组件筛选。
+    "capabilities": [
+      "intent_planning",
+      "keyword_retrieval",
+      "vector_retrieval",
+      "rrf_fusion",
+      "reranking",
+      "corrective_validation",
+      "answer_grounding"
+    ],
+    "tags": ["budget", "skin_type", "fine_grained"]
+  },
+
+  "input": {
+    "message": "我是油皮，预算150以内，推荐夏天通勤不闷的防晒霜。",
+
+    // 图片样例后续填写固定fixture路径，不要引用临时上传目录。
+    "image_fixture": null,
+
+    // 需要长期画像时使用，例如 {"skin_type":"油皮"}。
+    "profile_fixture": null,
+
+    // 普通用例为 null。异常用例可写：
+    // {"target":"milvus","mode":"connection_refused"}
+    "fault_injection": null
+  },
+
+  "expected": {
+    "route": {
+      // 允许多个值只应用在需求本身存在合理歧义的case。
+      // 人工审核后应尽量收窄，避免错误路径也被判通过。
+      "allowed": ["recommend"],
+      "forbidden": ["direct_answer", "clarify"]
+    },
+
+    "plan": {
+      "allowed_plan_types": ["single_retrieval"],
+      "slot_count": {"min": 1, "max": 1},
+      "budget": {
+        "min": null,
+        "max": 150,
+        // per_item：单件；total：组合总预算；unknown：用户没说清楚。
+        "scope": "per_item",
+        "numeric_tolerance": 0
+      },
+      "required_slot_concepts": ["防晒霜"],
+      "forbidden_slot_concepts": ["洁面", "乳液/面霜"]
+    },
+
+    "tools": {
+      "required": ["product_search"],
+      "forbidden": ["image_search"]
+    },
+
+    "retrieval": {
+      // 第一层：召回边界。用于计算 WrongTypeRate。
+      "required_subcategories": ["防晒霜"],
+      "forbidden_subcategories": ["洁面", "乳液/面霜"],
+
+      // 第二层：确定性硬约束。违反后相关性最多为1级。
+      "hard_constraints": {
+        "price_min": null,
+        "price_max": 150
+      },
+
+      // 第三层：同类商品内部的细粒度匹配。
+      "soft_constraints": [
+        {
+          "key": "oily_skin",
+          "label": "油皮适用",
+          // 同一case内所有weight之和必须等于1。
+          "weight": 0.35,
+          "positive_terms": ["油皮", "混油", "油痘肌"],
+          "negative_terms": ["更适合干皮"],
+          // 商品资料没写时是unknown，不自动判失败。
+          "absence_policy": "unknown_not_fail"
+        }
+      ],
+
+      "judged_products": [
+        {
+          "product_id": "p_beauty_01059",
+          "title": "真实商品标题",
+          "sub_category": "防晒霜",
+          "price": 120,
+
+          // 以下字段由生成器预计算，只是审核辅助。
+          "type_match": true,
+          "hard_pass": true,
+          "hard_violations": [],
+          "soft_coverage": 1.0,
+
+          "soft_scores": [
+            {
+              "key": "oily_skin",
+              "label": "油皮适用",
+              // -1=明确冲突；0=资料未知；1=部分支持；2=明确支持。
+              "proposed_score": 2,
+              // 严格审核时可以改这里；正式指标最终读人工结果。
+              "approved_score": null,
+              "state": "explicit_support",
+              "matched_positive_terms": ["油皮", "混油"],
+              "matched_negative_terms": []
+            }
+          ],
+
+          // 商品总相关性：
+          // 0=错商品类型；
+          // 1=类型正确但违反价格等硬约束；
+          // 2=硬约束满足，但关键软偏好缺少证据；
+          // 3=满足大部分关键软偏好；
+          // 4=核心需求均有明确证据。
+          "proposed_grade": 4,
+
+          // 你审核后填写0到4。未填写时不得启用正式门禁。
+          "approved_grade": null,
+          "review_status": "needs_review",
+
+          // 审核必须回看这段证据和source_path中的原始商品JSON。
+          "evidence_excerpt": "来自商品标题、营销描述、FAQ和评论的证据片段。",
+          "source_path": "ecommerce_agent_dataset/.../p_xxx.json"
+        }
+      ],
+
+      "metric_gates": {
+        // 初始为true，表示必须完成审核后才可作为硬门禁。
+        "enabled_after_human_review": true,
+        "wrong_type_rate@10_max": 0.1,
+        "hard_violation_rate@10_max": 0.2,
+        "acceptable_recall@20_min": 0.6,
+        "strong_recall@20_min": 0.4,
+        "ndcg@10_min": 0.65
+      }
+    },
+
+    "answer": {
+      "must_use_evidence_products_only": true,
+      "must_explain_hard_constraints": true,
+      "soft_constraint_labels": ["油皮适用", "轻薄不闷", "夏季通勤"],
+
+      // 这些是确定性/规则检查；judge_rubric_id才交给LLM Judge。
+      "forbidden_behavior": [
+        "不得把商品资料未提到的属性说成确定事实",
+        "不得推荐未进入证据集的商品"
+      ],
+      "judge_rubric_id": "shopping_recommendation_v1"
+    }
+  },
+
+  "annotation": {
+    "purpose": "这条样例存在的原因。",
+    "strict_review_points": [
+      "审核时最容易出错的地方。",
+      "为什么不能直接接受机器预标。"
+    ],
+    "editable_fields": [
+      "你通常需要修改的字段路径。"
+    ],
+    "notes": "自由备注。"
+  }
+}

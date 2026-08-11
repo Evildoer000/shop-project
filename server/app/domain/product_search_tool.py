@@ -42,7 +42,7 @@ class ProductSearchTool:
         plan = self._plan_for_slot(slot, base_plan, categories)
         strategy = plan.retrieval_strategy
         before_structured_filter = self.product_repository.count_available()
-        structured_products = self.product_repository.list_for_plan(plan, limit=strategy.candidate_limit)
+        structured_products = self._retrieval_products(plan, strategy)
         variants = self._query_variants(slot)
         attempts: list[dict] = []
 
@@ -174,7 +174,7 @@ class ProductSearchTool:
             plan = self._plan_for_slot(slot, base_plan, categories)
         strategy = plan.retrieval_strategy
         before_structured_filter = self.product_repository.count_available()
-        structured_products = self.product_repository.list_for_plan(plan, limit=strategy.candidate_limit)
+        structured_products = self._retrieval_products(plan, strategy)
         query = query.strip() or slot.query
 
         if not structured_products:
@@ -267,6 +267,11 @@ class ProductSearchTool:
 
     def query_variants(self, slot: NeedSlot) -> list[str]:
         return self._query_variants(slot)
+
+    def _retrieval_products(self, plan: QueryPlan, strategy: QueryRetrievalStrategy) -> list[Product]:
+        if hasattr(self.product_repository, "list_available_products"):
+            return self.product_repository.list_available_products()
+        return self.product_repository.list_for_plan(plan, limit=max(strategy.candidate_limit, 1_000_000))
 
     def _search_once(
         self,

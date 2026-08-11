@@ -1,0 +1,4 @@
+# Offline evaluation dependencies for the dedicated evaluator container.
+# Keep these out of the backend production image.
+deepeval==4.1.0
+pytest==8.3.5

@@ -7,6 +7,7 @@ import { CartPage } from "./pages/CartPage";
 import { ChatPage } from "./pages/ChatPage";
 import { LoginPage } from "./pages/LoginPage";
 import { MallPage } from "./pages/MallPage";
+import { ObservabilityPage } from "./pages/ObservabilityPage";
 import { ProductDetailPage } from "./pages/ProductDetailPage";
 import type { HealthStatus } from "./types";
 
@@ -50,6 +51,7 @@ function AppRoutes() {
         <Route path="/" element={<ChatPage />} />
         <Route path="/mall" element={<MallPage />} />
         <Route path="/cart" element={<CartPage />} />
+        <Route path="/observability" element={<ObservabilityPage />} />
         <Route path="/products/:productId" element={<ProductDetailPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

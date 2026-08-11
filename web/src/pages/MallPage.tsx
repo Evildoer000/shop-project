@@ -42,6 +42,7 @@ export function MallPage() {
     [categories, selectedCategory],
   );
   const hasMoreCatalog = mode === "catalog" && products.length < catalogTotal;
+  const showCatalogScore = mode === "catalog" && products.some((product) => typeof product.score === "number" && product.score > 0);
 
   useEffect(() => {
     impressedRef.current.clear();
@@ -336,7 +337,7 @@ export function MallPage() {
                 <ProductCard
                   key={`${mode}-${product.product_id}-${index}`}
                   product={product}
-                  showScore={mode === "recommend"}
+                  showScore={mode === "recommend" || showCatalogScore}
                   onOpen={() => openProduct(product, index)}
                   onAdd={() => addToCart(product)}
                 />

@@ -1,5 +1,5 @@
 import { NavLink } from "react-router-dom";
-import { Bot, HeartHandshake, LogOut, Phone, ShoppingCart, Store, Wifi, WifiOff, RefreshCw } from "lucide-react";
+import { Activity, Bot, HeartHandshake, LogOut, Phone, ShoppingCart, Store, Wifi, WifiOff, RefreshCw } from "lucide-react";
 import { useAppIdentity } from "../lib/app-state";
 import type { HealthStatus } from "../types";
 
@@ -12,6 +12,7 @@ const navItems = [
   { to: "/", label: "聊天导购", icon: Bot },
   { to: "/mall", label: "商城推荐", icon: Store },
   { to: "/cart", label: "购物车", icon: ShoppingCart },
+  { to: "/observability", label: "运行观测", icon: Activity },
 ];
 
 export function AppShell({ health, children }: AppShellProps) {

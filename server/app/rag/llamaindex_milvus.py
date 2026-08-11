@@ -59,7 +59,7 @@ class LlamaIndexMilvusRetriever:
                     "id": product.product_id,
                     "doc_id": "None",
                     "text": text,
-                    "embedding": self.embedding_client.embed(text),
+                    "embedding": self.embedding_client.embed_remote_required(text),
                     **metadata,
                     "_node_content": node.to_json(),
                     "_node_type": "TextNode",

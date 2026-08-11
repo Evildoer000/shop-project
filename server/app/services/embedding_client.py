@@ -46,6 +46,34 @@ class EmbeddingClient:
             self.__class__._text_remote_warning_printed = True
         return self._hash_embedding(text)
 
+    def embed_remote_required(self, text: str) -> list[float]:
+        """Generate a remote text embedding without any local fallback."""
+        if not self._is_configured():
+            raise RuntimeError(
+                "Remote text embedding is not configured. "
+                "Set EMBEDDING_API_KEY, EMBEDDING_BASE_URL and EMBEDDING_MODEL."
+            )
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                embedding = self._remote_embedding(text)
+                expected_dim = int(self.settings.embedding_dim)
+                if len(embedding) != expected_dim:
+                    raise RuntimeError(
+                        f"Remote text embedding dimension mismatch: "
+                        f"expected {expected_dim}, got {len(embedding)}."
+                    )
+                if not all(math.isfinite(value) for value in embedding):
+                    raise RuntimeError("Remote text embedding contains non-finite values.")
+                if not any(value != 0.0 for value in embedding):
+                    raise RuntimeError("Remote text embedding is an all-zero vector.")
+                return embedding
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    continue
+        raise RuntimeError(f"Remote text embedding failed after 2 attempts: {last_error}") from last_error
+
     def embed_image(self, image_path: str | Path) -> list[float]:
         if self._image_remote_is_configured():
             for attempt in range(2):

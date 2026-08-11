@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "dist",
+    "types": ["node", "@cloudflare/workers-types"],
+    "rootDir": "."
+  },
+  "include": ["src", "scripts", "worker-configuration.d.ts"]
+}

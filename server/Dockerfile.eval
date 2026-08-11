@@ -1,0 +1,20 @@
+FROM dockerproxy.net/library/python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+ENV PIP_DEFAULT_TIMEOUT=120
+
+WORKDIR /workspace
+
+COPY requirements-docker.txt /tmp/requirements-docker.txt
+COPY requirements-eval.txt /tmp/requirements-eval.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --upgrade pip \
+    && python -m pip install -r /tmp/requirements-docker.txt \
+    && python -m pip install -r /tmp/requirements-eval.txt
+
+CMD ["python", "-m", "pytest", "-c", "benchmark/v2/pytest.ini", "benchmark/v2/tests", "-m", "not semantic", "-q"]

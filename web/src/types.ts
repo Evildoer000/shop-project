@@ -224,6 +224,63 @@ export type TimingSummary = {
   total_latency_ms?: number | null;
   first_token_latency_ms?: number | null;
   completed_spans: number;
+  root_span_key?: string | null;
+  trace_schema_version?: string;
+};
+
+export type AgentRunSummary = {
+  run_id: string;
+  user_id: string;
+  session_id: string;
+  turn_id: string;
+  query_summary: string;
+  route: string;
+  plan_type: string;
+  status: string;
+  total_latency_ms?: number | null;
+  first_token_latency_ms?: number | null;
+  product_ids: string[];
+  evaluation_summary: Record<string, unknown>;
+  created_at?: string | null;
+  updated_at?: string | null;
+};
+
+export type AgentRunSpan = TimingSpan & {
+  span_id: number;
+  span_key?: string | null;
+  parent_span_key?: string | null;
+  task_id: string;
+  agent_id: string;
+  span_type: string;
+  attempt: number;
+  sequence: number;
+  trace_schema_version: string;
+  termination_reason?: string;
+};
+
+export type AgentRunConversation = {
+  turn_id: number;
+  user_message: string;
+  assistant_message: string;
+  route: string;
+  product_ids: string[];
+  rewrite_summary: Record<string, unknown>;
+  trace_summary: Record<string, unknown>;
+  created_at?: string | null;
+  updated_at?: string | null;
+};
+
+export type AgentRunListResponse = {
+  runs: AgentRunSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+export type AgentRunDetailResponse = {
+  run: AgentRunSummary;
+  spans: AgentRunSpan[];
+  conversation?: AgentRunConversation | null;
 };
 
 export type RuleEvaluationCheck = {

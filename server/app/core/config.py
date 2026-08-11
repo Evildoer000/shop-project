@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     milvus_collection: str = "product_chunks"
     text_milvus_collection: str = "product_chunks"
     image_milvus_collection: str = "product_image_chunks"
+    elasticsearch_enabled: bool = True
+    elasticsearch_url: str = "http://localhost:9200"
+    elasticsearch_index: str = "products"
+    elasticsearch_timeout_seconds: float = 10
     organizer_dataset_dir: str | None = "./ecommerce_agent_dataset"
 
     llm_api_key: str | None = None

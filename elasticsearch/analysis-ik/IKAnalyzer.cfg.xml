@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE properties SYSTEM "http://java.sun.com/dtd/properties.dtd">
+<properties>
+    <comment>Shop agent IK analyzer configuration</comment>
+    <entry key="ext_dict">ecommerce.dic</entry>
+    <entry key="ext_stopwords"></entry>
+</properties>

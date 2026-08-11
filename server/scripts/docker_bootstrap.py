@@ -15,6 +15,7 @@ sys.path.insert(0, str(SCRIPT_ROOT))
 
 from app.core.config import get_settings
 from app.db.session import get_engine
+from app.services.elasticsearch_product_index import ElasticsearchProductIndex
 from index_image_vectors import bootstrap_image_index
 from seed_products import main as seed_products_main
 
@@ -23,6 +24,7 @@ def main() -> None:
     timeout_seconds = int(os.getenv("BOOTSTRAP_WAIT_SECONDS", "180"))
     _wait_for_postgres(timeout_seconds)
     _wait_for_milvus(timeout_seconds)
+    _wait_for_elasticsearch(timeout_seconds)
     seed_products_main()
     bootstrap_image_index(skip_without_remote=True)
 
@@ -60,6 +62,25 @@ def _wait_for_milvus(timeout_seconds: int) -> None:
             print(f"Waiting for Milvus: {exc}")
             time.sleep(2)
     raise RuntimeError("Timed out waiting for Milvus.") from last_error
+
+
+def _wait_for_elasticsearch(timeout_seconds: int) -> None:
+    index = ElasticsearchProductIndex()
+    if not index.enabled:
+        print("Elasticsearch is disabled.")
+        return
+    deadline = time.monotonic() + timeout_seconds
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            if index.ping():
+                print("Elasticsearch is ready.")
+                return
+        except Exception as exc:
+            last_error = exc
+            print(f"Waiting for Elasticsearch: {exc}")
+        time.sleep(2)
+    print(f"Timed out waiting for Elasticsearch; backend will use BM25 fallback. Last error: {last_error}")
 
 
 if __name__ == "__main__":
