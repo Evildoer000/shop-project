@@ -4,11 +4,14 @@ import asyncio
 import logging
 import uuid
 from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.db.session import get_sessionmaker
+from app.domain.agents import BusinessAgentServices
 from app.domain.answer_generator import AnswerGenerator
 from app.domain.corrective_agent import CorrectiveAgentController
 from app.domain.image_retrieval_worker import ImageRetrievalWorker
@@ -26,6 +29,22 @@ from app.domain.retrieval_worker import RetrievalWorker
 from app.domain.retrieval_plan_builder import RetrievalPlanBuilder
 from app.domain.single_retrieval_worker import SingleRetrievalEvidence, SingleRetrievalWorker
 from app.domain.task_lifecycle import OrchestratorDecision, TurnTaskState
+from app.domain.supervisor import (
+    build_default_capability_catalog,
+    build_default_prompt_registry,
+    build_foundation_agent_registry,
+)
+from app.domain.supervisor.flow import SupervisorFlow
+from app.domain.tools import (
+    CommerceProductDetailTool,
+    CommerceResearchTool,
+    CommerceReviewsTool,
+    HttpCommerceMcpTransport,
+    ImageUnderstandingTool,
+    ProductDetailTool,
+    UnavailableCommerceTransport,
+    WebSearchTool,
+)
 from app.domain.trajectory_logger import TrajectoryLogger
 from app.harness import EvidenceBundle, EvidenceCandidate, EvidenceSlot, HarnessRuntime
 from app.observability.langfuse_tracer import LangfuseTracer
@@ -44,6 +63,7 @@ from app.schemas import (
     SINGLE_RETRIEVAL_REVIEW_LIMIT,
 )
 from app.services.image_attribute_extractor import ImageAttributeExtractor
+from app.services.llm_client import LlmClient, bind_llm_trace_context
 from app.services.product_repository import ProductRepository
 from app.services.structured_llm import StructuredLlmValidationError
 
@@ -62,8 +82,15 @@ CLIENT_TRACE_DROP_KEYS = {
 class EcommerceOrchestrator:
     def __init__(self, db: Session) -> None:
         self.db = db
+        self.settings = get_settings()
         self.input_processor = InputProcessor()
-        self.intent_planner = IntentPlanner()
+        self.capability_catalog = build_default_capability_catalog()
+        self.prompt_registry = build_default_prompt_registry()
+        self.agent_registry = build_foundation_agent_registry(self.capability_catalog)
+        self.intent_planner = IntentPlanner(
+            capability_catalog=self.capability_catalog,
+            prompt_registry=self.prompt_registry,
+        )
         self.image_attribute_extractor = ImageAttributeExtractor()
         self.corrective_agent = CorrectiveAgentController()
         self.retrieval_plan_builder = RetrievalPlanBuilder()
@@ -105,11 +132,111 @@ class EcommerceOrchestrator:
             "profile_lookup",
             self.profile_lookup_tool,
             description="长期画像读取原子能力",
+            sensitive=True,
         )
+        self.product_detail_tool = ProductDetailTool(self.product_repository)
+        self.image_understanding_tool = ImageUnderstandingTool(self.image_attribute_extractor)
+        commerce_transport = (
+            HttpCommerceMcpTransport(
+                self.settings.commerce_mcp_url,
+                timeout_seconds=self.settings.commerce_mcp_timeout_seconds,
+            )
+            if self.settings.commerce_mcp_url.strip()
+            else UnavailableCommerceTransport()
+        )
+        self.commerce_search_tool = CommerceResearchTool(commerce_transport)
+        self.commerce_product_detail_tool = CommerceProductDetailTool(commerce_transport)
+        self.commerce_reviews_tool = CommerceReviewsTool(commerce_transport)
+        self.web_search_tool = WebSearchTool(
+            endpoint=self.settings.web_search_endpoint,
+            api_key=self.settings.web_search_api_key,
+            timeout_seconds=self.settings.web_search_timeout_seconds,
+        )
+        self.tool_registry.register(
+            "image_understanding",
+            self.image_understanding_tool,
+            description="提取图片中的商品类别、颜色、风格和材质线索",
+        )
+        self.tool_registry.register(
+            "product_detail",
+            self.product_detail_tool,
+            description="按商品 ID 读取本地商品事实",
+        )
+        commerce_platforms = ("taobao", "douyin_ec", "xiaohongshu")
+        self.tool_registry.register(
+            "commerce_search",
+            self.commerce_search_tool,
+            kind="mcp",
+            description="通过受控桥接检索淘宝、抖音电商或小红书",
+            networked=True,
+            platforms=commerce_platforms,
+            timeout_ms=int(self.settings.commerce_mcp_timeout_seconds * 1000),
+        )
+        self.tool_registry.register(
+            "commerce_product_detail",
+            self.commerce_product_detail_tool,
+            kind="mcp",
+            description="通过受控桥接读取外部平台商品详情",
+            networked=True,
+            platforms=commerce_platforms,
+            timeout_ms=int(self.settings.commerce_mcp_timeout_seconds * 1000),
+        )
+        self.tool_registry.register(
+            "commerce_reviews",
+            self.commerce_reviews_tool,
+            kind="mcp",
+            description="通过受控桥接读取外部平台评论或内容反馈",
+            networked=True,
+            platforms=commerce_platforms,
+            timeout_ms=int(self.settings.commerce_mcp_timeout_seconds * 1000),
+        )
+        self.tool_registry.register(
+            "web_search",
+            self.web_search_tool,
+            description="通用联网搜索模板；未配置时返回结构化 unavailable",
+            networked=True,
+            sensitive=bool(self.settings.web_search_api_key),
+            timeout_ms=int(self.settings.web_search_timeout_seconds * 1000),
+        )
+        self.business_agent_services = BusinessAgentServices(
+            intent_planner=self.intent_planner,
+            profile_lookup_tool=self.profile_lookup_tool,
+            retrieval_plan_builder=self.retrieval_plan_builder,
+            retrieval_worker=self.retrieval_worker,
+            product_search_tool=self.product_search_tool,
+            image_search_tool=self.image_search_tool,
+            corrective_agent=self.corrective_agent,
+            repair_agent=self.repair_agent,
+            answer_generator=self.answer_generator,
+            product_repository=self.product_repository,
+            commerce_search=self.commerce_search_tool,
+            commerce_product_detail=self.commerce_product_detail_tool,
+            commerce_reviews=self.commerce_reviews_tool,
+            web_search=self.web_search_tool,
+            knowledge_llm=LlmClient(component="KnowledgeResearchAgent"),
+            comparison_llm=LlmClient(component="ComparisonAgent"),
+            slot_runner=self._graph_slot_runner,
+            memory_scheduler=self._schedule_graph_memory,
+        )
+        self.supervisor_flow = SupervisorFlow(
+            services=self.business_agent_services,
+            tool_registry=self.tool_registry,
+            span_recorder=self.span_recorder,
+            budget_manager=self.budget_manager,
+            registry=self.agent_registry,
+            prompt_registry=self.prompt_registry,
+        )
+        self.multi_agent_runtime_enabled = self.settings.multi_agent_runtime_enabled
         self.trajectory_logger = TrajectoryLogger()
         self.langfuse_tracer = LangfuseTracer()
 
     async def stream(self, request: ChatStreamRequest) -> AsyncGenerator[dict, None]:
+        if getattr(self, "multi_agent_runtime_enabled", False):
+            async with aclosing(self._stream_supervisor(request)) as stream:
+                async for event in stream:
+                    yield event
+            return
+
         task = self._new_task(request)
         normalized_input = self.input_processor.normalize(request)
         query = normalized_input.text
@@ -646,6 +773,459 @@ class EcommerceOrchestrator:
             profile_narrative=profile_narrative,
         ):
             yield event
+
+    async def _stream_supervisor(self, request: ChatStreamRequest) -> AsyncGenerator[dict, None]:
+        task = self._new_task(request)
+        normalized_input = self.input_processor.normalize(request)
+        query = normalized_input.text
+        image_path = normalized_input.image_path
+        planner_query = query or (
+            "用户上传了一张商品图片，希望识别图片线索并推荐相似或相关商品。"
+            if request.image_id
+            else ""
+        )
+        self.span_recorder.start_run(
+            user_id=request.user_id,
+            session_id=request.session_id,
+            turn_id=task.turn_id,
+            query_summary=query or request.message or ("图片商品检索" if request.image_id else ""),
+        )
+        trace_run = self.langfuse_tracer.start_run(
+            "ecommerce_multi_agent_chat",
+            input_payload={
+                "message": request.message,
+                "image_id": request.image_id,
+                "has_image": bool(request.image_id),
+            },
+            user_id=request.user_id,
+            session_id=request.session_id,
+            metadata={"endpoint": "chat_stream", "runtime": "supervisor_graph"},
+        )
+        intent_plan: IntentPlan | None = None
+        planner_span = None
+        try:
+            input_span = self.span_recorder.start_span(
+                "input_normalize",
+                label="输入标准化",
+                agent="InputProcessor",
+                task_id=f"{task.turn_id}:input",
+                agent_id="input_processor",
+                span_type="stage",
+                input_summary={
+                    "has_image_id": bool(request.image_id),
+                    "message_length": len(request.message or ""),
+                },
+            )
+            input_payload = {
+                "normalized_query": query,
+                "image_path_resolved": bool(image_path),
+                "input_modalities": [
+                    *(["text"] if query else []),
+                    *(["image"] if request.image_id else []),
+                ],
+            }
+            input_timing = self._finish_span(input_span, output_summary=input_payload)
+            task.add_step("input", "succeeded", output_summary=input_payload)
+            await trace_run.span("input_normalize", output_payload=input_payload)
+            yield self._timing_event(input_timing)
+            yield self._trace_event("input", "已完成输入标准化。")
+
+            context_span = self.span_recorder.start_span(
+                "memory_context_load",
+                label="读取最近对话与会话摘要",
+                agent="MemoryManager",
+                task_id=f"{task.turn_id}:memory_context",
+                agent_id="memory_manager",
+                span_type="stage",
+                input_summary={"user_id": request.user_id, "session_id": request.session_id},
+            )
+            conversation_context = self.memory_manager.build_context(
+                request.user_id,
+                request.session_id,
+                include_long_term=False,
+            )
+            context_payload = conversation_context.trace_payload()
+            context_timing = self._finish_span(
+                context_span,
+                output_summary={
+                    "recent_turn_count": len(conversation_context.recent_turns),
+                    "pending_summary_turn_count": len(conversation_context.pending_summary_turns),
+                    "has_session_summary": bool(conversation_context.session_summary),
+                    "long_term_profile_loaded": False,
+                },
+                metrics={
+                    "recent_turns": len(conversation_context.recent_turns),
+                    "pending_summary_turns": len(conversation_context.pending_summary_turns),
+                    "long_term_memory_items": 0,
+                },
+            )
+            await trace_run.span("memory_context_load", output_payload=context_payload)
+            yield self._timing_event(context_timing)
+
+            planner_context = self._planner_context(
+                conversation_context,
+                request.session_id,
+                include_long_term=False,
+            )
+            planner_context["input_modalities"] = {
+                "has_text": bool(query),
+                "has_image": bool(request.image_id),
+                "image_id_present": bool(request.image_id),
+                "image_path_resolved": bool(image_path),
+                "rule": "图片只是输入模态；推荐 Agent 决定是否调用多模态 Tool。",
+            }
+            self.budget_manager.record_planner_call(task)
+            planner_span = self.span_recorder.start_span(
+                "intent_planning",
+                label="强制意图理解与任务提案",
+                agent="IntentUnderstandingAgent",
+                task_id=f"{task.turn_id}:intent_understanding",
+                agent_id="intent_understanding_agent",
+                span_type="agent",
+                input_summary={
+                    "query_length": len(planner_query),
+                    "recent_turns": len(conversation_context.recent_turns),
+                    "has_session_summary": bool(conversation_context.session_summary),
+                    "has_image": bool(request.image_id),
+                    "long_term_profile_loaded": False,
+                    "prompt_version": self.prompt_registry.require("intent_understanding_agent").version,
+                },
+            )
+            yield self._agent_update(
+                stage="planner",
+                title="理解需求",
+                content_delta="正在结合当前消息和本会话上下文识别意图。",
+                done=False,
+            )
+            with bind_llm_trace_context(
+                run_id=self.span_recorder.run_id,
+                parent_span_key=planner_span.span_key,
+                task_id=f"{task.turn_id}:intent_understanding",
+                agent_id="intent_understanding_agent",
+                attempt=1,
+                span_recorder=self.span_recorder,
+            ):
+                async for planner_event in self.intent_planner.stream_plan_with_summary(
+                    planner_query,
+                    planner_context,
+                ):
+                    if getattr(planner_event, "kind", "") == "summary_delta":
+                        content = str(getattr(planner_event, "content", "") or "")
+                        if content:
+                            yield self._agent_update(
+                                stage="planner",
+                                title="理解需求",
+                                content_delta=content,
+                                done=False,
+                            )
+                    elif getattr(planner_event, "kind", "") == "plan":
+                        intent_plan = getattr(planner_event, "intent_plan", None)
+            if intent_plan is None:
+                raise StructuredLlmValidationError(
+                    "IntentUnderstandingAgent did not return an IntentPlan.",
+                    errors=["missing IntentPlan after tagged stream"],
+                    data=None,
+                    content="",
+                )
+            planner_payload = self._finish_span(
+                planner_span,
+                output_summary=intent_plan.model_dump(),
+                metrics=self._planner_rule_metrics(intent_plan),
+            )
+            planner_span = None
+            self._update_planner_proposal(task, intent_plan)
+            task.add_step("intent_planning", "succeeded", output_summary=intent_plan.model_dump())
+            self.decide_intent_plan(task, intent_plan)
+            await trace_run.span(
+                "intent_understanding",
+                input_payload={"query": planner_query, "context": context_payload},
+                output_payload=intent_plan.model_dump(),
+                metadata={"prompt_version": self.prompt_registry.require("intent_understanding_agent").version},
+                as_type="generation",
+            )
+            yield self._timing_event(planner_payload)
+            yield self._agent_update(
+                stage="planner",
+                title="理解需求",
+                content_delta="意图提案已生成，正在执行代码策略审批。",
+                done=True,
+            )
+            yield self._trace_event(
+                "intent_understanding",
+                "IntentUnderstandingAgent 已提交结构化提案，等待 Supervisor Policy Gate。",
+                intent_plan=intent_plan.model_dump(),
+            )
+
+            # The mandatory planner has already run. A missing upload is now a
+            # controlled input failure rather than an image-only planner bypass.
+            if request.image_id and image_path is None:
+                async for event in self._stream_missing_image(
+                    request=request,
+                    query=query,
+                    task=task,
+                    trace_run=trace_run,
+                    profile_narrative="",
+                ):
+                    yield event
+                return
+
+            self.decide_execution_path(task, intent_plan)
+            supervisor_stream = self.supervisor_flow.run(
+                query=planner_query,
+                user_id=request.user_id,
+                session_id=request.session_id,
+                turn_id=task.turn_id,
+                intent_plan=intent_plan,
+                conversation_context=conversation_context,
+                image_path=str(image_path) if image_path is not None else None,
+                intent_span_key=planner_payload.get("span_key"),
+                metadata={
+                    "request": request,
+                    "planner_context": planner_context,
+                    "profile_narrative": "",
+                    "run_id": self.span_recorder.run_id,
+                },
+            )
+            async with aclosing(supervisor_stream) as graph_stream:
+                async for event in graph_stream:
+                    event_type = str(event.get("type") or "")
+                    if event_type == "done":
+                        continue
+                    if event_type == "token":
+                        self.span_recorder.mark_first_token()
+                    if event_type in {"decision_trace", "trace"}:
+                        event = self._drop_client_trace_fields(event)
+                    yield event
+
+            result = self.supervisor_flow.last_result
+            if result is None:
+                raise RuntimeError("SupervisorFlow completed without a result")
+            evaluation = self._supervisor_evaluation_summary(intent_plan, result)
+            run_status = "succeeded"
+            termination_reason = str(result.graph.metadata.get("termination_reason") or "completed")
+            if result.report.failed_node_ids or result.report.blocked_node_ids:
+                run_status = "degraded" if result.answer_text else "failed"
+                termination_reason = termination_reason if termination_reason != "completed" else "completed_with_fallback"
+            self.trajectory_logger.log(
+                {
+                    "run_id": self.span_recorder.run_id,
+                    "user_id": request.user_id,
+                    "session_id": request.session_id,
+                    "turn_id": task.turn_id,
+                    "runtime": "supervisor_graph",
+                    "trace": result.trace,
+                    "evaluation": evaluation,
+                    "model_usage": self._trace_metadata(),
+                }
+            )
+            await trace_run.end(
+                output_payload={
+                    "route": result.route,
+                    "product_ids": result.product_ids,
+                    "answer_length": len(result.answer_text),
+                    "task_status": result.trace.get("task_status"),
+                },
+                metadata={
+                    **self._trace_metadata(),
+                    "run_id": self.span_recorder.run_id,
+                    "graph_id": result.graph.graph_id,
+                    "termination_reason": termination_reason,
+                },
+            )
+            self.span_recorder.finish_run(
+                route=result.route,
+                plan_type=intent_plan.plan_type,
+                product_ids=result.product_ids,
+                evaluation_summary=evaluation,
+                status=run_status,
+                termination_reason=termination_reason,
+            )
+            yield self._timing_event()
+            yield {"type": "done", "run_id": self.span_recorder.run_id}
+        except StructuredLlmValidationError as exc:
+            if planner_span is not None:
+                yield self._timing_event(
+                    self.span_recorder.finish_span(
+                        planner_span,
+                        status="failed",
+                        error_type="StructuredLlmValidationError",
+                        error_message=str(exc),
+                        termination_reason="planner_contract_invalid",
+                    )
+                )
+                planner_span = None
+            async for event in self._stream_planner_failure(
+                request=request,
+                query=query,
+                task=task,
+                trace_run=trace_run,
+                error=exc,
+            ):
+                yield event
+        except asyncio.CancelledError:
+            if self.span_recorder.status == "running":
+                self.span_recorder.finish_run(
+                    route="cancelled",
+                    plan_type=intent_plan.plan_type if intent_plan else "",
+                    product_ids=[],
+                    evaluation_summary={},
+                    status="cancelled",
+                    termination_reason="client_disconnected_or_task_cancelled",
+                )
+            await trace_run.end(error="cancelled")
+            raise
+        except GeneratorExit:
+            if self.span_recorder.status == "running":
+                self.span_recorder.finish_run(
+                    route="cancelled",
+                    plan_type=intent_plan.plan_type if intent_plan else "",
+                    product_ids=[],
+                    evaluation_summary={},
+                    status="cancelled",
+                    termination_reason="client_stream_closed",
+                )
+            await trace_run.end(error="client_stream_closed")
+            raise
+        except Exception as exc:
+            logger.exception("Supervisor graph request failed: %s", exc)
+            if planner_span is not None:
+                self.span_recorder.finish_span(
+                    planner_span,
+                    status="failed",
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                    termination_reason="supervisor_exception",
+                )
+                planner_span = None
+            if self.span_recorder.status == "running":
+                self.span_recorder.finish_run(
+                    route="supervisor_failed",
+                    plan_type=intent_plan.plan_type if intent_plan else "",
+                    product_ids=[],
+                    evaluation_summary={},
+                    status="failed",
+                    termination_reason=type(exc).__name__,
+                )
+            await trace_run.end(error=str(exc))
+            yield self._agent_update(
+                stage="answer",
+                title="请求未完成",
+                content_delta="本次处理出现异常，请稍后重试。",
+                done=True,
+            )
+            yield {"type": "token", "content": "抱歉，本次请求处理失败，请稍后重试。"}
+            yield self._timing_event()
+            yield {"type": "done", "run_id": self.span_recorder.run_id}
+
+    async def _graph_slot_runner(
+        self,
+        slot: NeedSlot,
+        plan: QueryPlan,
+        intent_plan: IntentPlan,
+    ) -> Any:
+        return await asyncio.to_thread(
+            self.multi_need_coordinator._run_slot_agent_in_isolated_context,
+            slot.model_copy(deep=True),
+            plan.model_copy(deep=True),
+            intent_plan.model_copy(deep=True),
+        )
+
+    def _schedule_graph_memory(self, context: Any, answer_text: str) -> None:
+        request = context.metadata.get("request")
+        if not isinstance(request, ChatStreamRequest):
+            return
+        intent_plan = context.artifact("intent_plan")
+        if not isinstance(intent_plan, IntentPlan):
+            intent_plan = context.intent_plan
+        reflection = context.artifact("reflection")
+        reflection_summary = (
+            self._reflection_summary(reflection)
+            if isinstance(reflection, ReflectionResult)
+            else {}
+        )
+        route = str(context.artifact("answer_route") or "no_product")
+        product_ids = list(context.artifact("answer_product_ids") or [])
+        self._schedule_memory_update(
+            request=request,
+            query=context.query,
+            answer_text=answer_text,
+            route=route,
+            product_ids=product_ids,
+            intent_plan=intent_plan,
+            decision_trace={
+                "route": route,
+                "retrieval_summary": reflection_summary,
+            },
+        )
+
+    def _supervisor_evaluation_summary(self, intent_plan: IntentPlan, result: Any) -> dict[str, Any]:
+        reflection = result.reflection if isinstance(result.reflection, ReflectionResult) else ReflectionResult(
+            has_passed_products=False,
+            reason="本轮未产生商品校验结果。",
+        )
+        single = result.report.artifacts.get("verified_evidence") or result.report.artifacts.get("single_evidence")
+        state = result.report.artifacts.get("verified_state") or result.report.artifacts.get("multi_state")
+        if state is not None:
+            recall_count = sum(len(items) for items in state.candidates_by_slot.values())
+        else:
+            recall_count = len(getattr(single, "ranked", []) or [])
+        corrective = self._corrective_rule_metrics(reflection, recall_count)
+        final_ids = set(result.product_ids or [])
+        evidence_ids = set(reflection.passed_product_ids or [])
+        products_from_evidence = not final_ids or bool(evidence_ids) and final_ids.issubset(evidence_ids)
+        return {
+            "checks": [
+                {
+                    "key": "plan_type",
+                    "label": "plan_type（计划类型）",
+                    "value": intent_plan.plan_type,
+                    "status": "passed" if intent_plan.plan_type in IntentPlanner.PLAN_TYPES else "warning",
+                    "description": "IntentUnderstandingAgent 输出的主执行计划类型。",
+                },
+                {
+                    "key": "need_slot_count",
+                    "label": "need_slots（需求槽位数）",
+                    "value": len(intent_plan.need_slots),
+                    "status": "passed" if intent_plan.plan_type != "multi_retrieval" or len(intent_plan.need_slots) >= 2 else "warning",
+                    "description": "多商品组合应拆出至少两个独立槽位。",
+                },
+                {
+                    "key": "budget_extracted",
+                    "label": "budget（预算识别）",
+                    "value": self._budget_value(intent_plan),
+                    "status": "passed" if intent_plan.budget_min is not None or intent_plan.budget_max is not None else "skipped",
+                    "description": "展示当前消息和会话上下文中的预算识别结果。",
+                },
+                {
+                    "key": "recall_count",
+                    "label": "recall_count（召回数量）",
+                    "value": recall_count,
+                    "status": "passed" if recall_count > 0 else ("skipped" if intent_plan.plan_type in {"direct_answer", "clarify"} else "warning"),
+                    "description": "进入 EvidenceVerifier 前的本地商品候选数量。",
+                },
+                {
+                    "key": "corrective_pass_rate",
+                    "label": "corrective_pass_rate（证据校验通过率）",
+                    "value": corrective["corrective_pass_rate"],
+                    "status": "passed" if recall_count == 0 or corrective["corrective_pass_rate"] > 0 else "warning",
+                    "description": "EvidenceVerifier 通过商品数除以候选商品数。",
+                },
+                {
+                    "key": "products_from_evidence",
+                    "label": "products_from_evidence（最终商品来自证据集）",
+                    "value": f"{len(final_ids & evidence_ids)}/{len(final_ids)}" if final_ids else "本轮未输出商品",
+                    "status": "passed" if products_from_evidence else "warning",
+                    "description": "最终展示商品必须属于 EvidenceVerifier 通过集合。",
+                },
+            ],
+            "raw": {
+                "recall_count": recall_count,
+                "passed_product_ids": list(reflection.passed_product_ids),
+                "rejected_count": len(reflection.rejected_products),
+                "fallback_plan": reflection.fallback_plan,
+                "route": result.route,
+            },
+        }
 
     async def _stream_single_retrieval(
         self,

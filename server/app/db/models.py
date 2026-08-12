@@ -133,6 +133,12 @@ class AgentRun(Base):
     route: Mapped[str] = mapped_column(String(64), default="", nullable=False)
     plan_type: Mapped[str] = mapped_column(String(64), default="", nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="running", nullable=False)
+    termination_reason: Mapped[str] = mapped_column(
+        String(128),
+        default="",
+        server_default=text("''"),
+        nullable=False,
+    )
     total_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
     first_token_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
     product_ids: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)

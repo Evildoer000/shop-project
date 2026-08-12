@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -197,12 +198,13 @@ async def chat_stream(
         await asyncio.sleep(0.01)
 
         orchestrator = EcommerceOrchestrator(db)
-        async for event in orchestrator.stream(payload):
-            event_type = event.get("type", "message")
-            yield {
-                "event": event_type,
-                "data": json.dumps(event, ensure_ascii=False),
-            }
+        async with aclosing(orchestrator.stream(payload)) as stream:
+            async for event in stream:
+                event_type = event.get("type", "message")
+                yield {
+                    "event": event_type,
+                    "data": json.dumps(event, ensure_ascii=False),
+                }
 
     return EventSourceResponse(events())
 

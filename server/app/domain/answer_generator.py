@@ -56,13 +56,17 @@ class AnswerGenerator:
         ranked_products: list[tuple[Product, float]],
         profile_narrative: str = "",
         image_attributes: dict[str, Any] | None = None,
+        extra_context: dict[str, Any] | None = None,
+        system_prompt_prefix: str = "",
     ) -> AsyncGenerator[str, None]:
         system_prompt, user_prompt = self._single_retrieval_prompt(
             plan,
             ranked_products,
             profile_narrative=profile_narrative,
             image_attributes=image_attributes,
+            extra_context=extra_context,
         )
+        system_prompt = self._with_system_prefix(system_prompt_prefix, system_prompt)
         async for token in self._generate_stream_or_fallback(
             system_prompt,
             user_prompt,
@@ -80,6 +84,8 @@ class AnswerGenerator:
         rejected_products: list[dict] | None = None,
         combo_summary: dict | None = None,
         profile_narrative: str = "",
+        extra_context: dict[str, Any] | None = None,
+        system_prompt_prefix: str = "",
     ) -> AsyncGenerator[str, None]:
         system_prompt, user_prompt = self._multi_need_prompt(
             state,
@@ -90,7 +96,9 @@ class AnswerGenerator:
             rejected_products,
             combo_summary,
             profile_narrative=profile_narrative,
+            extra_context=extra_context,
         )
+        system_prompt = self._with_system_prefix(system_prompt_prefix, system_prompt)
         async for token in self._generate_stream_or_fallback(
             system_prompt,
             user_prompt,
@@ -107,6 +115,7 @@ class AnswerGenerator:
         preferred_text: str | None = None,
         extra_context: dict | None = None,
         profile_narrative: str = "",
+        system_prompt_prefix: str = "",
     ) -> AsyncGenerator[str, None]:
         text = preferred_text
         if text is None:
@@ -118,6 +127,7 @@ class AnswerGenerator:
                 extra_context,
                 profile_narrative,
             )
+            system_prompt = self._with_system_prefix(system_prompt_prefix, system_prompt)
             async for token in self._generate_stream_or_fallback(
                 system_prompt,
                 user_prompt,
@@ -154,6 +164,7 @@ class AnswerGenerator:
         ranked_products: list[tuple[Product, float]],
         profile_narrative: str = "",
         image_attributes: dict[str, Any] | None = None,
+        extra_context: dict[str, Any] | None = None,
     ) -> tuple[str, str]:
         if not ranked_products:
             raise RuntimeError("AnswerGenerator 没有可用于生成回答的候选商品。")
@@ -187,6 +198,8 @@ class AnswerGenerator:
             "profile_narrative 只用于表达个性化理由，不能改变 final_products，不能把画像说成用户本轮明确要求。"
             "如果 image_attributes.available=true，可以用“根据图片推测”引入颜色、风格、品类等视觉语义；"
             "必须保持不确定措辞，不能把图片推测说成商品事实，也不能覆盖商品证据。"
+            "extra_context.verified_external_evidence 只包含 EvidenceVerifier 放行的对比、知识或外部平台证据；"
+            "可以用它补充用户明确要求的解释和对比，但不得用它新增 final_products、价格、库存或未经本地校验的商品推荐。"
             "\n\n# 输出格式 (markdown, 字数不限)\n"
             "必须严格按以下 markdown 格式输出，让前端解析渲染:\n"
             "\n"
@@ -216,6 +229,7 @@ class AnswerGenerator:
                 "final_products": products,
                 "profile_narrative": profile_narrative[:1500],
                 "image_attributes": image_attributes or {},
+                "extra_context": extra_context or {},
                 "instruction": (
                     f"请按 final_recommendation_order 顺序推荐全部 {len(products)} 个 final_products。"
                     "这些商品都是正式推荐结果；不要遗漏，不要另设候补。"
@@ -262,6 +276,7 @@ class AnswerGenerator:
         rejected_products: list[dict] | None = None,
         combo_summary: dict | None = None,
         profile_narrative: str = "",
+        extra_context: dict[str, Any] | None = None,
     ) -> tuple[str, str]:
         if not selection.flat_candidates:
             raise RuntimeError("AnswerGenerator 没有可用于生成多需求回答的候选商品。")
@@ -402,6 +417,8 @@ class AnswerGenerator:
             "如果 slot 已有正式通过商品，不要提该 slot 的 near-miss。\n"
             "profile_narrative 只用于表达个性化理由，不能影响正式推荐、预算组合、slot 覆盖判断；"
             "不要把画像内容说成用户本轮明确要求。\n"
+            "extra_context.verified_external_evidence 只用于补充用户明确要求的知识、对比或平台观察；"
+            "不得用这些外部内容新增 final_products_by_slot 或改变已审核组合。\n"
             "route playbook: "
             "recommend=按 slot 分组推荐完整组合；有 total budget 时明确组合总价。"
             "over_budget_combo=说明检索到了覆盖全部 slot 的最低完整组合候选，但最低总价 X 比预算 Y 高 Z；列 over_budget_combo_by_slot 中的候选；自然询问用户是否接受超预算、提高预算、减少购买项或放宽条件，不要写成已正式推荐。"
@@ -424,6 +441,7 @@ class AnswerGenerator:
                 "near_miss_suggestions": near_miss_suggestions,
                 "rejected_products": rejected_products or [],
                 "profile_narrative": profile_narrative[:1500],
+                "extra_context": extra_context or {},
             },
             ensure_ascii=False,
         )
@@ -509,6 +527,10 @@ class AnswerGenerator:
         call = self.llm_client.generate_required
         kwargs = {"operation": operation} if self._supports_parameter(call, "operation") else {}
         return await call(system_prompt, user_prompt, **kwargs)
+
+    def _with_system_prefix(self, prefix: str, prompt: str) -> str:
+        normalized = str(prefix or "").strip()
+        return f"{normalized}\n\n## 具体回答任务\n{prompt}" if normalized else prompt
 
     @staticmethod
     def _supports_parameter(callable_obj: Any, name: str) -> bool:

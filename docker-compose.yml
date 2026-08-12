@@ -44,6 +44,12 @@ x-backend-env: &backend-env
   RERANK_BASE_URL: ${RERANK_BASE_URL:-}
   RERANK_MODEL: ${RERANK_MODEL:-}
   RERANK_TIMEOUT_SECONDS: ${RERANK_TIMEOUT_SECONDS:-30}
+  MULTI_AGENT_RUNTIME_ENABLED: ${MULTI_AGENT_RUNTIME_ENABLED:-true}
+  COMMERCE_MCP_URL: ${COMMERCE_MCP_URL:-http://commerce-mcp:8787}
+  COMMERCE_MCP_TIMEOUT_SECONDS: ${COMMERCE_MCP_TIMEOUT_SECONDS:-15}
+  WEB_SEARCH_ENDPOINT: ${WEB_SEARCH_ENDPOINT:-}
+  WEB_SEARCH_API_KEY: ${WEB_SEARCH_API_KEY:-}
+  WEB_SEARCH_TIMEOUT_SECONDS: ${WEB_SEARCH_TIMEOUT_SECONDS:-15}
   ENABLE_TRAJECTORY_LOG: ${ENABLE_TRAJECTORY_LOG:-true}
   TRAJECTORY_LOG_PATH: /app/logs/multihop_trajectories.jsonl
   LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
@@ -137,6 +143,27 @@ services:
       timeout: 5s
       retries: 30
 
+  commerce-mcp:
+    build:
+      context: ./justoneapi-mcp-main
+      dockerfile: Dockerfile.bridge
+    image: shop-agent-commerce-mcp:latest
+    container_name: ecommerce-rag-commerce-mcp
+    environment:
+      JUSTONEAPI_TOKEN: ${JUSTONEAPI_TOKEN:-}
+      JUSTONEAPI_BASE_URL: ${JUSTONEAPI_BASE_URL:-https://api.justoneapi.com}
+      JUSTONEAPI_SEARCH_V2_ENABLED: ${JUSTONEAPI_SEARCH_V2_ENABLED:-true}
+      JUSTONEAPI_TIMEOUT_MS: ${JUSTONEAPI_TIMEOUT_MS:-60000}
+      JUSTONEAPI_RETRY: ${JUSTONEAPI_RETRY:-1}
+      BRIDGE_PORT: 8787
+    ports:
+      - "8787:8787"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   backend-bootstrap:
     build:
       context: ./server
@@ -157,6 +184,8 @@ services:
         condition: service_started
       milvus:
         condition: service_started
+      commerce-mcp:
+        condition: service_healthy
     volumes:
       - ./ecommerce_agent_dataset:/data/ecommerce_agent_dataset:ro
       - backend_logs:/app/logs

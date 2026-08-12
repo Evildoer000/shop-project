@@ -43,12 +43,13 @@ class RepairAgent:
         trigger: str,
         reflection_result: ReflectionResult,
         previous_candidates: dict[str, list[dict[str, Any]]] | None = None,
+        system_prompt_prefix: str = "",
     ) -> RepairPlan:
         fallback = self._fallback_plan(slots, trigger, reflection_result)
         if not self.llm_client.is_configured():
             return fallback
 
-        system_prompt = (
+        system_prompt = system_prompt_prefix + ("\n\n" if system_prompt_prefix else "") + (
             "你是电商 RAG Harness 的 RepairAgent（修复规划 Worker Agent）。只输出 JSON object，不要输出 Markdown。\n"
             "你的职责是：在 Orchestrator 已批准 repair 后，根据 CorrectiveAgent 的 reflection/repair_hint 生成检索修复计划。\n"
             "你只能生成 repair query，不执行检索、不读取商品库、不评价候选、不回答用户、不决定 final_route。\n"

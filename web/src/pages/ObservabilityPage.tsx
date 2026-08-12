@@ -262,6 +262,7 @@ function RunDetail({
         </div>
         <div className="run-overview-grid">
           <OverviewMetric label="状态" value={statusLabel(detail.run.status)} />
+          <OverviewMetric label="结束原因" value={detail.run.termination_reason || "正常完成"} />
           <OverviewMetric label="计划类型" value={detail.run.plan_type || "-"} />
           <OverviewMetric label="最终路径" value={detail.run.route || "-"} />
           <OverviewMetric label="总耗时" value={formatMs(detail.run.total_latency_ms)} />

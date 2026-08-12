@@ -4,6 +4,7 @@ import json
 import pytest
 
 from app.domain.intent_planner import IntentPlanner
+from app.domain.supervisor.validators import validate_intent_plan_contract
 from app.services.structured_llm import StructuredLlmValidationError
 
 
@@ -314,6 +315,128 @@ def test_intent_planner_retries_then_raises_invalid_json() -> None:
 
     assert len(client.calls) == 2
     assert "输出不是可解析的 JSON object" in client.calls[1]["user_prompt"]
+
+
+def test_intent_planner_expands_compound_request_into_supervisor_contract() -> None:
+    payload = base_payload(
+        normalized_query="推荐油皮通勤防晒并与上一款比较，解释清爽依据",
+        primary_intent="product_recommendation",
+        intents=[
+            {
+                "intent_id": "i1",
+                "intent_type": "product_recommendation",
+                "goal": "推荐油皮通勤防晒",
+                "query_rewrite": {
+                    "semantic_query": "适合油皮通勤且清爽的防晒霜",
+                    "keyword_query": "防晒霜 油皮 清爽 通勤 150元以内",
+                },
+            },
+            {
+                "intent_id": "i2",
+                "intent_type": "product_comparison",
+                "goal": "与上一款防晒比较",
+                "depends_on": ["i1"],
+                "referenced_product_ids": ["p1"],
+            },
+            {
+                "intent_id": "i3",
+                "intent_type": "shopping_knowledge",
+                "goal": "解释清爽不闷依据",
+                "depends_on": ["i1"],
+            },
+        ],
+        execution_mode="single_product",
+        input_modalities=["text"],
+        constraints={"budget_max": 150, "budget_scope": "per_item", "items": []},
+        context_requests=[
+            {
+                "request_id": "ctx_profile",
+                "context_type": "long_term_profile",
+                "usage": "ranking_only",
+                "query": "防晒偏好",
+                "reason": "用户明确要求按照平时偏好",
+            }
+        ],
+        research_requests=[
+            {
+                "request_id": "r1",
+                "intent_id": "i2",
+                "mode": "social_content",
+                "platforms": ["xiaohongshu"],
+                "query": "两款防晒评价",
+                "reason": "用户要求查看小红书评价",
+            }
+        ],
+        agent_proposals=[
+            {
+                "proposal_id": "p_profile",
+                "capability": "profile_preference",
+                "intent_ids": ["i1"],
+                "reason": "需要个性化排序",
+            },
+            {
+                "proposal_id": "p_single",
+                "capability": "single_product_recommendation",
+                "intent_ids": ["i1"],
+                "reason": "需要召回一个商品目标",
+            },
+            {
+                "proposal_id": "p_compare",
+                "capability": "comparison",
+                "intent_ids": ["i2"],
+                "depends_on": ["p_single"],
+                "reason": "用户要求对比",
+            },
+            {
+                "proposal_id": "p_knowledge",
+                "capability": "knowledge_research",
+                "intent_ids": ["i3"],
+                "depends_on": ["p_single"],
+                "reason": "用户要求解释原理",
+            },
+        ],
+        referenced_product_ids=["p1"],
+        profile_lookup={
+            "requested": True,
+            "query": "防晒偏好",
+            "usage": "ranking_only",
+            "reason": "用户明确依赖长期偏好",
+        },
+    )
+
+    plan = asyncio.run(IntentPlanner(StaticLlmClient(payload)).plan(payload["normalized_query"], {}))
+
+    validate_intent_plan_contract(plan)
+    assert [intent.intent_type for intent in plan.intents] == [
+        "product_recommendation",
+        "product_comparison",
+        "shopping_knowledge",
+    ]
+    assert plan.execution_mode == "single_product"
+    assert plan.context_requests[0].usage == "ranking_only"
+    assert plan.research_requests[0].platforms == ["xiaohongshu"]
+    assert [proposal.capability for proposal in plan.agent_proposals] == [
+        "profile_preference",
+        "single_product_recommendation",
+        "comparison",
+        "knowledge_research",
+    ]
+
+
+def test_intent_planner_prompt_exposes_only_planner_proposable_capabilities() -> None:
+    client = StaticLlmClient({"plan_type": "direct_answer"})
+
+    asyncio.run(IntentPlanner(client).plan("你好", {}))
+
+    user_prompt = json.loads(client.calls[0]["user_prompt"])
+    capabilities = {
+        item["capability"] for item in user_prompt["available_agent_capabilities"]
+    }
+    assert "single_product_recommendation" in capabilities
+    assert "comparison" in capabilities
+    assert "repair" not in capabilities
+    assert "answer_generation" not in capabilities
+    assert "memory_distillation" not in capabilities
 
 
 async def _collect_stream(generator):

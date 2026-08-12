@@ -67,6 +67,15 @@ class Settings(BaseSettings):
     rerank_backend: str = "hybrid"
     rerank_timeout_seconds: float = 30
 
+    # Supervisor/Agent runtime. Docker enables the graph runtime; the legacy
+    # flow remains available as a controlled rollback for local tests.
+    multi_agent_runtime_enabled: bool = True
+    commerce_mcp_url: str = ""
+    commerce_mcp_timeout_seconds: float = 15
+    web_search_endpoint: str = ""
+    web_search_api_key: str = ""
+    web_search_timeout_seconds: float = 15
+
     enable_trajectory_log: bool = True
     trajectory_log_path: str = "server/logs/multi_need_trajectories.jsonl"
 

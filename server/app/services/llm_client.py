@@ -7,6 +7,8 @@ import os
 import time
 from dataclasses import dataclass
 from collections.abc import AsyncGenerator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 from urllib.parse import urlparse
 
@@ -22,6 +24,17 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 # 设 LLM_DEBUG_LOG_PATH=/tmp/phase3.jsonl 把每次 LLM call 的 prompt+response 写盘
 _PROMPT_LOG_PATH = os.environ.get("LLM_DEBUG_LOG_PATH", "")
 _PROMPT_LOG_SEQ = {"n": 0}
+_LLM_TRACE_CONTEXT: ContextVar[dict[str, Any]] = ContextVar("llm_trace_context", default={})
+
+
+@contextmanager
+def bind_llm_trace_context(**values: Any):
+    current = dict(_LLM_TRACE_CONTEXT.get())
+    token = _LLM_TRACE_CONTEXT.set({**current, **values})
+    try:
+        yield
+    finally:
+        _LLM_TRACE_CONTEXT.reset(token)
 
 
 def _log_prompt(component: str, operation: str, system_prompt: str, user_prompt: str,
@@ -84,6 +97,11 @@ class ModelCallTelemetry:
     attempt_count: int = 0
     error_type: str | None = None
     status_code: int | None = None
+    run_id: str = ""
+    span_key: str = ""
+    task_id: str = ""
+    agent_id: str = ""
+    attempt: int = 1
 
     def model_dump(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -103,6 +121,15 @@ class ModelCallTelemetry:
             payload["error_type"] = self.error_type
         if self.status_code is not None:
             payload["status_code"] = self.status_code
+        if self.run_id:
+            payload["run_id"] = self.run_id
+        if self.span_key:
+            payload["span_key"] = self.span_key
+        if self.task_id:
+            payload["task_id"] = self.task_id
+        if self.agent_id:
+            payload["agent_id"] = self.agent_id
+        payload["attempt"] = self.attempt
         return payload
 
 
@@ -588,6 +615,7 @@ class LlmClient:
         error_type: str | None = None,
         status_code: int | None = None,
     ) -> None:
+        trace_context = dict(_LLM_TRACE_CONTEXT.get())
         telemetry = ModelCallTelemetry(
             component=self.component,
             model=str(self.settings.llm_model or ""),
@@ -601,10 +629,50 @@ class LlmClient:
             attempt_count=attempt_count,
             error_type=error_type,
             status_code=status_code,
+            run_id=str(trace_context.get("run_id") or ""),
+            span_key=str(trace_context.get("parent_span_key") or ""),
+            task_id=str(trace_context.get("task_id") or ""),
+            agent_id=str(trace_context.get("agent_id") or ""),
+            attempt=max(1, int(trace_context.get("attempt") or 1)),
         )
         self.last_call = telemetry
         self.call_history.append(telemetry)
         logger.info("LLM telemetry: %s", telemetry.model_dump())
+        recorder = trace_context.get("span_recorder")
+        if recorder is not None and hasattr(recorder, "record_completed_span"):
+            try:
+                recorder.record_completed_span(
+                    f"llm:{self.component}:{operation}",
+                    label=f"{self.component}.{operation}",
+                    duration_ms=telemetry.latency_ms,
+                    parent_span_key=telemetry.span_key or None,
+                    task_id=telemetry.task_id,
+                    agent_id=telemetry.agent_id or self.component,
+                    span_type="llm",
+                    attempt=telemetry.attempt,
+                    status=telemetry.status,
+                    input_summary={
+                        "component": self.component,
+                        "operation": operation,
+                        "model": telemetry.model,
+                        "provider": telemetry.provider,
+                        "stream": stream,
+                    },
+                    output_summary={
+                        "usage": telemetry.usage,
+                        "estimated_cost": telemetry.estimated_cost,
+                        "attempt_count": telemetry.attempt_count,
+                        "status_code": telemetry.status_code,
+                    },
+                    metrics={
+                        "total_tokens": self._token_count(telemetry.usage, "total_tokens"),
+                        "estimated_cost": telemetry.estimated_cost,
+                    },
+                    error_type=telemetry.error_type or "",
+                    termination_reason="completed" if telemetry.status == "succeeded" else "llm_failed",
+                )
+            except Exception as exc:
+                logger.warning("persist LLM telemetry span failed: %s", exc)
 
     def _usage_from_response(self, data: Any) -> dict[str, Any]:
         if not isinstance(data, dict) or not isinstance(data.get("usage"), dict):

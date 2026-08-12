@@ -117,10 +117,13 @@ class QueryPlan(BaseModel):
 
 class RewriteNeedSlot(BaseModel):
     slot_id: str
+    intent_id: str = ""
     need_type: Literal["required", "optional"] = "required"
     goal: str
     product_type: str = ""
     query: str
+    semantic_query: str = ""
+    keyword_query: str = ""
     soft_constraints: list[str] = Field(default_factory=list)
     exclude_terms: list[str] = Field(default_factory=list)
     min_candidates: int = 1
@@ -138,12 +141,147 @@ PlanType = Literal[
 class ProfileLookupProposal(BaseModel):
     requested: bool = False
     query: str = ""
+    usage: Literal["intent_refinement", "ranking_only", "answer_personalization"] = "ranking_only"
     reason: str = ""
 
 
+IntentType = Literal[
+    "social_chat",
+    "product_recommendation",
+    "product_comparison",
+    "product_qa",
+    "shopping_knowledge",
+    "cart_action",
+]
+
+ExecutionMode = Literal[
+    "direct",
+    "clarify",
+    "context_evidence",
+    "single_product",
+    "multi_product",
+]
+
+InputModality = Literal["text", "image", "audio"]
+
+AgentCapability = Literal[
+    "intent_understanding",
+    "profile_preference",
+    "clarification",
+    "single_product_recommendation",
+    "multi_product_bundle",
+    "slot_product_retrieval",
+    "commerce_research",
+    "comparison",
+    "knowledge_research",
+    "evidence_verification",
+    "bundle_optimization",
+    "repair",
+    "answer_generation",
+    "memory_distillation",
+]
+
+
+class IntentQueryRewrite(BaseModel):
+    semantic_query: str = ""
+    keyword_query: str = ""
+
+
+class IntentItem(BaseModel):
+    intent_id: str
+    intent_type: IntentType
+    goal: str
+    depends_on: list[str] = Field(default_factory=list)
+    query_rewrite: IntentQueryRewrite = Field(default_factory=IntentQueryRewrite)
+    referenced_product_ids: list[str] = Field(default_factory=list)
+
+
+class IntentConstraint(BaseModel):
+    name: str
+    value: str | float | int | bool | list[str]
+    strength: Literal["hard", "soft"] = "hard"
+    source: Literal[
+        "current_query",
+        "recent_turn",
+        "session_summary",
+        "image_inference",
+        "long_term_profile",
+    ] = "current_query"
+    reason: str = ""
+
+
+class IntentConstraintSet(BaseModel):
+    budget_min: float | None = None
+    budget_max: float | None = None
+    budget_scope: Literal["per_item", "total", "unknown"] = "unknown"
+    items: list[IntentConstraint] = Field(default_factory=list)
+
+
+class ContextRequest(BaseModel):
+    request_id: str
+    context_type: Literal["long_term_profile"] = "long_term_profile"
+    usage: Literal["intent_refinement", "ranking_only", "answer_personalization"] = "ranking_only"
+    query: str = ""
+    reason: str
+    required: bool = False
+
+
+class ClarificationProposal(BaseModel):
+    required: bool = False
+    blocking: bool = False
+    missing_fields: list[str] = Field(default_factory=list)
+    ambiguity: str = ""
+    question_goal: str = ""
+    reason: str = ""
+
+
+class ResearchRequest(BaseModel):
+    request_id: str
+    intent_id: str
+    mode: Literal["web_general", "marketplace", "social_content"]
+    platforms: list[str] = Field(default_factory=list)
+    query: str = ""
+    freshness: Literal["any", "recent", "realtime"] = "recent"
+    reason: str
+    required: bool = False
+
+
+class AgentTaskProposal(BaseModel):
+    proposal_id: str
+    capability: AgentCapability
+    intent_ids: list[str] = Field(default_factory=list)
+    reason: str
+    required: bool = True
+    depends_on: list[str] = Field(default_factory=list)
+    optional_context_from: list[str] = Field(default_factory=list)
+    expected_output_schema: str = ""
+
+
+class IntentUncertainty(BaseModel):
+    field: str
+    description: str
+    blocking: bool = False
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
 class IntentPlan(BaseModel):
+    schema_version: str = "2.0"
     original_query: str = ""
+    normalized_query: str = ""
     summary: str = ""
+    primary_intent: IntentType = "product_recommendation"
+    intents: list[IntentItem] = Field(default_factory=list)
+    execution_mode: ExecutionMode = "single_product"
+    input_modalities: list[InputModality] = Field(default_factory=lambda: ["text"])
+    constraints: IntentConstraintSet = Field(default_factory=IntentConstraintSet)
+    context_requests: list[ContextRequest] = Field(default_factory=list)
+    clarification: ClarificationProposal = Field(default_factory=ClarificationProposal)
+    research_requests: list[ResearchRequest] = Field(default_factory=list)
+    agent_proposals: list[AgentTaskProposal] = Field(default_factory=list)
+    uncertainties: list[IntentUncertainty] = Field(default_factory=list)
+
+    # Retrieval projection consumed by the current retrieval workers. The Supervisor
+    # will own this projection once the execution layer is connected.
     plan_type: PlanType = "single_retrieval"
     vector_query: str = ""
     keyword_query: str = ""
@@ -313,6 +451,7 @@ class AgentRunSummary(BaseModel):
     route: str = ""
     plan_type: str = ""
     status: str = "running"
+    termination_reason: str = ""
     total_latency_ms: float | None = None
     first_token_latency_ms: float | None = None
     product_ids: list[str] = Field(default_factory=list)

@@ -10,6 +10,7 @@ def ensure_database_schema(engine: Engine) -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_session_memory_distilled_at(engine)
     _ensure_product_stock_defaults(engine)
+    _ensure_agent_run_columns(engine)
     _ensure_agent_run_span_tree_columns(engine)
 
 
@@ -33,6 +34,24 @@ def _ensure_product_stock_defaults(engine: Engine) -> None:
         return
     with engine.begin() as connection:
         connection.execute(text("UPDATE products SET stock = 1 WHERE stock IS NULL"))
+
+
+def _ensure_agent_run_columns(engine: Engine) -> None:
+    """Extend existing run rows without rebuilding historical observations."""
+    inspector = inspect(engine)
+    if not inspector.has_table("agent_runs"):
+        return
+    columns = {column["name"] for column in inspector.get_columns("agent_runs")}
+    if "termination_reason" in columns:
+        return
+    reason_type = "TEXT" if engine.dialect.name == "sqlite" else "VARCHAR(128)"
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "ALTER TABLE agent_runs "
+                f"ADD COLUMN termination_reason {reason_type} NOT NULL DEFAULT ''"
+            )
+        )
 
 
 def _ensure_agent_run_span_tree_columns(engine: Engine) -> None:

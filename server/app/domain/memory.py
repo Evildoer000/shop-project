@@ -238,7 +238,13 @@ class MemoryManager:
         rows = self.db.scalars(select(UserMemory).where(UserMemory.user_id == user_id)).all()
         return [f"{row.key}:{row.value}" for row in rows]
 
-    def build_context(self, user_id: str, session_id: str) -> ConversationContext:
+    def build_context(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        include_long_term: bool = False,
+    ) -> ConversationContext:
         state = self._get_state(user_id, session_id)
         turns = self._load_turns(user_id, session_id)
         recent = turns[-RECENT_TURNS_LIMIT:]
@@ -250,13 +256,13 @@ class MemoryManager:
             if turn.turn_id > summarized_through
             and (recent_start_id is None or turn.turn_id < recent_start_id)
         ]
-        profile = self.load_memory(user_id)
+        profile = self.load_memory(user_id) if include_long_term else []
         return ConversationContext(
             session_summary=(state.session_summary if state else "") or "",
             pending_summary_turns=pending,
             recent_turns=recent,
             long_term_profile=profile,
-            long_term_narrative=self.load_profile_narrative(user_id),
+            long_term_narrative=self.load_profile_narrative(user_id) if include_long_term else "",
         )
 
     def load_profile_narrative(self, user_id: str) -> str:

@@ -7,7 +7,22 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import Any
 
-from app.schemas import IntentPlan, ProfileLookupProposal, RewriteNeedSlot
+from app.domain.supervisor.capability_catalog import CapabilityCatalog, build_default_capability_catalog
+from app.domain.supervisor.prompts import PromptRegistry, build_default_prompt_registry
+from app.schemas import (
+    AgentTaskProposal,
+    ClarificationProposal,
+    ContextRequest,
+    IntentConstraint,
+    IntentConstraintSet,
+    IntentItem,
+    IntentPlan,
+    IntentQueryRewrite,
+    IntentUncertainty,
+    ProfileLookupProposal,
+    ResearchRequest,
+    RewriteNeedSlot,
+)
 from app.services.llm_client import LlmClient
 from app.services.structured_llm import StructuredLlmValidationError, generate_validated_json, parse_json_object
 
@@ -22,16 +37,33 @@ class PlannerStreamEvent:
 class IntentPlanner:
     JSON_RESPONSE_FORMAT = {"type": "json_object"}
     PLAN_TYPES = {"direct_answer", "clarify", "single_retrieval", "multi_retrieval"}
+    INTENT_TYPES = {
+        "social_chat",
+        "product_recommendation",
+        "product_comparison",
+        "product_qa",
+        "shopping_knowledge",
+        "cart_action",
+    }
+    EXECUTION_MODES = {"direct", "clarify", "context_evidence", "single_product", "multi_product"}
+    INPUT_MODALITIES = {"text", "image", "audio"}
 
-    def __init__(self, llm_client: LlmClient | None = None) -> None:
+    def __init__(
+        self,
+        llm_client: LlmClient | None = None,
+        capability_catalog: CapabilityCatalog | None = None,
+        prompt_registry: PromptRegistry | None = None,
+    ) -> None:
         self.llm_client = llm_client or LlmClient(component="IntentPlanner")
+        self.capability_catalog = capability_catalog or build_default_capability_catalog()
+        self.prompt_registry = prompt_registry or build_default_prompt_registry()
 
     async def stream_plan_with_summary(
         self,
         query: str,
         context: dict[str, Any] | None = None,
     ) -> AsyncGenerator[PlannerStreamEvent, None]:
-        system_prompt = (
+        system_prompt = self._versioned_system_prompt() + (
             "你是电商 RAG Harness 的 IntentPlanner（意图规划智能体）。你的职责只是给 Orchestrator 提出"
             "最小声明式计划；不要回答用户，不要查商品，不要读取数据库，不要决定 final_route，不要编造商品事实。\n\n"
             "## 流式输出契约\n"
@@ -104,6 +136,7 @@ class IntentPlanner:
             "- multi_retrieval 的 need_slots 必须是当前轮生效后的完整 slot plan，不是增量片段。\n"
             "- 不要输出 product_type/categories/preferences/exclusions；这些属于下游 RetrievalPlanBuilder / Tool 的内部解析。\n"
         )
+        system_prompt += self._expanded_contract_prompt()
         user_prompt = json.dumps(
             {
                 "query": query,
@@ -134,6 +167,8 @@ class IntentPlanner:
                     "referenced_product_ids": ["product IDs from recent turns; omit when empty"],
                     "profile_lookup": {"requested": True, "query": "lookup query", "reason": "why profile lookup is useful"},
                 },
+                "expanded_output_contract": self._expanded_output_contract(),
+                "available_agent_capabilities": self.capability_catalog.describe_for_prompt(),
             },
             ensure_ascii=False,
         )
@@ -169,10 +204,10 @@ class IntentPlanner:
                 data=data,
                 content=content,
             )
-        yield PlannerStreamEvent(kind="plan", intent_plan=self._parse_plan(query, data))
+        yield PlannerStreamEvent(kind="plan", intent_plan=self._parse_plan(query, data, context))
 
     async def plan(self, query: str, context: dict[str, Any] | None = None) -> IntentPlan:
-        system_prompt = (
+        system_prompt = self._versioned_system_prompt() + (
             "你是电商 RAG Harness 的 IntentPlanner（意图规划智能体）。只输出 JSON object，不要输出 Markdown 或解释文字。\n"
             "你的职责只是给 Orchestrator 提出最小声明式计划；不要回答用户，不要查商品，不要读取数据库，"
             "不要决定 final_route，不要编造商品事实。\n\n"
@@ -263,6 +298,7 @@ class IntentPlanner:
             "- 单一商品加多个约束不是多需求，例如「预算3500的安卓平板，轻薄」仍是 single_retrieval。\n"
             "- 不要输出 product_type/categories/preferences/exclusions；这些属于下游 RetrievalPlanBuilder / Tool 的内部解析。\n"
         )
+        system_prompt += self._expanded_contract_prompt()
         user_prompt = json.dumps(
             {
                 "query": query,
@@ -292,6 +328,8 @@ class IntentPlanner:
                     "referenced_product_ids": ["product IDs from recent turns; omit when empty"],
                     "profile_lookup": {"requested": True, "query": "lookup query", "reason": "why profile lookup is useful"},
                 },
+                "expanded_output_contract": self._expanded_output_contract(),
+                "available_agent_capabilities": self.capability_catalog.describe_for_prompt(),
                 "examples": [
                     {
                         "query": "你是谁？",
@@ -395,7 +433,7 @@ class IntentPlanner:
             response_format=self.JSON_RESPONSE_FORMAT,
             operation="intent_planner.plan",
         )
-        return self._parse_plan(query, data)
+        return self._parse_plan(query, data, context)
 
     async def _generate_stream_required(
         self,
@@ -420,7 +458,12 @@ class IntentPlanner:
             for parameter in signature.parameters.values()
         )
 
-    def _parse_plan(self, query: str, data: dict[str, Any]) -> IntentPlan:
+    def _parse_plan(
+        self,
+        query: str,
+        data: dict[str, Any],
+        context: dict[str, Any] | None = None,
+    ) -> IntentPlan:
         plan_type = str(data.get("plan_type") or "single_retrieval").strip()
         if plan_type not in self.PLAN_TYPES:
             plan_type = "single_retrieval"
@@ -439,24 +482,756 @@ class IntentPlanner:
                 vector_query = query
                 keyword_query = query
         profile_lookup = data.get("profile_lookup") if isinstance(data.get("profile_lookup"), dict) else {}
-        return IntentPlan(
-            original_query=query,
-            summary=str(data.get("summary") or "").strip(),
-            plan_type=plan_type,  # type: ignore[arg-type]
+        profile_usage = self._profile_usage(profile_lookup.get("usage"))
+        referenced_product_ids = self._string_list(data.get("referenced_product_ids"))
+        primary_intent = self._normalize_primary_intent(data.get("primary_intent"), plan_type, referenced_product_ids)
+        execution_mode = self._normalize_execution_mode(data.get("execution_mode"), plan_type, referenced_product_ids)
+        intents = self._sanitize_intents(
+            data.get("intents"),
+            query=query,
+            primary_intent=primary_intent,
             vector_query=vector_query,
             keyword_query=keyword_query,
+            referenced_product_ids=referenced_product_ids,
+        )
+        execution_mode = self._resolve_execution_mode(
+            execution_mode,
+            plan_type=plan_type,
+            intents=intents,
+            referenced_product_ids=referenced_product_ids,
+        )
+        intents = self._ensure_knowledge_bridge_intent(
+            intents,
+            execution_mode=execution_mode,
+            query=query,
+        )
+        if primary_intent not in {intent.intent_type for intent in intents}:
+            primary_intent = intents[0].intent_type
+        constraints = self._sanitize_constraints(
+            data.get("constraints"),
             budget_min=self._float_or_none(data.get("budget_min")),
             budget_max=self._float_or_none(data.get("budget_max")),
             budget_scope=self._normalize_budget_scope(data.get("budget_scope"), plan_type),
+        )
+        context_requests = self._sanitize_context_requests(
+            data.get("context_requests"),
+            profile_lookup=profile_lookup,
+            profile_usage=profile_usage,
+        )
+        clarification = self._sanitize_clarification(data.get("clarification"), execution_mode)
+        research_requests = self._sanitize_research_requests(
+            data.get("research_requests"),
+            intents,
+            query=query,
+            referenced_product_ids=referenced_product_ids,
+        )
+        agent_proposals = self._sanitize_agent_proposals(
+            data.get("agent_proposals"),
+            execution_mode=execution_mode,
+            intents=intents,
+            context_requests=context_requests,
+            research_requests=research_requests,
+        )
+        profile_context = next(
+            (request for request in context_requests if request.context_type == "long_term_profile"),
+            None,
+        )
+        profile_requested = self._bool_or_false(profile_lookup.get("requested")) or profile_context is not None
+        budget_min = constraints.budget_min
+        budget_max = constraints.budget_max
+        budget_scope = constraints.budget_scope
+        return IntentPlan(
+            schema_version="2.0",
+            original_query=query,
+            normalized_query=str(data.get("normalized_query") or query).strip(),
+            summary=str(data.get("summary") or "").strip(),
+            primary_intent=primary_intent,  # type: ignore[arg-type]
+            intents=intents,
+            execution_mode=execution_mode,  # type: ignore[arg-type]
+            input_modalities=self._normalize_modalities(data.get("input_modalities"), query, context),
+            constraints=constraints,
+            context_requests=context_requests,
+            clarification=clarification,
+            research_requests=research_requests,
+            agent_proposals=agent_proposals,
+            uncertainties=self._sanitize_uncertainties(data.get("uncertainties")),
+            plan_type=plan_type,  # type: ignore[arg-type]
+            vector_query=vector_query,
+            keyword_query=keyword_query,
+            budget_min=budget_min,
+            budget_max=budget_max,
+            budget_scope=budget_scope,
             need_slots=need_slots,
-            referenced_product_ids=self._string_list(data.get("referenced_product_ids")),
+            referenced_product_ids=referenced_product_ids,
             profile_lookup=ProfileLookupProposal(
-                requested=self._bool_or_false(profile_lookup.get("requested")),
-                query=str(profile_lookup.get("query") or "").strip(),
-                reason=str(profile_lookup.get("reason") or "").strip(),
+                requested=profile_requested,
+                query=str(profile_lookup.get("query") or (profile_context.query if profile_context else "")).strip(),
+                usage=(profile_context.usage if profile_context else profile_usage),  # type: ignore[arg-type]
+                reason=str(
+                    profile_lookup.get("reason") or (profile_context.reason if profile_context else "")
+                ).strip(),
             ),
             plan_reason=str(data.get("plan_reason") or "").strip(),
         )
+
+    def _versioned_system_prompt(self) -> str:
+        spec = self.prompt_registry.require("intent_understanding_agent")
+        return spec.render_system(allowed_tools=[])
+
+    def _expanded_contract_prompt(self) -> str:
+        return (
+            "\n\n## 扩展意图契约\n"
+            "- primary_intent/intents 描述用户要完成的业务目标；一个请求可以同时包含推荐、对比和知识解释。\n"
+            "- execution_mode 只描述工作流拓扑：direct、clarify、context_evidence、single_product、multi_product。\n"
+            "- input_modalities 只描述 text/image/audio；图片不是独立业务路线，也不要提案纯图片 Agent。\n"
+            "- 每个 intent 必须有稳定 intent_id、intent_type、goal；有依赖时通过 depends_on 引用其它 intent_id。\n"
+            "- query_rewrite 应属于具体 intent；multi_product 的检索词应继续下沉到对应 need_slots。\n"
+            "- context_requests 只提出上下文读取需求。长期画像用途必须是 intent_refinement、ranking_only 或 answer_personalization。\n"
+            "- clarification 说明是否阻塞、缺失字段和澄清目标；不要在这里直接生成最终回答。\n"
+            "- research_requests 只描述 web_general/marketplace/social_content 等抽象研究需求和平台，不得填写 MCP 名、URL、Cookie 或具体 Tool。\n"
+            "- agent_proposals 只能从 available_agent_capabilities 中选择，并说明 intent_ids、依赖和理由。\n"
+            "- EvidenceVerifier、BundleOptimizer、Repair、AnswerGenerator、MemoryDistillation 由 Supervisor 固定或按运行时失败插入，绝不能写入 agent_proposals。\n"
+            "- 长期画像产生的约束只能是 soft，不能覆盖当前 query 中的 hard constraints。\n"
+            "- 用户只有效果/症状/模糊用途而没有可确认商品族时，优先 execution_mode=context_evidence 并提案 knowledge_research；"
+            "不得猜测商品类型。Supervisor 会在知识证据给出可追溯商品概念后决定是否追加推荐。\n"
+        )
+
+    def _expanded_output_contract(self) -> dict[str, Any]:
+        return {
+            "schema_version": "2.0",
+            "normalized_query": "normalized current query",
+            "primary_intent": "social_chat | product_recommendation | product_comparison | product_qa | shopping_knowledge | cart_action",
+            "intents": [
+                {
+                    "intent_id": "i1",
+                    "intent_type": "one primary_intent enum value",
+                    "goal": "business goal",
+                    "depends_on": [],
+                    "query_rewrite": {"semantic_query": "", "keyword_query": ""},
+                    "referenced_product_ids": [],
+                }
+            ],
+            "execution_mode": "direct | clarify | context_evidence | single_product | multi_product",
+            "input_modalities": ["text | image | audio"],
+            "constraints": {
+                "budget_min": "number or null",
+                "budget_max": "number or null",
+                "budget_scope": "per_item | total | unknown",
+                "items": [
+                    {
+                        "name": "constraint name",
+                        "value": "constraint value",
+                        "strength": "hard | soft",
+                        "source": "current_query | recent_turn | session_summary | image_inference",
+                        "reason": "source reason",
+                    }
+                ],
+            },
+            "context_requests": [
+                {
+                    "request_id": "ctx1",
+                    "context_type": "long_term_profile",
+                    "usage": "intent_refinement | ranking_only | answer_personalization",
+                    "query": "lookup query",
+                    "reason": "why context is needed",
+                    "required": False,
+                }
+            ],
+            "clarification": {
+                "required": False,
+                "blocking": False,
+                "missing_fields": [],
+                "ambiguity": "",
+                "question_goal": "",
+                "reason": "",
+            },
+            "research_requests": [
+                {
+                    "request_id": "r1",
+                    "intent_id": "i1",
+                    "mode": "web_general | marketplace | social_content",
+                    "platforms": [],
+                    "query": "research goal",
+                    "freshness": "any | recent | realtime",
+                    "reason": "why research is needed",
+                    "required": False,
+                }
+            ],
+            "agent_proposals": [
+                {
+                    "proposal_id": "p1",
+                    "capability": "one available_agent_capabilities value",
+                    "intent_ids": ["i1"],
+                    "reason": "why this capability is needed",
+                    "required": True,
+                    "depends_on": [],
+                    "optional_context_from": [],
+                    "expected_output_schema": "short schema name",
+                }
+            ],
+            "uncertainties": [
+                {
+                    "field": "field name",
+                    "description": "uncertainty",
+                    "blocking": False,
+                    "confidence": "0..1 or null",
+                }
+            ],
+        }
+
+    def _normalize_primary_intent(
+        self,
+        value: Any,
+        plan_type: str,
+        referenced_product_ids: list[str],
+    ) -> str:
+        normalized = str(value or "").strip()
+        if normalized in self.INTENT_TYPES:
+            return normalized
+        if plan_type == "direct_answer":
+            return "product_qa" if referenced_product_ids else "social_chat"
+        return "product_recommendation"
+
+    def _normalize_execution_mode(
+        self,
+        value: Any,
+        plan_type: str,
+        referenced_product_ids: list[str],
+    ) -> str:
+        normalized = str(value or "").strip()
+        if normalized in self.EXECUTION_MODES:
+            return normalized
+        if plan_type == "clarify":
+            return "clarify"
+        if plan_type == "multi_retrieval":
+            return "multi_product"
+        if plan_type == "single_retrieval":
+            return "single_product"
+        return "context_evidence" if referenced_product_ids else "direct"
+
+    def _resolve_execution_mode(
+        self,
+        proposed: str,
+        *,
+        plan_type: str,
+        intents: list[IntentItem],
+        referenced_product_ids: list[str],
+    ) -> str:
+        if plan_type == "clarify":
+            return "clarify"
+        if plan_type == "multi_retrieval":
+            return "multi_product"
+        if plan_type == "single_retrieval":
+            return "single_product"
+        intent_types = {intent.intent_type for intent in intents}
+        has_context_evidence_goal = bool(
+            referenced_product_ids
+            or intent_types.intersection({"product_comparison", "product_qa", "shopping_knowledge"})
+        )
+        if has_context_evidence_goal or proposed == "context_evidence":
+            return "context_evidence"
+        return "direct"
+
+    def _ensure_knowledge_bridge_intent(
+        self,
+        intents: list[IntentItem],
+        *,
+        execution_mode: str,
+        query: str,
+    ) -> list[IntentItem]:
+        intent_types = {intent.intent_type for intent in intents}
+        if (
+            execution_mode != "context_evidence"
+            or "product_recommendation" not in intent_types
+            or intent_types.intersection({"product_qa", "shopping_knowledge"})
+        ):
+            return intents
+        known_ids = {intent.intent_id for intent in intents}
+        intent_id = "i_knowledge_bridge"
+        suffix = 2
+        while intent_id in known_ids:
+            intent_id = f"i_knowledge_bridge_{suffix}"
+            suffix += 1
+        return [
+            *intents,
+            IntentItem(
+                intent_id=intent_id,
+                intent_type="shopping_knowledge",
+                goal=f"研究用户目标并映射到可检索商品概念：{query}",
+            ),
+        ]
+
+    def _normalize_modalities(
+        self,
+        value: Any,
+        query: str,
+        context: dict[str, Any] | None,
+    ) -> list[str]:
+        modalities = [item for item in self._string_list(value) if item in self.INPUT_MODALITIES]
+        if query.strip() and "text" not in modalities:
+            modalities.insert(0, "text")
+        context = context or {}
+        modality_context = context.get("input_modalities")
+        has_image_context = (
+            bool(context.get("image_attributes") or context.get("image_id"))
+            or isinstance(modality_context, dict) and bool(modality_context.get("has_image"))
+            or isinstance(modality_context, list) and "image" in modality_context
+        )
+        if has_image_context and "image" not in modalities:
+            modalities.append("image")
+        return modalities or ["text"]
+
+    def _sanitize_intents(
+        self,
+        value: Any,
+        *,
+        query: str,
+        primary_intent: str,
+        vector_query: str,
+        keyword_query: str,
+        referenced_product_ids: list[str],
+    ) -> list[IntentItem]:
+        result: list[IntentItem] = []
+        seen_ids: set[str] = set()
+        if isinstance(value, list):
+            for index, item in enumerate(value, start=1):
+                if not isinstance(item, dict):
+                    continue
+                intent_type = str(item.get("intent_type") or item.get("type") or "").strip()
+                if intent_type not in self.INTENT_TYPES:
+                    continue
+                intent_id = str(item.get("intent_id") or f"i{index}").strip() or f"i{index}"
+                if intent_id in seen_ids:
+                    continue
+                rewrite = item.get("query_rewrite") if isinstance(item.get("query_rewrite"), dict) else {}
+                result.append(
+                    IntentItem(
+                        intent_id=intent_id,
+                        intent_type=intent_type,  # type: ignore[arg-type]
+                        goal=str(item.get("goal") or query).strip(),
+                        depends_on=self._string_list(item.get("depends_on")),
+                        query_rewrite=IntentQueryRewrite(
+                            semantic_query=str(rewrite.get("semantic_query") or "").strip(),
+                            keyword_query=str(rewrite.get("keyword_query") or "").strip(),
+                        ),
+                        referenced_product_ids=self._string_list(item.get("referenced_product_ids")),
+                    )
+                )
+                seen_ids.add(intent_id)
+        if result:
+            return result
+        return [
+            IntentItem(
+                intent_id="i1",
+                intent_type=primary_intent,  # type: ignore[arg-type]
+                goal=query,
+                query_rewrite=IntentQueryRewrite(
+                    semantic_query=vector_query,
+                    keyword_query=keyword_query,
+                ),
+                referenced_product_ids=referenced_product_ids,
+            )
+        ]
+
+    def _sanitize_constraints(
+        self,
+        value: Any,
+        *,
+        budget_min: float | None,
+        budget_max: float | None,
+        budget_scope: str,
+    ) -> IntentConstraintSet:
+        payload = value if isinstance(value, dict) else {}
+        scope = str(payload.get("budget_scope") or budget_scope).strip()
+        if scope not in {"per_item", "total", "unknown"}:
+            scope = budget_scope
+        items: list[IntentConstraint] = []
+        raw_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+        for item in raw_items:
+            if not isinstance(item, dict) or not str(item.get("name") or "").strip():
+                continue
+            raw_value = item.get("value")
+            if not isinstance(raw_value, (str, float, int, bool, list)):
+                continue
+            strength = item.get("strength") if item.get("strength") in {"hard", "soft"} else "hard"
+            source = item.get("source")
+            if source not in {
+                "current_query",
+                "recent_turn",
+                "session_summary",
+                "image_inference",
+                "long_term_profile",
+            }:
+                source = "current_query"
+            if source == "long_term_profile":
+                strength = "soft"
+            items.append(
+                IntentConstraint(
+                    name=str(item.get("name") or "").strip(),
+                    value=raw_value,
+                    strength=strength,
+                    source=source,
+                    reason=str(item.get("reason") or "").strip(),
+                )
+            )
+        return IntentConstraintSet(
+            budget_min=self._float_or_none(payload.get("budget_min")) if "budget_min" in payload else budget_min,
+            budget_max=self._float_or_none(payload.get("budget_max")) if "budget_max" in payload else budget_max,
+            budget_scope=scope,  # type: ignore[arg-type]
+            items=items,
+        )
+
+    def _sanitize_context_requests(
+        self,
+        value: Any,
+        *,
+        profile_lookup: dict[str, Any],
+        profile_usage: str,
+    ) -> list[ContextRequest]:
+        result: list[ContextRequest] = []
+        if isinstance(value, list):
+            for index, item in enumerate(value, start=1):
+                if not isinstance(item, dict) or item.get("context_type") != "long_term_profile":
+                    continue
+                usage = self._profile_usage(item.get("usage"))
+                reason = str(item.get("reason") or "").strip()
+                if not reason:
+                    continue
+                result.append(
+                    ContextRequest(
+                        request_id=str(item.get("request_id") or f"ctx{index}").strip() or f"ctx{index}",
+                        usage=usage,  # type: ignore[arg-type]
+                        query=str(item.get("query") or "").strip(),
+                        reason=reason,
+                        required=self._bool_or_false(item.get("required")),
+                    )
+                )
+        if result or not self._bool_or_false(profile_lookup.get("requested")):
+            return result
+        return [
+            ContextRequest(
+                request_id="ctx_profile",
+                usage=profile_usage,  # type: ignore[arg-type]
+                query=str(profile_lookup.get("query") or "").strip(),
+                reason=str(profile_lookup.get("reason") or "需要长期画像作为软偏好。").strip(),
+            )
+        ]
+
+    def _sanitize_clarification(self, value: Any, execution_mode: str) -> ClarificationProposal:
+        payload = value if isinstance(value, dict) else {}
+        required = self._bool_or_false(payload.get("required")) or execution_mode == "clarify"
+        return ClarificationProposal(
+            required=required,
+            blocking=self._bool_or_false(payload.get("blocking")) or execution_mode == "clarify",
+            missing_fields=self._string_list(payload.get("missing_fields")),
+            ambiguity=str(payload.get("ambiguity") or "").strip(),
+            question_goal=str(payload.get("question_goal") or "补齐可执行的商品目标").strip() if required else "",
+            reason=str(payload.get("reason") or "用户需求不足以形成可执行任务。").strip() if required else "",
+        )
+
+    def _sanitize_research_requests(
+        self,
+        value: Any,
+        intents: list[IntentItem],
+        *,
+        query: str,
+        referenced_product_ids: list[str],
+    ) -> list[ResearchRequest]:
+        intent_ids = {intent.intent_id for intent in intents}
+        result: list[ResearchRequest] = []
+        seen_ids: set[str] = set()
+        raw_requests = value if isinstance(value, list) else []
+        for index, item in enumerate(raw_requests, start=1):
+            if not isinstance(item, dict):
+                continue
+            mode = str(item.get("mode") or "").strip()
+            intent_id = str(item.get("intent_id") or "").strip()
+            if mode not in {"web_general", "marketplace", "social_content"} or intent_id not in intent_ids:
+                continue
+            request_id = str(item.get("request_id") or f"r{index}").strip() or f"r{index}"
+            if request_id in seen_ids:
+                continue
+            freshness = item.get("freshness") if item.get("freshness") in {"any", "recent", "realtime"} else "recent"
+            result.append(
+                ResearchRequest(
+                    request_id=request_id,
+                    intent_id=intent_id,
+                    mode=mode,  # type: ignore[arg-type]
+                    platforms=self._string_list(item.get("platforms")),
+                    query=str(item.get("query") or "").strip(),
+                    freshness=freshness,
+                    reason=str(item.get("reason") or "需要补充外部证据。").strip(),
+                    required=self._bool_or_false(item.get("required")),
+                )
+            )
+            seen_ids.add(request_id)
+
+        # Knowledge routes must never silently fall back to model memory when
+        # the planner omitted a research request. Product QA about an already
+        # referenced catalog item can be grounded locally; open-ended shopping
+        # knowledge still receives the controlled web-search template.
+        referenced = set(referenced_product_ids)
+        for intent in intents:
+            if intent.intent_type not in {"shopping_knowledge", "product_qa"}:
+                continue
+            has_local_reference = bool(referenced or intent.referenced_product_ids)
+            if intent.intent_type == "product_qa" and has_local_reference:
+                continue
+            if any(
+                request.intent_id == intent.intent_id and request.mode == "web_general"
+                for request in result
+            ):
+                continue
+            request_id = f"r_web_{intent.intent_id}"
+            suffix = 2
+            while request_id in seen_ids:
+                request_id = f"r_web_{intent.intent_id}_{suffix}"
+                suffix += 1
+            result.append(
+                ResearchRequest(
+                    request_id=request_id,
+                    intent_id=intent.intent_id,
+                    mode="web_general",
+                    query=intent.goal or query,
+                    freshness="recent",
+                    reason="该知识目标需要可追溯的外部资料，不能把模型常识伪装成联网证据。",
+                    required=False,
+                )
+            )
+            seen_ids.add(request_id)
+        return result
+
+    def _sanitize_agent_proposals(
+        self,
+        value: Any,
+        *,
+        execution_mode: str,
+        intents: list[IntentItem],
+        context_requests: list[ContextRequest],
+        research_requests: list[ResearchRequest],
+    ) -> list[AgentTaskProposal]:
+        result: list[AgentTaskProposal] = []
+        seen_ids: set[str] = set()
+        canonical_by_capability: dict[str, AgentTaskProposal] = {}
+        proposal_aliases: dict[str, str] = {}
+        proposable = self.capability_catalog.proposable_names()
+        known_intent_ids = {intent.intent_id for intent in intents}
+        if isinstance(value, list):
+            for index, item in enumerate(value, start=1):
+                if not isinstance(item, dict):
+                    continue
+                capability = str(item.get("capability") or "").strip()
+                proposal_id = str(item.get("proposal_id") or f"p{index}").strip() or f"p{index}"
+                if capability not in proposable or proposal_id in seen_ids:
+                    continue
+                intent_ids_for_proposal = [
+                    intent_id
+                    for intent_id in self._string_list(item.get("intent_ids"))
+                    if intent_id in known_intent_ids
+                ]
+                existing = canonical_by_capability.get(capability)
+                if existing is not None:
+                    proposal_aliases[proposal_id] = existing.proposal_id
+                    existing.intent_ids = list(dict.fromkeys([*existing.intent_ids, *intent_ids_for_proposal]))
+                    existing.required = existing.required or self._bool_or_true(item.get("required"))
+                    existing.depends_on = list(
+                        dict.fromkeys([*existing.depends_on, *self._string_list(item.get("depends_on"))])
+                    )
+                    existing.optional_context_from = list(
+                        dict.fromkeys(
+                            [
+                                *existing.optional_context_from,
+                                *self._string_list(item.get("optional_context_from")),
+                            ]
+                        )
+                    )
+                    if not existing.expected_output_schema:
+                        existing.expected_output_schema = str(
+                            item.get("expected_output_schema") or ""
+                        ).strip()
+                    seen_ids.add(proposal_id)
+                    continue
+                proposal = AgentTaskProposal(
+                    proposal_id=proposal_id,
+                    capability=capability,  # type: ignore[arg-type]
+                    intent_ids=intent_ids_for_proposal,
+                    reason=str(item.get("reason") or "该能力支持当前意图。").strip(),
+                    required=self._bool_or_true(item.get("required")),
+                    depends_on=self._string_list(item.get("depends_on")),
+                    optional_context_from=self._string_list(item.get("optional_context_from")),
+                    expected_output_schema=str(item.get("expected_output_schema") or "").strip(),
+                )
+                result.append(proposal)
+                canonical_by_capability[capability] = proposal
+                proposal_aliases[proposal_id] = proposal_id
+                seen_ids.add(proposal_id)
+
+        # Rewrite dependencies after duplicate capabilities have been folded.
+        # This also handles references to an alias that appeared later in the
+        # model output.
+        for proposal in result:
+            proposal.depends_on = list(
+                dict.fromkeys(
+                    canonical
+                    for dependency in proposal.depends_on
+                    if (canonical := proposal_aliases.get(dependency, dependency))
+                    != proposal.proposal_id
+                )
+            )
+            proposal.optional_context_from = list(
+                dict.fromkeys(
+                    canonical
+                    for dependency in proposal.optional_context_from
+                    if (canonical := proposal_aliases.get(dependency, dependency))
+                    != proposal.proposal_id
+                )
+            )
+
+        intent_ids = [intent.intent_id for intent in intents]
+
+        def add_missing(
+            proposal_id: str,
+            capability: str,
+            selected_intent_ids: list[str],
+            reason: str,
+            depends_on: list[str] | None = None,
+        ) -> str:
+            existing = next((item for item in result if item.capability == capability), None)
+            if existing:
+                existing.intent_ids = list(dict.fromkeys([*existing.intent_ids, *selected_intent_ids]))
+                existing.depends_on = list(
+                    dict.fromkeys(
+                        dependency
+                        for dependency in [*existing.depends_on, *(depends_on or [])]
+                        if dependency and dependency != existing.proposal_id
+                    )
+                )
+                return existing.proposal_id
+            unique_id = proposal_id
+            suffix = 2
+            while unique_id in seen_ids:
+                unique_id = f"{proposal_id}_{suffix}"
+                suffix += 1
+            result.append(
+                AgentTaskProposal(
+                    proposal_id=unique_id,
+                    capability=capability,  # type: ignore[arg-type]
+                    intent_ids=selected_intent_ids,
+                    reason=reason,
+                    depends_on=depends_on or [],
+                )
+            )
+            seen_ids.add(unique_id)
+            return unique_id
+
+        if context_requests:
+            add_missing("p_profile", "profile_preference", intent_ids, "用户请求需要长期画像作为受控软上下文。")
+
+        core_proposal_id = ""
+        if execution_mode == "clarify":
+            core_proposal_id = add_missing("p_clarify", "clarification", intent_ids, "当前歧义阻塞后续执行。")
+        elif execution_mode == "single_product":
+            recommendation_intents = [
+                intent.intent_id for intent in intents if intent.intent_type == "product_recommendation"
+            ] or intent_ids
+            core_proposal_id = add_missing(
+                "p_single_product",
+                "single_product_recommendation",
+                recommendation_intents,
+                "当前工作流包含一个商品目标。",
+            )
+        elif execution_mode == "multi_product":
+            recommendation_intents = [
+                intent.intent_id for intent in intents if intent.intent_type == "product_recommendation"
+            ] or intent_ids
+            core_proposal_id = add_missing(
+                "p_multi_product",
+                "multi_product_bundle",
+                recommendation_intents,
+                "当前工作流包含多个商品槽位。",
+            )
+
+        commerce_intent_ids = list(
+            dict.fromkeys(
+                request.intent_id
+                for request in research_requests
+                if request.mode in {"marketplace", "social_content"}
+                and any(platform in {"taobao", "douyin_ec", "xiaohongshu"} for platform in request.platforms)
+            )
+        )
+        commerce_proposal_id = ""
+        if commerce_intent_ids:
+            commerce_proposal_id = add_missing(
+                "p_commerce_research",
+                "commerce_research",
+                commerce_intent_ids,
+                "用户请求需要三平台外部商品或口碑证据。",
+                [core_proposal_id] if core_proposal_id else [],
+            )
+
+        comparison_intents = [intent.intent_id for intent in intents if intent.intent_type == "product_comparison"]
+        if comparison_intents:
+            add_missing(
+                "p_comparison",
+                "comparison",
+                comparison_intents,
+                "用户明确要求商品对比。",
+                list(dict.fromkeys(item for item in [core_proposal_id, commerce_proposal_id] if item)),
+            )
+        knowledge_intents = [
+            intent.intent_id
+            for intent in intents
+            if intent.intent_type in {"product_qa", "shopping_knowledge"}
+        ]
+        if knowledge_intents:
+            add_missing(
+                "p_knowledge",
+                "knowledge_research",
+                knowledge_intents,
+                "用户需要商品事实或选购知识解释。",
+                [core_proposal_id] if core_proposal_id else [],
+            )
+
+        # Clarification is a terminal business branch. Do not let a noisy LLM
+        # proposal trigger retrieval or network work before the user answers.
+        if execution_mode == "clarify":
+            result = [item for item in result if item.capability == "clarification"]
+            for proposal in result:
+                proposal.depends_on = []
+                proposal.optional_context_from = []
+        elif execution_mode == "direct":
+            result = []
+        return result
+
+    def _sanitize_uncertainties(self, value: Any) -> list[IntentUncertainty]:
+        if not isinstance(value, list):
+            return []
+        result: list[IntentUncertainty] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            field = str(item.get("field") or "").strip()
+            description = str(item.get("description") or "").strip()
+            if not field or not description:
+                continue
+            confidence = self._float_or_none(item.get("confidence"))
+            if confidence is not None:
+                confidence = max(0.0, min(1.0, confidence))
+            result.append(
+                IntentUncertainty(
+                    field=field,
+                    description=description,
+                    blocking=self._bool_or_false(item.get("blocking")),
+                    confidence=confidence,
+                )
+            )
+        return result
+
+    def _profile_usage(self, value: Any) -> str:
+        usage = str(value or "").strip()
+        if usage in {"intent_refinement", "ranking_only", "answer_personalization"}:
+            return usage
+        return "ranking_only"
 
     def _validate_plan_data(self, data: dict[str, Any]) -> list[str]:
         errors: list[str] = []
@@ -490,6 +1265,41 @@ class IntentPlanner:
             errors.append("profile_lookup must be an object")
         elif isinstance(profile_lookup, dict) and not self._is_bool_like(profile_lookup.get("requested", False)):
             errors.append("profile_lookup.requested must be boolean")
+        if "schema_version" in data and str(data.get("schema_version") or "").strip() != "2.0":
+            errors.append("schema_version must be 2.0")
+        if "primary_intent" in data and data.get("primary_intent") not in self.INTENT_TYPES:
+            errors.append("primary_intent is invalid")
+        if "execution_mode" in data and data.get("execution_mode") not in self.EXECUTION_MODES:
+            errors.append("execution_mode is invalid")
+        if "input_modalities" in data:
+            modalities = data.get("input_modalities")
+            if not isinstance(modalities, list):
+                errors.append("input_modalities must be a list")
+            elif any(item not in self.INPUT_MODALITIES for item in modalities):
+                errors.append("input_modalities contains an invalid modality")
+        for field in ["intents", "context_requests", "research_requests", "agent_proposals", "uncertainties"]:
+            if field in data and not isinstance(data.get(field), list):
+                errors.append(f"{field} must be a list")
+        for field in ["constraints", "clarification"]:
+            if field in data and not isinstance(data.get(field), dict):
+                errors.append(f"{field} must be an object")
+        raw_intents = data.get("intents") if isinstance(data.get("intents"), list) else []
+        for index, item in enumerate(raw_intents):
+            if not isinstance(item, dict):
+                errors.append(f"intents[{index}] must be an object")
+                continue
+            intent_type = item.get("intent_type") or item.get("type")
+            if intent_type not in self.INTENT_TYPES:
+                errors.append(f"intents[{index}].intent_type is invalid")
+        raw_proposals = data.get("agent_proposals") if isinstance(data.get("agent_proposals"), list) else []
+        proposable = self.capability_catalog.proposable_names()
+        for index, item in enumerate(raw_proposals):
+            if not isinstance(item, dict):
+                errors.append(f"agent_proposals[{index}] must be an object")
+                continue
+            capability = item.get("capability")
+            if capability not in proposable:
+                errors.append(f"agent_proposals[{index}].capability is not planner-proposable")
         return errors
 
     def _json_text_from_tagged_content(self, content: str) -> str:
@@ -507,10 +1317,13 @@ class IntentPlanner:
                 result.append(
                     RewriteNeedSlot(
                         slot_id=str(item.get("slot_id") or f"s{index}").strip() or f"s{index}",
+                        intent_id=str(item.get("intent_id") or "").strip(),
                         need_type=item.get("need_type") if item.get("need_type") in {"required", "optional"} else "required",
                         goal=str(item.get("goal") or item.get("product_type") or item.get("query") or "").strip(),
                         product_type=str(item.get("product_type") or item.get("goal") or "").strip(),
                         query=str(item.get("query") or item.get("goal") or item.get("product_type") or "").strip(),
+                        semantic_query=str(item.get("semantic_query") or item.get("query") or "").strip(),
+                        keyword_query=str(item.get("keyword_query") or item.get("query") or "").strip(),
                         soft_constraints=self._string_list(item.get("soft_constraints")),
                         exclude_terms=self._string_list(item.get("exclude_terms")),
                         min_candidates=max(1, int(item.get("min_candidates") or 1)),
@@ -557,6 +1370,15 @@ class IntentPlanner:
         if isinstance(value, str):
             return value.strip().lower() == "true"
         return value == 1
+
+    def _bool_or_true(self, value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() != "false"
+        return value != 0
 
 
 class _TaggedPlannerStreamParser:

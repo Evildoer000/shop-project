@@ -219,6 +219,7 @@ export type TimingSpan = {
 
 export type TimingSummary = {
   status: string;
+  termination_reason?: string;
   route?: string;
   plan_type?: string;
   total_latency_ms?: number | null;
@@ -237,6 +238,7 @@ export type AgentRunSummary = {
   route: string;
   plan_type: string;
   status: string;
+  termination_reason?: string;
   total_latency_ms?: number | null;
   first_token_latency_ms?: number | null;
   product_ids: string[];

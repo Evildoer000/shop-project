@@ -5,7 +5,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -51,6 +51,7 @@ class SpanRecorder:
         self.started_perf = time.perf_counter()
         self.finished_at: datetime | None = None
         self.status = "running"
+        self.termination_reason = ""
         self.route = ""
         self.plan_type = ""
         self.first_token_latency_ms: float | None = None
@@ -60,6 +61,8 @@ class SpanRecorder:
         self._sequence = 0
         self._root_span: ActiveSpan | None = None
         self._last_span_by_name: dict[str, ActiveSpan] = {}
+        self._active_spans: dict[str, ActiveSpan] = {}
+        self._finished_span_payloads: dict[str, dict[str, Any]] = {}
 
     def start_run(self, *, user_id: str, session_id: str, turn_id: str, query_summary: str) -> dict[str, Any]:
         self.user_id = user_id
@@ -68,9 +71,19 @@ class SpanRecorder:
         self.query_summary = self._compact(query_summary, 500)
         self.started_at = datetime.now(timezone.utc)
         self.started_perf = time.perf_counter()
+        self.finished_at = None
+        self.status = "running"
+        self.termination_reason = ""
+        self.route = ""
+        self.plan_type = ""
+        self.first_token_latency_ms = None
+        self.product_ids = []
+        self.evaluation_summary = {}
         self._sequence = 0
         self.spans = []
         self._last_span_by_name = {}
+        self._active_spans = {}
+        self._finished_span_payloads = {}
         self._root_span = ActiveSpan(
             span_key=f"span_{uuid.uuid4().hex}",
             parent_span_key=None,
@@ -124,6 +137,7 @@ class SpanRecorder:
             input_summary=safe_input,
         )
         self._last_span_by_name[name] = span
+        self._active_spans[span.span_key] = span
         return span
 
     def child_span(
@@ -251,6 +265,9 @@ class SpanRecorder:
         error_message: str = "",
         termination_reason: str = "",
     ) -> dict[str, Any]:
+        existing = self._finished_span_payloads.get(span.span_key)
+        if existing is not None:
+            return existing
         finished_at = datetime.now(timezone.utc)
         duration_ms = max(0.0, (time.perf_counter() - span.started_perf) * 1000)
         resolved_termination_reason = termination_reason
@@ -280,6 +297,8 @@ class SpanRecorder:
             "error_message": self._compact(error_message, 500),
             "termination_reason": self._compact(resolved_termination_reason, 128),
         }
+        self._active_spans.pop(span.span_key, None)
+        self._finished_span_payloads[span.span_key] = payload
         self.spans.append(payload)
         self._persist_span(payload, span.started_at, finished_at)
         logger.info(
@@ -291,6 +310,92 @@ class SpanRecorder:
             payload["metrics"],
         )
         return payload
+
+    def record_completed_span(
+        self,
+        name: str,
+        *,
+        duration_ms: float,
+        label: str = "",
+        parent_span_key: str | None = None,
+        task_id: str = "",
+        agent_id: str = "",
+        span_type: str = "stage",
+        attempt: int = 1,
+        status: str = "succeeded",
+        input_summary: dict[str, Any] | None = None,
+        output_summary: dict[str, Any] | None = None,
+        metrics: dict[str, Any] | None = None,
+        error_type: str = "",
+        error_message: str = "",
+        termination_reason: str = "",
+    ) -> dict[str, Any]:
+        """Persist an already completed external call with its measured duration."""
+        finished_at = datetime.now(timezone.utc)
+        resolved_duration = max(0.0, float(duration_ms or 0.0))
+        started_at = finished_at - timedelta(milliseconds=resolved_duration)
+        self._sequence += 1
+        payload = {
+            "run_id": self.run_id,
+            "span_key": f"span_{uuid.uuid4().hex}",
+            "parent_span_key": parent_span_key or (self._root_span.span_key if self._root_span else None),
+            "task_id": task_id or self.turn_id or self.run_id,
+            "agent_id": agent_id,
+            "span_type": span_type,
+            "attempt": max(1, int(attempt or 1)),
+            "sequence": self._sequence,
+            "trace_schema_version": self.trace_schema_version,
+            "name": name,
+            "label": label or name,
+            "agent": agent_id,
+            "status": status,
+            "started_at": started_at.isoformat(),
+            "finished_at": finished_at.isoformat(),
+            "duration_ms": round(resolved_duration, 2),
+            "input_summary": self._json_safe(input_summary or {}),
+            "output_summary": self._json_safe(output_summary or {}),
+            "metrics": self._json_safe(metrics or {}),
+            "error_type": error_type,
+            "error_message": self._compact(error_message, 500),
+            "termination_reason": self._compact(termination_reason or status, 128),
+        }
+        self._finished_span_payloads[str(payload["span_key"])] = payload
+        self.spans.append(payload)
+        self._persist_span(payload, started_at, finished_at)
+        logger.info(
+            "agent_span run_id=%s name=%s status=%s duration_ms=%.2f metrics=%s",
+            self.run_id,
+            name,
+            status,
+            resolved_duration,
+            payload["metrics"],
+        )
+        return payload
+
+    def finish_open_spans(
+        self,
+        *,
+        status: str,
+        termination_reason: str,
+        error_type: str = "",
+        error_message: str = "",
+    ) -> list[dict[str, Any]]:
+        """Force every non-root in-flight span to a terminal state."""
+        root_key = self._root_span.span_key if self._root_span is not None else ""
+        finished: list[dict[str, Any]] = []
+        for span in list(self._active_spans.values()):
+            if span.span_key == root_key:
+                continue
+            finished.append(
+                self.finish_span(
+                    span,
+                    status=status,
+                    error_type=error_type,
+                    error_message=error_message,
+                    termination_reason=termination_reason,
+                )
+            )
+        return finished
 
     def mark_first_token(self) -> None:
         if self.first_token_latency_ms is None:
@@ -306,7 +411,16 @@ class SpanRecorder:
         status: str = "succeeded",
         termination_reason: str = "",
     ) -> dict[str, Any]:
+        if self.finished_at is not None:
+            return self.run_payload()
+        self.finish_open_spans(
+            status="cancelled" if status == "cancelled" else "failed",
+            termination_reason=termination_reason or "run_ended_with_open_span",
+            error_type="CancelledError" if status == "cancelled" else "RunTerminated",
+            error_message="Request ended before this span completed.",
+        )
         self.status = status
+        self.termination_reason = self._compact(termination_reason or status, 128)
         self.route = route
         self.plan_type = plan_type
         self.product_ids = list(dict.fromkeys(product_ids or []))
@@ -344,6 +458,7 @@ class SpanRecorder:
             "run_id": self.run_id,
             "summary": {
                 "status": self.status,
+                "termination_reason": self.termination_reason,
                 "route": self.route,
                 "plan_type": self.plan_type,
                 "total_latency_ms": self.total_latency_ms(),
@@ -393,6 +508,7 @@ class SpanRecorder:
                 row.route = self.route
                 row.plan_type = self.plan_type
                 row.status = self.status
+                row.termination_reason = self.termination_reason
                 row.total_latency_ms = self.total_latency_ms()
                 row.first_token_latency_ms = self.first_token_latency_ms
                 row.product_ids = self.product_ids

@@ -14,6 +14,10 @@ class ToolRegistration:
     owner: str
     description: str
     instance: Any
+    networked: bool = False
+    sensitive: bool = False
+    platforms: tuple[str, ...] = ()
+    timeout_ms: int = 30_000
 
 
 class ToolRegistry:
@@ -33,6 +37,10 @@ class ToolRegistry:
         kind: str = "tool",
         owner: str = "Orchestrator",
         description: str = "",
+        networked: bool = False,
+        sensitive: bool = False,
+        platforms: tuple[str, ...] = (),
+        timeout_ms: int = 30_000,
     ) -> None:
         if name in self._items:
             raise ValueError(f"Tool already registered: {name}")
@@ -42,6 +50,10 @@ class ToolRegistry:
             owner=owner,
             description=description,
             instance=instance,
+            networked=networked,
+            sensitive=sensitive,
+            platforms=platforms,
+            timeout_ms=timeout_ms,
         )
 
     def get(self, name: str) -> Any:
@@ -50,19 +62,26 @@ class ToolRegistry:
             raise KeyError(f"Tool not registered: {name}")
         return registration.instance
 
+    def registration(self, name: str) -> ToolRegistration | None:
+        return self._items.get(name)
+
     def require(self, name: str, expected_type: type[T]) -> T:
         instance = self.get(name)
         if not isinstance(instance, expected_type):
             raise TypeError(f"Tool {name} is {type(instance).__name__}, expected {expected_type.__name__}")
         return instance
 
-    def describe(self) -> list[dict[str, str]]:
+    def describe(self) -> list[dict[str, Any]]:
         return [
             {
                 "name": item.name,
                 "kind": item.kind,
                 "owner": item.owner,
                 "description": item.description,
+                "networked": item.networked,
+                "sensitive": item.sensitive,
+                "platforms": list(item.platforms),
+                "timeout_ms": item.timeout_ms,
             }
             for item in self._items.values()
         ]

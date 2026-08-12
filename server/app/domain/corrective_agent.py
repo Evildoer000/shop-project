@@ -27,6 +27,112 @@ class CorrectiveAgentController:
     def __init__(self, llm_client: LlmClient | None = None) -> None:
         self.llm_client = llm_client or LlmClient(component="CorrectiveAgent")
 
+    async def review_auxiliary(
+        self,
+        original_query: str,
+        intent_plan: IntentPlan,
+        evidence: list[dict[str, Any]],
+        *,
+        system_prompt_prefix: str = "",
+    ) -> dict[str, Any]:
+        """Review non-recommendation evidence without inventing new facts."""
+        valid = {
+            str(item.get("evidence_id") or ""): item
+            for item in evidence
+            if isinstance(item, dict) and str(item.get("evidence_id") or "")
+        }
+        trusted_local_ids = [
+            evidence_id
+            for evidence_id, item in valid.items()
+            if item.get("source_type") == "local_product_catalog"
+            and item.get("provenance", {}).get("evidence_role") == "referenced_context"
+        ]
+        reviewable = [
+            item
+            for evidence_id, item in valid.items()
+            if evidence_id not in trusted_local_ids
+        ]
+        fallback = {
+            "passed_evidence_ids": trusted_local_ids,
+            "rejected_evidence": [
+                {"evidence_id": item["evidence_id"], "reason": "辅助证据未完成语义审核。"}
+                for item in reviewable
+            ],
+            "reason": "仅保留了本地目录中被本轮明确引用的商品事实。",
+            "used_llm": False,
+        }
+        if not reviewable or not self._llm_is_configured():
+            return fallback
+        system_prompt = system_prompt_prefix + ("\n\n" if system_prompt_prefix else "") + (
+            "你正在执行 EvidenceVerifierAgent 的辅助证据审核。只输出 JSON object。\n"
+            "逐条判断 evidence 是否与当前用户目标相关、来源是否可追溯、内容是否足以支撑 claim。"
+            "外部平台观察不能证明本地库存、价格或商品真实性；Agent 衍生结论必须引用 supporting_evidence_ids。"
+            "不得新增证据、商品、事实或结论。返回："
+            "{\"passed_evidence_ids\":[\"...\"],"
+            "\"rejected_evidence\":[{\"evidence_id\":\"...\",\"reason\":\"...\"}],"
+            "\"reason\":\"...\"}。"
+        )
+        user_prompt = json.dumps(
+            {
+                "original_query": original_query,
+                "intent_plan": intent_plan.model_dump(),
+                "evidence": reviewable[:30],
+            },
+            ensure_ascii=False,
+        )
+        try:
+            data = await generate_validated_json(
+                self.llm_client,
+                system_prompt,
+                user_prompt,
+                validate=lambda value: self._validate_auxiliary_review(value, set(valid)),
+                error_message="EvidenceVerifier auxiliary review returned invalid JSON.",
+                response_format=self.JSON_RESPONSE_FORMAT,
+                operation="corrective_agent.review_auxiliary",
+            )
+        except StructuredLlmValidationError:
+            return fallback
+        passed_ids = self._unique(
+            [
+                *trusted_local_ids,
+                *[
+                    evidence_id
+                    for evidence_id in self._string_list(data.get("passed_evidence_ids"))
+                    if evidence_id in valid
+                ],
+            ]
+        )
+        return {
+            "passed_evidence_ids": passed_ids,
+            "rejected_evidence": data.get("rejected_evidence", []),
+            "reason": str(data.get("reason") or ""),
+            "used_llm": True,
+        }
+
+    def _validate_auxiliary_review(
+        self,
+        data: dict[str, Any],
+        valid_evidence_ids: set[str],
+    ) -> list[str]:
+        errors: list[str] = []
+        passed = data.get("passed_evidence_ids")
+        if not isinstance(passed, list):
+            errors.append("passed_evidence_ids must be an array")
+            passed = []
+        unknown = sorted(
+            {
+                str(evidence_id)
+                for evidence_id in passed
+                if str(evidence_id) not in valid_evidence_ids
+            }
+        )
+        if unknown:
+            errors.append(f"passed_evidence_ids contains unknown IDs: {unknown}")
+        rejected = data.get("rejected_evidence")
+        if rejected is not None and not isinstance(rejected, list):
+            errors.append("rejected_evidence must be an array")
+        return errors
+
     async def review(
         self,
         original_query: str,
@@ -36,6 +142,7 @@ class CorrectiveAgentController:
         vector_scores: dict[str, float],
         keyword_scores: dict[str, float],
         image_attributes: dict[str, Any] | None = None,
+        system_prompt_prefix: str = "",
     ) -> ReflectionResult:
         if not ranked:
             return ReflectionResult(
@@ -81,7 +188,7 @@ class CorrectiveAgentController:
             for product, rerank_score in ranked[:review_limit]
         ]
         valid_ids = {product.product_id for product, _ in ranked}
-        system_prompt = (
+        system_prompt = system_prompt_prefix + ("\n\n" if system_prompt_prefix else "") + (
             "你是电商 RAG Harness 的 CorrectiveAgent（证据反射 Worker Agent）。只输出 JSON object，不要输出 Markdown。\n"
             "你的职责是审核 rerank 后的候选商品证据是否真的支撑当前用户需求；你不决定 final_route，不生成回答。\n"
             "只能依据输入候选证据，不得补充商品、价格、库存、优惠、功效或用户没有说过的约束。\n"
@@ -180,6 +287,7 @@ class CorrectiveAgentController:
         intent_plan: IntentPlan,
         plan: QueryPlan,
         state: MultiNeedState,
+        system_prompt_prefix: str = "",
     ) -> ReflectionResult:
         flat_candidates = [
             candidate
@@ -205,7 +313,7 @@ class CorrectiveAgentController:
         if not self._llm_is_configured():
             return fallback
 
-        system_prompt = (
+        system_prompt = system_prompt_prefix + ("\n\n" if system_prompt_prefix else "") + (
             "你是电商多需求 RAG Harness 的 CorrectiveAgent（多需求证据反射 Worker Agent）。只输出 JSON object，不要输出 Markdown。\n"
             "你的职责是一次性审核每个 need slot 是否被候选商品语义覆盖；你不决定 final_route，不生成回答，不计算最终预算路线。\n"
             "只能依据输入候选证据，不得补充商品、价格、库存、优惠、功效或用户没有说过的约束。\n\n"
