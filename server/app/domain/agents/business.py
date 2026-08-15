@@ -159,8 +159,7 @@ class BusinessAgentHandlers:
             evidence = await context.execute_tool(
                 "product_search",
                 "single_repair",
-                lambda _tool: asyncio.to_thread(
-                    self.services.retrieval_worker.run_single_repair,
+                lambda _tool: self.services.retrieval_worker.run_single_repair_isolated(
                     query,
                     intent_plan,
                     plan,
@@ -176,8 +175,7 @@ class BusinessAgentHandlers:
             evidence = await context.execute_tool(
                 "image_search",
                 "image_initial",
-                lambda _tool: asyncio.to_thread(
-                    self.services.retrieval_worker.run_image_initial,
+                lambda _tool: self.services.retrieval_worker.run_image_initial_isolated(
                     original_query=query,
                     intent_plan=intent_plan,
                     plan=plan,
@@ -190,8 +188,7 @@ class BusinessAgentHandlers:
             evidence = await context.execute_tool(
                 "product_search",
                 "single_initial",
-                lambda _tool: asyncio.to_thread(
-                    self.services.retrieval_worker.run_single_initial,
+                lambda _tool: self.services.retrieval_worker.run_single_initial_isolated(
                     query,
                     intent_plan,
                     plan,
@@ -251,10 +248,17 @@ class BusinessAgentHandlers:
             )
         else:
             agent = SlotRetrievalAgent(self.services.product_search_tool)
+            boundary = getattr(self.services.retrieval_worker, "execution_boundary", None)
             result = await context.execute_tool(
                 "product_search",
                 "slot_retrieval",
-                lambda _tool: asyncio.to_thread(agent.run, slot, plan, intent_plan),
+                (
+                    lambda _tool: boundary.run_product(
+                        lambda search_tool: SlotRetrievalAgent(search_tool).run(slot, plan, intent_plan)
+                    )
+                    if boundary is not None
+                    else lambda _tool: asyncio.to_thread(agent.run, slot, plan, intent_plan)
+                ),
                 input_summary={"slot_id": slot.slot_id, "query_length": len(slot.query)},
             )
         return AgentResult.success(
@@ -928,6 +932,7 @@ class BusinessAgentHandlers:
                 "intents": refined_intents or original.intents,
                 "execution_mode": original.execution_mode,
                 "input_modalities": original.input_modalities,
+                "constraints": original.constraints,
                 "context_requests": original.context_requests,
                 "clarification": original.clarification,
                 "research_requests": original.research_requests,
@@ -936,6 +941,9 @@ class BusinessAgentHandlers:
                 "referenced_product_ids": original.referenced_product_ids,
                 "profile_lookup": original.profile_lookup,
                 "plan_type": original.plan_type,
+                "budget_min": original.budget_min,
+                "budget_max": original.budget_max,
+                "budget_scope": original.budget_scope,
             }
         )
 
@@ -1238,6 +1246,7 @@ class BusinessAgentHandlers:
                 {
                     "proposal_id": f"knowledge_concept:{index}",
                     "concept": value,
+                    "concept_type": str(concept.get("concept_type") or "other"),
                     "supporting_evidence_ids": supporting_ids,
                     "source": str(concept.get("source") or "knowledge_research_agent"),
                     "risk_flags": risks,
@@ -1306,7 +1315,9 @@ class BusinessAgentHandlers:
     def _dependency_evidence(self, context: AgentExecutionContext) -> list[EvidenceRef]:
         result: list[EvidenceRef] = []
         seen: set[str] = set()
-        for dependency_id in context.node.depends_on:
+        for dependency_id in dict.fromkeys(
+            [*context.node.depends_on, *context.node.input_refs]
+        ):
             refs = context.artifact(f"evidence:{dependency_id}", [])
             for ref in refs:
                 if not isinstance(ref, EvidenceRef) or not ref.evidence_id or ref.evidence_id in seen:
@@ -1515,6 +1526,7 @@ class BusinessAgentHandlers:
                 grounded_fallback.append(
                     {
                         "concept": term,
+                        "concept_type": self._fallback_concept_type(term),
                         "evidence_indexes": indexes[:3],
                         "source": "structured_search_response",
                     }
@@ -1540,9 +1552,10 @@ class BusinessAgentHandlers:
         system_prompt = str(context.metadata.get("agent_system_prompt") or "") + (
             "\n## 本任务结构化约束\n"
             "从给定搜索证据中识别可供本地商品检索使用的商品概念。"
-            "只允许输出证据中明确出现或直接支持的可购买商品类别；症状、效果、成分、形容词、"
-            "品牌营销词和治疗结论不能单独作为商品概念。每个概念必须引用 evidence_indexes。"
-            "输出 JSON：{\"concepts\":[{\"concept\":\"...\",\"evidence_indexes\":[0]}],"
+            "对每个概念必须分类为 product_type、ingredient、efficacy 或 other。"
+            "只有可购买商品类别才标 product_type；症状、效果、成分、形容词、品牌营销词和治疗结论"
+            "不能标 product_type。每个概念必须在引用证据正文中明确出现，并引用 evidence_indexes。"
+            "输出 JSON：{\"concepts\":[{\"concept\":\"...\",\"concept_type\":\"product_type\",\"evidence_indexes\":[0]}],"
             "\"risks\":[\"...\"]}。"
         )
         user_prompt = json.dumps(
@@ -1572,6 +1585,7 @@ class BusinessAgentHandlers:
             grounded.append(
                 {
                     "concept": concept,
+                    "concept_type": str(item.get("concept_type") or "other"),
                     "evidence_indexes": indexes,
                     "evidence_urls": [evidence[index]["url"] for index in indexes if evidence[index]["url"]],
                     "source": "knowledge_research_llm",
@@ -1595,8 +1609,11 @@ class BusinessAgentHandlers:
                 continue
             concept = str(item.get("concept") or "").strip()
             refs = item.get("evidence_indexes")
+            concept_type = str(item.get("concept_type") or "")
             if not (2 <= len(concept) <= 24):
                 errors.append(f"concepts[{index}].concept must contain 2..24 characters")
+            if concept_type not in {"product_type", "ingredient", "efficacy", "other"}:
+                errors.append(f"concepts[{index}].concept_type is invalid")
             if not isinstance(refs, list) or not refs:
                 errors.append(f"concepts[{index}].evidence_indexes must be non-empty")
                 continue
@@ -1605,6 +1622,14 @@ class BusinessAgentHandlers:
         if data.get("risks") is not None and not isinstance(data.get("risks"), list):
             errors.append("risks must be an array")
         return errors
+
+    def _fallback_concept_type(self, concept: str) -> str:
+        product_suffixes = (
+            "霜", "乳", "膏", "胶", "液", "油", "膜", "贴", "喷雾", "精华",
+            "洁面", "洗面奶", "防晒", "面膜", "洗发水", "护发素", "沐浴露",
+            "裤", "袜", "鞋", "衣", "包", "杯", "灯", "耳机", "手机", "电脑",
+        )
+        return "product_type" if any(concept.endswith(suffix) for suffix in product_suffixes) else "other"
 
     async def _reason_over_comparison(
         self,

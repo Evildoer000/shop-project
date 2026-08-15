@@ -42,7 +42,7 @@ class SpanRecorder:
 
     def __init__(self) -> None:
         self.run_id = f"run_{uuid.uuid4().hex}"
-        self.trace_schema_version = "v1"
+        self.trace_schema_version = "v2"
         self.user_id = ""
         self.session_id = ""
         self.turn_id = ""

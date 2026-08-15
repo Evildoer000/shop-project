@@ -26,6 +26,8 @@ class PromptSpec:
             "## 本次允许使用的 Tool 白名单\n"
             f"{tool_text}\n"
             "任何未列出的 Tool、网络地址、数据库表或 Agent 都不可调用。\n"
+            "你不能直接启动、调用或把任务转交给另一个 Agent；只能返回结构化结果，"
+            "由 Supervisor 通过可审计 Handoff 继续调度。\n"
             "不要输出隐式思维链；只输出契约要求的结论、依据、风险和结构化字段。\n"
         )
 
@@ -35,7 +37,7 @@ def build_default_prompt_registry() -> "PromptRegistry":
     registry.register(
         PromptSpec(
             agent_id="intent_understanding_agent",
-            version="2026-08-11.1",
+            version="2026-08-13.1",
             role="强制执行的意图理解 Agent",
             system_template=(
                 "你只负责理解请求并提交声明式 IntentPlan，不回答用户、不查商品、不读取长期画像、不调用 Tool。\n"
@@ -54,7 +56,7 @@ def build_default_prompt_registry() -> "PromptRegistry":
     registry.register(
         PromptSpec(
             agent_id="profile_preference_agent",
-            version="2026-08-11.1",
+            version="2026-08-13.1",
             role="长期画像与行为偏好读取 Agent",
             system_template=(
                 "你只读取 Supervisor 已批准的用户画像，并把它整理成软偏好。\n"
@@ -68,7 +70,7 @@ def build_default_prompt_registry() -> "PromptRegistry":
     registry.register(
         PromptSpec(
             agent_id="clarification_agent",
-            version="2026-08-11.1",
+            version="2026-08-13.1",
             role="阻塞条件澄清 Agent",
             system_template=(
                 "你只生成一个最小、容易回答的澄清问题。\n"
@@ -81,7 +83,7 @@ def build_default_prompt_registry() -> "PromptRegistry":
     registry.register(
         PromptSpec(
             agent_id="single_product_recommendation_agent",
-            version="2026-08-11.1",
+            version="2026-08-13.1",
             role="单商品目标推荐 Agent",
             system_template=(
                 "你只处理一个商品目标。先把当前意图和硬约束转成检索输入，再使用白名单中的商品检索 Tool。\n"
@@ -95,7 +97,7 @@ def build_default_prompt_registry() -> "PromptRegistry":
     registry.register(
         PromptSpec(
             agent_id="multi_product_bundle_agent",
-            version="2026-08-11.1",
+            version="2026-08-13.1",
             role="多商品组合协调 Agent",
             system_template=(
                 "你只负责把已批准的多商品需求分配给独立 Slot Agent，并合并每个 Slot 的检索证据。\n"
@@ -109,7 +111,7 @@ def build_default_prompt_registry() -> "PromptRegistry":
     registry.register(
         PromptSpec(
             agent_id="slot_retrieval_agent",
-            version="2026-08-11.1",
+            version="2026-08-13.1",
             role="单 Slot 检索 Agent",
             system_template=(
                 "你只处理 Supervisor 分配的一个商品 Slot。\n"
@@ -123,7 +125,7 @@ def build_default_prompt_registry() -> "PromptRegistry":
     registry.register(
         PromptSpec(
             agent_id="commerce_research_agent",
-            version="2026-08-11.1",
+            version="2026-08-13.1",
             role="三平台外部商品与口碑证据 Agent",
             system_template=(
                 "你只允许查询淘宝、抖音电商和小红书。平台之外的请求必须拒绝或标记 unavailable。\n"
@@ -138,7 +140,7 @@ def build_default_prompt_registry() -> "PromptRegistry":
     registry.register(
         PromptSpec(
             agent_id="comparison_agent",
-            version="2026-08-11.1",
+            version="2026-08-13.1",
             role="商品对比 Agent",
             system_template=(
                 "你只比较输入中明确存在的商品或证据，不负责发现新的商品。\n"
@@ -152,7 +154,7 @@ def build_default_prompt_registry() -> "PromptRegistry":
     registry.register(
         PromptSpec(
             agent_id="knowledge_research_agent",
-            version="2026-08-11.1",
+            version="2026-08-13.1",
             role="商品原理与选购知识 Agent",
             system_template=(
                 "你负责把模糊目标拆成可验证的知识问题、候选商品概念和检索扩展。\n"
@@ -170,7 +172,7 @@ def build_default_prompt_registry() -> "PromptRegistry":
     registry.register(
         PromptSpec(
             agent_id="evidence_verifier_agent",
-            version="2026-08-11.1",
+            version="2026-08-13.1",
             role="证据校验 Agent",
             system_template=(
                 "你只审核上游提交的候选和证据是否支撑当前需求。\n"
@@ -184,7 +186,7 @@ def build_default_prompt_registry() -> "PromptRegistry":
     registry.register(
         PromptSpec(
             agent_id="repair_agent",
-            version="2026-08-11.1",
+            version="2026-08-13.1",
             role="局部失败修复规划 Agent",
             system_template=(
                 "你只根据失败节点的结构化诊断生成局部修复计划。\n"
@@ -197,7 +199,7 @@ def build_default_prompt_registry() -> "PromptRegistry":
     registry.register(
         PromptSpec(
             agent_id="bundle_optimizer",
-            version="2026-08-11.1",
+            version="2026-08-13.1",
             role="多商品组合优化 Agent",
             system_template=(
                 "你只处理 EvidenceVerifier 已通过的多个 Slot 证据。\n"
@@ -210,7 +212,7 @@ def build_default_prompt_registry() -> "PromptRegistry":
     registry.register(
         PromptSpec(
             agent_id="answer_generator",
-            version="2026-08-11.1",
+            version="2026-08-13.1",
             role="最终回答生成 Agent",
             system_template=(
                 "你只使用 Supervisor 提供的已校验证据生成用户可读回答。\n"
@@ -224,7 +226,7 @@ def build_default_prompt_registry() -> "PromptRegistry":
     registry.register(
         PromptSpec(
             agent_id="memory_distillation_agent",
-            version="2026-08-11.1",
+            version="2026-08-13.1",
             role="异步记忆蒸馏 Agent",
             system_template=(
                 "你只处理已经结束的会话轮次。区分短期会话摘要、长期稳定偏好和一次性事件。\n"

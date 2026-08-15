@@ -47,6 +47,7 @@ class ProductSearchTool:
         attempts: list[dict] = []
 
         if not structured_products:
+            branch_status = self._empty_pool_branch_status(variants[0], variants[0])
             return SlotSearchResult(
                 slot_id=slot.slot_id,
                 query=slot.query,
@@ -57,6 +58,9 @@ class ProductSearchTool:
                     {
                         "attempt": 1,
                         "query": variants[0],
+                        "vector_query": variants[0],
+                        "keyword_query": variants[0],
+                        "retrieval_branches": branch_status,
                         "categories": categories,
                         "category_resolution": category_resolution,
                         "structured_candidates": 0,
@@ -65,6 +69,7 @@ class ProductSearchTool:
                 ],
                 categories=categories,
                 category_resolution=category_resolution,
+                branch_status=branch_status,
             )
 
         merged: dict[str, SlotCandidate] = {}
@@ -75,6 +80,7 @@ class ProductSearchTool:
         searched_queries: set[str] = set()
         last_vector_query = variants[0]
         last_keyword_query = variants[0]
+        last_branch_status: dict[str, dict] = {}
         for attempt_index, query in enumerate(variants[: self.MAX_ATTEMPTS_PER_SLOT], start=1):
             query = query.strip()
             if not query or query in searched_queries:
@@ -85,13 +91,19 @@ class ProductSearchTool:
                 products=structured_products,
                 strategy=strategy,
                 query=query,
+                vector_query=query,
+                keyword_query=query,
             )
             last_vector_query = result["vector_query"]
             last_keyword_query = result["keyword_query"]
+            last_branch_status = result["branch_status"]
             attempts.append(
                 {
                     "attempt": attempt_index,
                     "query": query,
+                    "vector_query": result["vector_query"],
+                    "keyword_query": result["keyword_query"],
+                    "retrieval_branches": result["branch_status"],
                     "categories": categories,
                     "category_resolution": category_resolution,
                     "structured_candidates": len(structured_products),
@@ -152,6 +164,7 @@ class ProductSearchTool:
             attempts=attempts,
             categories=categories,
             category_resolution=category_resolution,
+            branch_status=last_branch_status,
         )
 
     def search_query(
@@ -163,6 +176,8 @@ class ProductSearchTool:
         attempt_index: int,
         reason: str,
         *,
+        vector_query: str | None = None,
+        keyword_query: str | None = None,
         use_base_plan: bool = False,
     ) -> SlotSearchResult:
         if use_base_plan:
@@ -176,18 +191,24 @@ class ProductSearchTool:
         before_structured_filter = self.product_repository.count_available()
         structured_products = self._retrieval_products(plan, strategy)
         query = query.strip() or slot.query
+        vector_query = (vector_query or "").strip() or query
+        keyword_query = (keyword_query or "").strip() or query
 
         if not structured_products:
+            branch_status = self._empty_pool_branch_status(vector_query, keyword_query)
             return SlotSearchResult(
                 slot_id=slot.slot_id,
                 query=slot.query,
-                vector_query=query,
-                keyword_query=query,
+                vector_query=vector_query,
+                keyword_query=keyword_query,
                 counts=self._counts(before_structured_filter=before_structured_filter),
                 attempts=[
                     {
                         "attempt": attempt_index,
                         "query": query,
+                        "vector_query": vector_query,
+                        "keyword_query": keyword_query,
+                        "retrieval_branches": branch_status,
                         "categories": categories,
                         "category_resolution": category_resolution,
                         "structured_candidates": 0,
@@ -197,6 +218,7 @@ class ProductSearchTool:
                 categories=categories,
                 category_resolution=category_resolution,
                 structured_products=[],
+                branch_status=branch_status,
             )
 
         result = self._search_once(
@@ -204,6 +226,8 @@ class ProductSearchTool:
             products=structured_products,
             strategy=strategy,
             query=query,
+            vector_query=vector_query,
+            keyword_query=keyword_query,
         )
         candidates = [
             self._candidate(
@@ -223,8 +247,8 @@ class ProductSearchTool:
         return SlotSearchResult(
             slot_id=slot.slot_id,
             query=slot.query,
-            vector_query=query,
-            keyword_query=query,
+            vector_query=result["vector_query"],
+            keyword_query=result["keyword_query"],
             candidates=sorted(
                 candidates,
                 key=lambda candidate: (candidate.rerank_score, candidate.rrf_score, candidate.keyword_score),
@@ -243,6 +267,9 @@ class ProductSearchTool:
                 {
                     "attempt": attempt_index,
                     "query": query,
+                    "vector_query": result["vector_query"],
+                    "keyword_query": result["keyword_query"],
+                    "retrieval_branches": result["branch_status"],
                     "categories": categories,
                     "category_resolution": category_resolution,
                     "structured_candidates": len(structured_products),
@@ -263,6 +290,7 @@ class ProductSearchTool:
             hybrid_ranked_products=result["fused_products"],
             vector_scores=result["vector_scores"],
             keyword_scores=result["keyword_scores"],
+            branch_status=result["branch_status"],
         )
 
     def query_variants(self, slot: NeedSlot) -> list[str]:
@@ -279,16 +307,18 @@ class ProductSearchTool:
         products: list[Product],
         strategy: QueryRetrievalStrategy,
         query: str,
+        vector_query: str,
+        keyword_query: str,
     ) -> dict:
-        vector_scores = (
-            self.retriever.retrieve(query, products, top_k=strategy.vector_top_k)
-            if strategy.use_vector
-            else {}
+        vector_scores, vector_status = self._run_vector_branch(
+            vector_query,
+            products,
+            strategy,
         )
-        keyword_scores = (
-            self.product_repository.keyword_scores(query, products, top_k=strategy.keyword_top_k)
-            if strategy.use_keyword
-            else {}
+        keyword_scores, keyword_status = self._run_keyword_branch(
+            keyword_query,
+            products,
+            strategy,
         )
         passing_ids = {
             product_id
@@ -304,18 +334,91 @@ class ProductSearchTool:
             top_k=strategy.hybrid_top_k,
         )
         ranked = self.reranker.rerank(
-            self._rerank_query(slot, query),
+            self._rerank_query(slot, query, vector_query, keyword_query),
             fused_products,
             top_k=strategy.final_top_k,
         )
         return {
-            "vector_query": query,
-            "keyword_query": query,
+            "vector_query": vector_query,
+            "keyword_query": keyword_query,
             "vector_scores": vector_scores,
             "keyword_scores": keyword_scores,
+            "branch_status": {
+                "vector": vector_status,
+                "keyword": keyword_status,
+            },
             "score_filtered": score_filtered,
             "fused_products": fused_products,
             "ranked": ranked,
+        }
+
+    def _run_vector_branch(
+        self,
+        query: str,
+        products: list[Product],
+        strategy: QueryRetrievalStrategy,
+    ) -> tuple[dict[str, float], dict]:
+        if not strategy.use_vector:
+            return {}, self._branch_status("disabled", query)
+        try:
+            scores = self.retriever.retrieve(query, products, top_k=strategy.vector_top_k)
+            return scores, self._branch_status("ok", query, hit_count=len(scores))
+        except Exception as exc:
+            return {}, self._branch_status(
+                "degraded",
+                query,
+                error=self._compact(str(exc))[:300],
+                reason="vector_embedding_or_milvus_failed",
+            )
+
+    def _run_keyword_branch(
+        self,
+        query: str,
+        products: list[Product],
+        strategy: QueryRetrievalStrategy,
+    ) -> tuple[dict[str, float], dict]:
+        if not strategy.use_keyword:
+            return {}, self._branch_status("disabled", query)
+        try:
+            scores = self.product_repository.keyword_scores(query, products, top_k=strategy.keyword_top_k)
+            return scores, self._branch_status("ok", query, hit_count=len(scores))
+        except Exception as exc:
+            return {}, self._branch_status(
+                "degraded",
+                query,
+                error=self._compact(str(exc))[:300],
+                reason="keyword_retrieval_failed",
+            )
+
+    def _branch_status(
+        self,
+        status: str,
+        query: str,
+        *,
+        hit_count: int = 0,
+        reason: str = "",
+        error: str = "",
+    ) -> dict:
+        return {
+            "status": status,
+            "query": query,
+            "hit_count": hit_count,
+            "reason": reason,
+            "error": error,
+        }
+
+    def _empty_pool_branch_status(self, vector_query: str, keyword_query: str) -> dict[str, dict]:
+        return {
+            "vector": self._branch_status(
+                "skipped",
+                vector_query,
+                reason="structured_candidate_pool_empty",
+            ),
+            "keyword": self._branch_status(
+                "skipped",
+                keyword_query,
+                reason="structured_candidate_pool_empty",
+            ),
         }
 
     def _plan_for_slot(self, slot: NeedSlot, base_plan: QueryPlan, categories: list[str]) -> QueryPlan:
@@ -383,8 +486,20 @@ class ProductSearchTool:
                 return [category, *keywords]
         return []
 
-    def _rerank_query(self, slot: NeedSlot, query: str) -> str:
-        return self._compact(" ".join(part for part in [slot.product_type, slot.goal, query] if part))
+    def _rerank_query(
+        self,
+        slot: NeedSlot,
+        query: str,
+        vector_query: str = "",
+        keyword_query: str = "",
+    ) -> str:
+        return self._compact(
+            " ".join(
+                part
+                for part in [slot.product_type, slot.goal, query, vector_query, keyword_query]
+                if part
+            )
+        )
 
     def _has_enough_signal(self, ranked: list[tuple[Product, float]], slot: NeedSlot) -> bool:
         if len(ranked) >= max(1, slot.min_candidates * 2):

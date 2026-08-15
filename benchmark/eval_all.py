@@ -299,6 +299,12 @@ def final_result_ok(result: TurnEvalResult) -> bool:
 
 def extract_tool_calls(events: list[dict[str, Any]], trace: dict[str, Any]) -> set[str]:
     tools: set[str] = set()
+    for call in trace.get("tool_calls") or []:
+        if not isinstance(call, dict):
+            continue
+        tool = str(call.get("tool") or "").strip()
+        if tool:
+            tools.add(tool)
     for event in events:
         stage = str(event.get("stage") or "")
         if stage == "profile_lookup":
@@ -330,6 +336,17 @@ def extract_tool_calls(events: list[dict[str, Any]], trace: dict[str, Any]) -> s
 
 def extract_internal_actions(events: list[dict[str, Any]], trace: dict[str, Any]) -> set[str]:
     actions: set[str] = set()
+    for call in trace.get("tool_calls") or []:
+        if not isinstance(call, dict):
+            continue
+        operation = str(call.get("operation") or "")
+        if "repair" in operation:
+            actions.add("repair_search_executed")
+    for node in trace.get("agent_path") or []:
+        if not isinstance(node, dict):
+            continue
+        if node.get("capability") == "repair" and node.get("status") == "succeeded":
+            actions.add("repair_plan_generated")
     for event in events:
         stage = str(event.get("stage") or "")
         if stage in {"repair_plan_generated", "repair_search_executed", "evidence_merged"}:

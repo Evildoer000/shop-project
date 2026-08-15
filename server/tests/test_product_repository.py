@@ -47,7 +47,7 @@ def test_keyword_scores_prefer_professional_laptop_terms() -> None:
 
     scores = ProductRepository(None).keyword_scores("做视频剪辑和设计，想买性能强的专业笔记本", products)  # type: ignore[arg-type]
 
-    assert scores["pro"] > scores["air"]
+    assert scores["pro"] > scores.get("air", 0.0)
 
 
 def test_repository_exclude_terms_are_not_hard_filters() -> None:

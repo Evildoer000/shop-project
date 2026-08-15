@@ -8,6 +8,8 @@ from app.domain.multi_need_retrieval_coordinator import MultiNeedRetrievalCoordi
 from app.domain.need_slot_schemas import AgentToolCall, MultiNeedState, NeedSlot, SlotCandidate
 from app.domain.product_search_tool import ProductSearchTool
 from app.domain.repair_worker import RepairPlan
+from app.domain.retrieval_execution import RetrievalExecutionBoundary
+from app.domain.image_search_tool import ImageSearchTool
 from app.domain.single_retrieval_worker import SingleRetrievalEvidence, SingleRetrievalWorker
 from app.schemas import IntentPlan, QueryPlan
 
@@ -20,11 +22,17 @@ class RetrievalWorker:
         single_retrieval_worker: SingleRetrievalWorker,
         multi_need_coordinator: MultiNeedRetrievalCoordinator,
         image_retrieval_worker: ImageRetrievalWorker,
+        execution_boundary: RetrievalExecutionBoundary | None = None,
     ) -> None:
         self.product_search_tool = product_search_tool
         self.single_retrieval_worker = single_retrieval_worker
         self.multi_need_coordinator = multi_need_coordinator
         self.image_retrieval_worker = image_retrieval_worker
+        image_search_tool = getattr(image_retrieval_worker, "image_search_tool", None)
+        self.execution_boundary = execution_boundary or RetrievalExecutionBoundary(
+            product_search_tool,
+            image_search_tool if isinstance(image_search_tool, ImageSearchTool) else None,
+        )
 
     def run_single_initial(
         self,
@@ -33,6 +41,20 @@ class RetrievalWorker:
         plan: QueryPlan,
     ) -> SingleRetrievalEvidence:
         return self.single_retrieval_worker.run(original_query, intent_plan, plan)
+
+    async def run_single_initial_isolated(
+        self,
+        original_query: str,
+        intent_plan: IntentPlan,
+        plan: QueryPlan,
+    ) -> SingleRetrievalEvidence:
+        return await self.execution_boundary.run_product(
+            lambda search_tool: SingleRetrievalWorker(search_tool).run(
+                original_query,
+                intent_plan,
+                plan,
+            )
+        )
 
     async def run_multi_initial(
         self,
@@ -57,8 +79,57 @@ class RetrievalWorker:
             image_path=image_path,
         )
 
+    async def run_image_initial_isolated(
+        self,
+        original_query: str,
+        intent_plan: IntentPlan,
+        plan: QueryPlan,
+        image_path: str,
+    ) -> Any:
+        return await self.execution_boundary.run_image(
+            lambda image_search_tool: ImageRetrievalWorker(image_search_tool).run(
+                original_query=original_query,
+                intent_plan=intent_plan,
+                plan=plan,
+                image_path=image_path,
+            )
+        )
+
     def run_single_repair(
         self,
+        original_query: str,
+        intent_plan: IntentPlan,
+        plan: QueryPlan,
+        repair_plan: RepairPlan,
+    ) -> SingleRetrievalEvidence:
+        return self._run_single_repair_with_tool(
+            self.product_search_tool,
+            original_query,
+            intent_plan,
+            plan,
+            repair_plan,
+        )
+
+    async def run_single_repair_isolated(
+        self,
+        original_query: str,
+        intent_plan: IntentPlan,
+        plan: QueryPlan,
+        repair_plan: RepairPlan,
+    ) -> SingleRetrievalEvidence:
+        return await self.execution_boundary.run_product(
+            lambda search_tool: self._run_single_repair_with_tool(
+                search_tool,
+                original_query,
+                intent_plan,
+                plan,
+                repair_plan,
+            )
+        )
+
+    def _run_single_repair_with_tool(
+        self,
+        search_tool: ProductSearchTool,
         original_query: str,
         intent_plan: IntentPlan,
         plan: QueryPlan,
@@ -82,7 +153,7 @@ class RetrievalWorker:
                 continue
             last_query = query
             tool_calls += 1
-            search_result = self.product_search_tool.search_query(
+            search_result = search_tool.search_query(
                 slot=slot,
                 base_plan=plan,
                 intent_plan=intent_plan,
@@ -125,6 +196,23 @@ class RetrievalWorker:
         state: MultiNeedState,
         repair_plan: RepairPlan,
     ) -> MultiNeedState:
+        return self._run_multi_repair_with_tool(self.product_search_tool, state, repair_plan)
+
+    async def run_multi_repair_isolated(
+        self,
+        state: MultiNeedState,
+        repair_plan: RepairPlan,
+    ) -> MultiNeedState:
+        return await self.execution_boundary.run_product(
+            lambda search_tool: self._run_multi_repair_with_tool(search_tool, state, repair_plan)
+        )
+
+    def _run_multi_repair_with_tool(
+        self,
+        search_tool: ProductSearchTool,
+        state: MultiNeedState,
+        repair_plan: RepairPlan,
+    ) -> MultiNeedState:
         for slot_id in repair_plan.targets:
             slot = state.slot_by_id(slot_id)
             if slot is None:
@@ -139,7 +227,7 @@ class RetrievalWorker:
                     reason="repair_search_executed",
                 )
                 try:
-                    search_result = self.product_search_tool.search_query(
+                    search_result = search_tool.search_query(
                         slot=slot,
                         base_plan=state.plan,
                         intent_plan=state.intent_plan,

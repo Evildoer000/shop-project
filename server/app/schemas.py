@@ -166,6 +166,7 @@ InputModality = Literal["text", "image", "audio"]
 
 AgentCapability = Literal[
     "intent_understanding",
+    "policy_gate",
     "profile_preference",
     "clarification",
     "single_product_recommendation",
@@ -187,6 +188,28 @@ class IntentQueryRewrite(BaseModel):
     keyword_query: str = ""
 
 
+class IntentRouteBasis(BaseModel):
+    """Planner-observed facts used by deterministic routing policy."""
+
+    target_clarity: Literal[
+        "not_applicable",
+        "explicit_product",
+        "context_product",
+        "vague_effect_or_use",
+    ] = "not_applicable"
+    local_catalog_status: Literal["sufficient", "insufficient", "unknown"] = "unknown"
+    external_information_need: Literal[
+        "none",
+        "explicit_web",
+        "explicit_platform",
+        "freshness_required",
+        "knowledge_bridge",
+    ] = "none"
+    trigger_text: str = ""
+    product_family: str = ""
+    reason: str = ""
+
+
 class IntentItem(BaseModel):
     intent_id: str
     intent_type: IntentType
@@ -194,6 +217,7 @@ class IntentItem(BaseModel):
     depends_on: list[str] = Field(default_factory=list)
     query_rewrite: IntentQueryRewrite = Field(default_factory=IntentQueryRewrite)
     referenced_product_ids: list[str] = Field(default_factory=list)
+    route_basis: IntentRouteBasis = Field(default_factory=IntentRouteBasis)
 
 
 class IntentConstraint(BaseModel):
@@ -239,9 +263,18 @@ class ResearchRequest(BaseModel):
     request_id: str
     intent_id: str
     mode: Literal["web_general", "marketplace", "social_content"]
+    consumer_capability: Literal["knowledge_research", "comparison", "commerce_research"]
+    trigger_type: Literal[
+        "explicit_web_request",
+        "explicit_platform_request",
+        "freshness_required",
+        "knowledge_bridge",
+    ]
+    trigger_text: str
     platforms: list[str] = Field(default_factory=list)
     query: str = ""
     freshness: Literal["any", "recent", "realtime"] = "recent"
+    local_catalog_gap: str = ""
     reason: str
     required: bool = False
 
@@ -251,7 +284,9 @@ class AgentTaskProposal(BaseModel):
     capability: AgentCapability
     intent_ids: list[str] = Field(default_factory=list)
     reason: str
-    required: bool = True
+    # The Supervisor derives core/auxiliary status from the execution contract.
+    # Planner output may narrow a branch but cannot promote an auxiliary branch.
+    required: bool = False
     depends_on: list[str] = Field(default_factory=list)
     optional_context_from: list[str] = Field(default_factory=list)
     expected_output_schema: str = ""
@@ -472,7 +507,7 @@ class AgentRunSpanResponse(BaseModel):
     span_type: str = "stage"
     attempt: int = 1
     sequence: int = 0
-    trace_schema_version: str = "v1"
+    trace_schema_version: str = "v2"
     name: str
     label: str = ""
     agent: str = ""
@@ -516,6 +551,8 @@ class AgentRunDetailResponse(BaseModel):
 
 
 class DecisionTrace(BaseModel):
+    trace_schema_version: str = "v2"
+    run_id: str = ""
     query_understanding: dict = Field(default_factory=dict)
     image_attributes: dict = Field(default_factory=dict)
     memory_used: list[str] = Field(default_factory=list)
@@ -523,6 +560,8 @@ class DecisionTrace(BaseModel):
     retrieval_summary: dict = Field(default_factory=dict)
     multi_need_trace: dict = Field(default_factory=dict)
     agent_path: list[dict] = Field(default_factory=list)
+    tool_calls: list[dict] = Field(default_factory=list)
+    handoffs: list[dict] = Field(default_factory=list)
     planner_proposal: dict = Field(default_factory=dict)
     orchestrator_decisions: list[dict] = Field(default_factory=list)
     task: dict = Field(default_factory=dict)
@@ -533,4 +572,6 @@ class DecisionTrace(BaseModel):
     candidate_counts: dict = Field(default_factory=dict)
     stages: list[dict] = Field(default_factory=list)
     rerank_factors: list[str] = Field(default_factory=list)
+    failed_node_ids: list[str] = Field(default_factory=list)
+    blocked_node_ids: list[str] = Field(default_factory=list)
     final_reason: str = ""

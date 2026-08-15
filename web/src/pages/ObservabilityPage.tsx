@@ -15,11 +15,7 @@ import {
 import { getAgentRun, getAgentRuns } from "../lib/api";
 import { useAppIdentity } from "../lib/app-state";
 import type { AgentRunDetailResponse, AgentRunSpan, AgentRunSummary } from "../types";
-
-type TreeNode = {
-  span: AgentRunSpan;
-  children: TreeNode[];
-};
+import { AgentExecutionPanel } from "../components/AgentExecutionPanel";
 
 export function ObservabilityPage() {
   const { userId } = useAppIdentity();
@@ -89,8 +85,6 @@ export function ObservabilityPage() {
         .includes(normalized),
     );
   }, [query, runs]);
-
-  const tree = useMemo(() => buildSpanTree(detail?.spans ?? []), [detail?.spans]);
 
   async function copyJson() {
     if (!detail) return;
@@ -205,7 +199,7 @@ export function ObservabilityPage() {
               正在加载运行详情...
             </section>
           ) : detail ? (
-            <RunDetail detail={detail} tree={tree} onCopy={copyJson} onDownload={downloadJson} />
+            <RunDetail detail={detail} onCopy={copyJson} onDownload={downloadJson} />
           ) : (
             <section className="panel empty-page">
               <GitBranch size={34} />
@@ -221,12 +215,10 @@ export function ObservabilityPage() {
 
 function RunDetail({
   detail,
-  tree,
   onCopy,
   onDownload,
 }: {
   detail: AgentRunDetailResponse;
-  tree: TreeNode[];
   onCopy: () => void;
   onDownload: () => void;
 }) {
@@ -296,70 +288,13 @@ function RunDetail({
         </section>
       ) : null}
 
-      <section className="panel execution-panel">
-        <div className="panel-title">
-          <GitBranch size={16} />
-          <span>执行树</span>
-          <small>{detail.spans.length} 个节点，按父子关系展示</small>
-        </div>
-        <div className="execution-tree">
-          {tree.length === 0 ? (
-            <div className="empty-hint">这次请求没有保存 span。</div>
-          ) : (
-            tree.map((node) => (
-              <TreeRow
-                key={node.span.span_key || node.span.span_id}
-                node={node}
-                depth={0}
-                selectedSpanKey={selectedSpanKey}
-                onSelect={setSelectedSpanKey}
-              />
-            ))
-          )}
-        </div>
-      </section>
+      <AgentExecutionPanel
+        spans={detail.spans}
+        selectedSpanKey={selectedSpanKey}
+        onSelect={setSelectedSpanKey}
+      />
 
       {selectedSpan ? <SpanDetail span={selectedSpan} /> : null}
-    </div>
-  );
-}
-
-function TreeRow({
-  node,
-  depth,
-  selectedSpanKey,
-  onSelect,
-}: {
-  node: TreeNode;
-  depth: number;
-  selectedSpanKey: string;
-  onSelect: (spanKey: string) => void;
-}) {
-  const key = node.span.span_key || String(node.span.span_id);
-  return (
-    <div className="tree-node">
-      <button
-        type="button"
-        className={`tree-row ${key === selectedSpanKey ? "selected" : ""}`}
-        style={{ "--tree-depth": depth } as React.CSSProperties}
-        onClick={() => onSelect(key)}
-      >
-        <span className="tree-branch">{depth > 0 ? "└" : "•"}</span>
-        <StatusIcon status={node.span.status} />
-        <span className="tree-name">{node.span.label || node.span.name}</span>
-        <span className="tree-agent">{node.span.agent_id || node.span.agent || "-"}</span>
-        <span className="tree-duration">{formatMs(node.span.duration_ms)}</span>
-        {node.span.attempt > 1 ? <span className="tree-attempt">第 {node.span.attempt} 次</span> : null}
-      </button>
-      {node.children.map((child) => (
-        <TreeRow
-          key={child.span.span_key || child.span.span_id}
-          node={child}
-          depth={depth + 1}
-          selectedSpanKey={selectedSpanKey}
-          onSelect={onSelect}
-        />
-      ))}
     </div>
   );
 }
@@ -371,7 +306,7 @@ function SpanDetail({ span }: { span: AgentRunSpan }) {
         <div>
           <div className="panel-title">
             <Activity size={16} />
-            <span>节点详情</span>
+            <span>执行详情</span>
           </div>
           <h3>{span.label || span.name}</h3>
         </div>
@@ -381,8 +316,8 @@ function SpanDetail({ span }: { span: AgentRunSpan }) {
         </div>
       </div>
       <div className="span-meta-grid">
-        <ContextValue label="Agent" value={span.agent_id || span.agent || "-"} />
-        <ContextValue label="节点类型" value={span.span_type || "-"} />
+        <ContextValue label="执行主体" value={span.agent_id || span.agent || "-"} />
+        <ContextValue label="记录类型" value={spanTypeLabel(span.span_type)} />
         <ContextValue label="任务 ID" value={span.task_id || "-"} />
         <ContextValue label="父节点" value={span.parent_span_key || "根节点"} />
         <ContextValue label="序号" value={String(span.sequence ?? 0)} />
@@ -448,29 +383,6 @@ function StatusIcon({ status }: { status: string }) {
   return <AlertTriangle className="status-icon status-warning" size={15} />;
 }
 
-function buildSpanTree(spans: AgentRunSpan[]): TreeNode[] {
-  const nodes = new Map<string, TreeNode>();
-  const roots: TreeNode[] = [];
-  const ordered = [...spans].sort((left, right) => {
-    const sequenceDiff = (left.sequence ?? 0) - (right.sequence ?? 0);
-    return sequenceDiff || left.span_id - right.span_id;
-  });
-
-  for (const span of ordered) {
-    const key = span.span_key || String(span.span_id);
-    nodes.set(key, { span, children: [] });
-  }
-  for (const span of ordered) {
-    const key = span.span_key || String(span.span_id);
-    const node = nodes.get(key);
-    if (!node) continue;
-    const parent = span.parent_span_key ? nodes.get(span.parent_span_key) : null;
-    if (parent && parent !== node) parent.children.push(node);
-    else roots.push(node);
-  }
-  return roots;
-}
-
 function fieldLabel(key: string) {
   const labels: Record<string, string> = {
     plan_type: "计划类型",
@@ -483,6 +395,26 @@ function fieldLabel(key: string) {
     status: "状态",
     fallback_plan: "兜底策略",
     repair_attempt: "修复次数",
+    handoff_id: "交接 ID",
+    handoff_type: "交接类型",
+    handoff_status: "交接状态",
+    from_node_id: "来源节点",
+    from_agent_id: "来源 Agent",
+    to_node_id: "目标节点",
+    to_agent_id: "目标 Agent",
+    required: "是否硬依赖",
+    artifact_refs: "产物引用",
+    evidence_refs: "证据引用",
+    depends_on: "硬依赖节点",
+    input_refs: "软上下文节点",
+    handoff_ids: "交接 ID 列表",
+    dependency_span_keys: "依赖 Span",
+    prompt_id: "Prompt ID",
+    prompt_version: "Prompt 版本",
+    allowed_tools: "允许工具",
+    evidence_count: "证据数量",
+    tool_call_count: "工具调用次数",
+    attempt: "执行次数",
   };
   return labels[key] || key;
 }
@@ -512,4 +444,17 @@ function formatDate(value?: string | null) {
 
 function statusLabel(status: string) {
   return { succeeded: "成功", failed: "失败", degraded: "降级", running: "执行中" }[status] || status || "未知";
+}
+
+function spanTypeLabel(spanType: string) {
+  const labels: Record<string, string> = {
+    run: "请求总控",
+    agent: "业务 Agent",
+    policy: "代码策略",
+    llm: "模型调用",
+    tool: "工具调用",
+    handoff: "Agent 交接",
+    stage: "系统阶段",
+  };
+  return labels[spanType] || spanType || "未知";
 }

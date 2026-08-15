@@ -181,12 +181,16 @@ export type ChatSessionDetailResponse = {
 };
 
 export type DecisionTrace = {
+  trace_schema_version?: string;
+  run_id?: string;
   query_understanding?: Record<string, unknown>;
   image_attributes?: Record<string, unknown>;
   memory_used?: string[];
   filters?: string[];
   retrieval_summary?: Record<string, unknown>;
   agent_path?: Record<string, unknown>[];
+  tool_calls?: AgentToolCallTrace[];
+  handoffs?: AgentHandoff[];
   planner_proposal?: Record<string, unknown>;
   orchestrator_decisions?: Record<string, unknown>[];
   task?: Record<string, unknown>;
@@ -197,8 +201,42 @@ export type DecisionTrace = {
   candidate_counts?: Record<string, unknown>;
   stages?: Record<string, unknown>[];
   rerank_factors?: string[];
+  failed_node_ids?: string[];
+  blocked_node_ids?: string[];
   final_reason?: string;
   [key: string]: unknown;
+};
+
+export type AgentToolCallTrace = {
+  call_id?: string;
+  node_id?: string;
+  capability?: string;
+  task_id?: string;
+  agent_id?: string;
+  tool: string;
+  operation: string;
+  status: string;
+  attempt?: number;
+  result?: Record<string, unknown>;
+  error_type?: string;
+  error_message?: string;
+};
+
+export type AgentHandoff = {
+  handoff_id: string;
+  handoff_type: string;
+  from_node_id: string;
+  to_node_id: string;
+  from_agent_id: string;
+  to_agent_id: string;
+  intent_ids?: string[];
+  artifact_refs?: string[];
+  evidence_refs?: string[];
+  required: boolean;
+  reason?: string;
+  status: string;
+  sequence?: number;
+  metadata?: Record<string, unknown>;
 };
 
 export type TimingSpan = {
@@ -303,6 +341,7 @@ export type StreamEvent =
   | { type: "decision_trace"; trace: DecisionTrace }
   | { type: "token"; content: string }
   | { type: "agent_update"; stage: string; title: string; content_delta: string; done: boolean }
+  | { type: "handoff_update"; run_id: string; handoff: AgentHandoff; span_key?: string }
   | { type: "timing_update"; run_id: string; span?: TimingSpan; summary?: TimingSummary; evaluation?: RuleEvaluationSummary }
   | { type: "product_cards"; products: ProductCard[] }
   | { type: "error"; message?: string; error?: string; stage?: string }
@@ -322,6 +361,7 @@ export type ChatMessage = {
   timingSummary?: TimingSummary | null;
   ruleEvaluation?: RuleEvaluationSummary | null;
   agentUpdates?: AgentUpdate[];
+  handoffs?: AgentHandoff[];
   products?: ProductCard[];
 };
 

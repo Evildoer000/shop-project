@@ -69,6 +69,7 @@ class SlotSearchResult(BaseModel):
     hybrid_ranked_products: list[Product] = Field(default_factory=list, exclude=True)
     vector_scores: dict[str, float] = Field(default_factory=dict)
     keyword_scores: dict[str, float] = Field(default_factory=dict)
+    branch_status: dict[str, dict] = Field(default_factory=dict)
 
 
 class SlotCoverageDecision(BaseModel):

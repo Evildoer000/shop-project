@@ -147,17 +147,29 @@ def get_agent_run(
         .order_by(AgentRunSpan.sequence.asc(), AgentRunSpan.span_id.asc())
     ).all()
 
-    # AgentRun.turn_id is the orchestrator task ID, while ConversationTurn has
-    # its own DB integer ID. Match the persisted turn by the same user/session/query.
+    # New turns carry run_id in trace_summary, which keeps repeated or concurrent
+    # identical queries attributable to the correct execution tree. The text
+    # fallback preserves access to historical rows written before trace v2.
     conversation_row = db.scalar(
         select(ConversationTurn)
         .where(
             ConversationTurn.user_id == run.user_id,
             ConversationTurn.session_id == run.session_id,
-            ConversationTurn.user_message == run.query_summary,
+            ConversationTurn.trace_summary["run_id"].as_string() == run.run_id,
         )
         .order_by(ConversationTurn.created_at.desc(), ConversationTurn.turn_id.desc())
     )
+    if conversation_row is None:
+        conversation_row = db.scalar(
+            select(ConversationTurn)
+            .where(
+                ConversationTurn.user_id == run.user_id,
+                ConversationTurn.session_id == run.session_id,
+                ConversationTurn.user_message == run.query_summary,
+                ConversationTurn.trace_summary["run_id"].as_string().is_(None),
+            )
+            .order_by(ConversationTurn.created_at.desc(), ConversationTurn.turn_id.desc())
+        )
     conversation = (
         AgentRunConversation.model_validate(conversation_row)
         if conversation_row is not None

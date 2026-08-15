@@ -60,6 +60,28 @@ class DummyRetriever:
         }
 
 
+class RecordingRetriever(DummyRetriever):
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.error = error
+        self.queries: list[str] = []
+
+    def retrieve(self, query: str, products: list[Product], top_k: int = 12) -> dict[str, float]:
+        self.queries.append(query)
+        if self.error is not None:
+            raise self.error
+        return super().retrieve(query, products, top_k)
+
+
+class RecordingRepository(DummyRepository):
+    def __init__(self, products: list[Product]) -> None:
+        super().__init__(products)
+        self.keyword_queries: list[str] = []
+
+    def keyword_scores(self, query: str, products: list[Product], top_k: int | None = None) -> dict[str, float]:
+        self.keyword_queries.append(query)
+        return super().keyword_scores(query, products, top_k)
+
+
 class DummyReranker:
     def rerank(self, query: str, products: list[Product], top_k: int = 5) -> list[tuple[Product, float]]:
         return [(product, 0.4) for product in products[:top_k]]
@@ -150,3 +172,60 @@ def test_search_uses_up_to_three_attempts_when_signal_is_empty() -> None:
 
     assert len(result.attempts) == 3
     assert result.candidates == []
+
+
+def test_search_query_routes_semantic_and_lexical_queries_to_separate_branches() -> None:
+    product = make_product("p1", "SPF50 lightweight sunscreen", "beauty", "sunscreen")
+    repository = RecordingRepository([product])
+    retriever = RecordingRetriever()
+    tool = ProductSearchTool(repository, retriever, DummyReranker())
+    slot = NeedSlot(slot_id="s1", goal="sunscreen", product_type="sunscreen", query="original request")
+
+    result = tool.search_query(
+        slot,
+        QueryPlan(),
+        IntentPlan(original_query="original request"),
+        "original request",
+        1,
+        "test",
+        vector_query="semantic oily skin summer commute",
+        keyword_query="sunscreen SPF50 lightweight",
+    )
+
+    assert retriever.queries == ["semantic oily skin summer commute"]
+    assert repository.keyword_queries == ["sunscreen SPF50 lightweight"]
+    assert result.vector_query == "semantic oily skin summer commute"
+    assert result.keyword_query == "sunscreen SPF50 lightweight"
+    assert result.branch_status["vector"]["status"] == "ok"
+    assert result.branch_status["keyword"]["status"] == "ok"
+
+
+def test_search_query_degrades_to_keyword_branch_when_vector_embedding_fails() -> None:
+    product = make_product("p1", "SPF50 lightweight sunscreen", "beauty", "sunscreen")
+    repository = RecordingRepository([product])
+    retriever = RecordingRetriever(error=RuntimeError("embedding quota exhausted"))
+    tool = ProductSearchTool(repository, retriever, DummyReranker())
+    slot = NeedSlot(slot_id="s1", goal="sunscreen", product_type="sunscreen", query="sunscreen")
+
+    result = tool.search_query(
+        slot,
+        QueryPlan(),
+        IntentPlan(original_query="sunscreen"),
+        "sunscreen",
+        1,
+        "test",
+        vector_query="semantic sunscreen",
+        keyword_query="SPF50 sunscreen",
+    )
+
+    assert result.vector_scores == {}
+    assert result.keyword_scores == {"p1": 0.5}
+    assert [candidate.product_id for candidate in result.candidates] == ["p1"]
+    assert result.branch_status["vector"] == {
+        "status": "degraded",
+        "query": "semantic sunscreen",
+        "hit_count": 0,
+        "reason": "vector_embedding_or_milvus_failed",
+        "error": "embedding quota exhausted",
+    }
+    assert result.branch_status["keyword"]["status"] == "ok"

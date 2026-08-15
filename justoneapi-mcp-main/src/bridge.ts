@@ -6,6 +6,7 @@ import { loadNodeConfig } from "./config.js";
 import { bundledCatalog } from "./generated/bundledCatalog.js";
 import { stderrLogger } from "./common/logger.js";
 import { RuntimeContext } from "./common/runtime.js";
+import { BaiduWebSearchMcpClient } from "./webSearchMcp.js";
 
 // This bridge deliberately exposes high-level operations only.  The native MCP
 // server still owns discovery, schemas and generic endpoint calling, but no
@@ -46,6 +47,13 @@ const runtime: RuntimeContext = {
   isAdmin: () => true,
 };
 
+const webSearchClient = new BaiduWebSearchMcpClient({
+  endpoint: process.env.BAIDU_WEB_SEARCH_MCP_URL || "",
+  token: process.env.BAIDU_WEB_SEARCH_MCP_TOKEN || "",
+  toolName: process.env.BAIDU_WEB_SEARCH_MCP_TOOL_NAME || "web_search",
+  timeoutMs: Number(process.env.BAIDU_WEB_SEARCH_MCP_TIMEOUT_MS || 30_000),
+});
+
 const port = Number(process.env.BRIDGE_PORT || 8787);
 
 createServer(async (request, response) => {
@@ -55,6 +63,22 @@ createServer(async (request, response) => {
         ok: true,
         token_configured: Boolean(runtime.getToken()),
         allowed_platforms: Object.keys(ALLOWED_ENDPOINTS.search),
+        web_search_configured: webSearchClient.configured,
+        web_search_tool: webSearchClient.configuredToolName,
+      });
+      return;
+    }
+    if (request.method === "POST" && request.url === "/v1/web/search") {
+      const input = await readJson(request);
+      const result = await webSearchClient.search({
+        query: String(input.query || ""),
+        count: clamp(input.count ?? input.limit ?? 8, 1, 20),
+        freshness: String(input.freshness || ""),
+      });
+      sendJson(response, 200, {
+        ...result,
+        operation: "search",
+        collected_at: new Date().toISOString(),
       });
       return;
     }
@@ -115,6 +139,8 @@ createServer(async (request, response) => {
     port,
     token_configured: Boolean(runtime.getToken()),
     allowed_platforms: Object.keys(ALLOWED_ENDPOINTS.search),
+    web_search_configured: webSearchClient.configured,
+    web_search_tool: webSearchClient.configuredToolName,
   });
 });
 

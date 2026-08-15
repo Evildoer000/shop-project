@@ -61,6 +61,12 @@ def build_default_capability_catalog() -> CapabilityCatalog:
             supervisor_managed=True,
         ),
         CapabilityDefinition(
+            name="policy_gate",
+            description="用确定性代码规则审批 Agent 提案、研究请求和动态调度。",
+            planner_proposable=False,
+            supervisor_managed=True,
+        ),
+        CapabilityDefinition(
             name="profile_preference",
             description="按需读取长期画像，并输出只能作为软偏好的个性化上下文。",
             planner_proposable=True,

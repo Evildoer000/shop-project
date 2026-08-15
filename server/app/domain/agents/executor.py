@@ -14,7 +14,12 @@ from app.domain.agents.contracts import (
     ExecutionReport,
 )
 from app.domain.supervisor.agent_registry import AgentRegistry
-from app.domain.supervisor.task_graph import FAILURE_STATUSES, TaskGraph, TaskGraphNode
+from app.domain.supervisor.task_graph import (
+    FAILURE_STATUSES,
+    AgentHandoff,
+    TaskGraph,
+    TaskGraphNode,
+)
 from app.domain.supervisor.tool_access import AgentToolAccess
 from app.harness.tool_registry import ToolRegistry
 from app.services.llm_client import bind_llm_trace_context
@@ -55,6 +60,8 @@ class AgentExecutor:
         self.handlers = handlers or {}
         self.prompt_registry = prompt_registry
         self._span_keys: dict[str, str] = {}
+        self._handoff_span_keys: dict[str, str] = {}
+        self._observed_handoff_statuses: dict[str, str] = {}
 
     def register(self, capability: str, handler: AgentHandler) -> None:
         if capability in self.handlers:
@@ -64,6 +71,16 @@ class AgentExecutor:
     def begin_graph(self, *, completed_span_keys: dict[str, str] | None = None) -> None:
         """Reset request-scoped lineage before executing a newly compiled graph."""
         self._span_keys = dict(completed_span_keys or {})
+        self._handoff_span_keys = {}
+        self._observed_handoff_statuses = {}
+
+    def register_completed_node_span(self, node_id: str, span_key: str | None) -> None:
+        """Attach a code-owned system node to the same request execution tree."""
+        if node_id and span_key:
+            self._span_keys[node_id] = span_key
+
+    def span_key_for_node(self, node_id: str) -> str | None:
+        return self._span_keys.get(node_id)
 
     async def execute(
         self,
@@ -109,6 +126,8 @@ class AgentExecutor:
         interruption_reason = "executor_stream_closed"
 
         try:
+            for handoff_event in self._handoff_events(graph):
+                yield handoff_event
             while True:
                 while True:
                     blocked = graph.mark_blocked_nodes()
@@ -121,6 +140,8 @@ class AgentExecutor:
                             node_id=node_id,
                             payload={"reason": "dependency_failed"},
                         )
+                    for handoff_event in self._handoff_events(graph):
+                        yield handoff_event
 
                 ready = graph.ready_nodes()
                 if not ready:
@@ -128,7 +149,9 @@ class AgentExecutor:
                     if pending:
                         if execution_report.failed_node_ids or any(
                             node.status in FAILURE_STATUSES
-                            or node.status == "skipped" and node.metadata.get("skipped_reason") == "dependency_failed"
+                            or node.status == "skipped"
+                            and node.metadata.get("skipped_reason")
+                            in {"dependency_failed", "optional_branch_failed"}
                             for node in graph.nodes
                         ):
                             break
@@ -151,6 +174,8 @@ class AgentExecutor:
 
                 active_nodes = list(ready)
                 for node in active_nodes:
+                    graph.accept_handoffs(node.node_id)
+                for node in active_nodes:
                     node.status = "running"
                 node_tasks = {
                     node.node_id: asyncio.create_task(
@@ -159,6 +184,8 @@ class AgentExecutor:
                     )
                     for node in active_nodes
                 }
+                for handoff_event in self._handoff_events(graph):
+                    yield handoff_event
 
                 # Tasks exist before a start event is exposed. If the SSE
                 # consumer closes on that event, the finally block can cancel
@@ -206,6 +233,11 @@ class AgentExecutor:
                 for node in active_nodes:
                     result = node_tasks[node.node_id].result()
                     self._store_result(execution_report, node, result)
+                    graph.complete_source_handoffs(
+                        node.node_id,
+                        evidence_refs=[item.evidence_id for item in result.evidence if item.evidence_id],
+                    )
+                    graph.consume_handoffs(node.node_id)
                     yield ExecutorEvent(
                         kind="node_finished",
                         node_id=node.node_id,
@@ -218,6 +250,8 @@ class AgentExecutor:
                             "result": result.compact(),
                         },
                     )
+                    for handoff_event in self._handoff_events(graph):
+                        yield handoff_event
 
                 active_nodes = []
                 node_tasks = {}
@@ -227,6 +261,8 @@ class AgentExecutor:
                     break
 
             execution_report.completed = not [node for node in graph.nodes if node.status == "pending"]
+            for handoff_event in self._handoff_events(graph):
+                yield handoff_event
             yield ExecutorEvent(
                 kind="graph_finished",
                 payload={
@@ -253,6 +289,7 @@ class AgentExecutor:
                     execution_report,
                     interruption_reason,
                 )
+                self._handoff_events(graph)
             if base_context.metadata.get("executor_event_queue") is event_queue:
                 base_context.metadata.pop("executor_event_queue", None)
 
@@ -266,14 +303,16 @@ class AgentExecutor:
         try:
             registration = self.agent_registry.require(node.agent_id)
         except Exception as exc:
-            return AgentResult.failure_result(
+            result = AgentResult.failure_result(
                 "agent_not_registered",
                 str(exc),
                 retryable=False,
                 termination_reason="configuration_error",
             )
+            self._record_synthetic_failure_span(node, result, started, graph)
+            return result
         if registration.manifest.capability != node.capability:
-            return AgentResult.failure_result(
+            result = AgentResult.failure_result(
                 "agent_capability_mismatch",
                 (
                     f"Agent {node.agent_id} provides {registration.manifest.capability}, "
@@ -282,25 +321,36 @@ class AgentExecutor:
                 retryable=False,
                 termination_reason="configuration_error",
             )
+            self._record_synthetic_failure_span(node, result, started, graph)
+            return result
         handler = self.handlers.get(node.capability)
-        parent_span_key = self._parent_span_key(node)
+        parent_span_key = self._parent_span_key(node, graph)
         prompt_spec = self.prompt_registry.get(node.agent_id) if self.prompt_registry is not None else None
         span = None
         if self.span_recorder is not None:
             span = self.span_recorder.start_span(
-                f"agent:{node.agent_id}",
+                (
+                    f"policy:{node.agent_id}"
+                    if node.capability == "policy_gate"
+                    else f"agent:{node.agent_id}"
+                ),
                 label=node.metadata.get("phase") or node.capability,
                 agent=node.agent_id,
                 agent_id=node.agent_id,
                 task_id=node.task_id,
-                span_type="agent",
+                span_type="policy" if node.capability == "policy_gate" else "agent",
                 attempt=node.attempt,
                 parent_span_key=parent_span_key,
                 input_summary={
                     "node_id": node.node_id,
                     "capability": node.capability,
                     "depends_on": list(node.depends_on),
-                    "dependency_span_keys": [self._span_keys.get(item) for item in node.depends_on],
+                    "input_refs": list(node.input_refs),
+                    "handoff_ids": [item.handoff_id for item in graph.handoffs_to(node.node_id)],
+                    "dependency_span_keys": [
+                        self._span_keys.get(item)
+                        for item in self._dependency_ids(node)
+                    ],
                     "prompt_id": prompt_spec.agent_id if prompt_spec is not None else "",
                     "prompt_version": prompt_spec.version if prompt_spec is not None else "",
                     "allowed_tools": list(registration.manifest.allowed_tools),
@@ -316,7 +366,7 @@ class AgentExecutor:
         else:
             dependency_outputs = {
                 dependency_id: self._output_for_dependency(dependency_id, base_context)
-                for dependency_id in node.depends_on
+                for dependency_id in self._dependency_ids(node)
             }
             context = AgentExecutionContext(
                 node=node,
@@ -417,6 +467,53 @@ class AgentExecutor:
             )
         return result
 
+    def _record_synthetic_failure_span(
+        self,
+        node: TaskGraphNode,
+        result: AgentResult,
+        started: float,
+        graph: TaskGraph,
+    ) -> None:
+        """Keep graph configuration failures attributable to their task node."""
+        if self.span_recorder is None or node.node_id in self._span_keys:
+            return
+        record = getattr(self.span_recorder, "record_completed_span", None)
+        if not callable(record):
+            return
+        failure = result.failure
+        payload = record(
+            (
+                f"policy:{node.agent_id}"
+                if node.capability == "policy_gate"
+                else f"agent:{node.agent_id}"
+            ),
+            duration_ms=max(0.0, (time.perf_counter() - started) * 1000),
+            label=node.metadata.get("phase") or node.capability,
+            parent_span_key=self._parent_span_key(node, graph),
+            task_id=node.task_id,
+            agent_id=node.agent_id,
+            span_type="policy" if node.capability == "policy_gate" else "agent",
+            attempt=node.attempt,
+            status=result.status,
+            input_summary={
+                "node_id": node.node_id,
+                "capability": node.capability,
+                "depends_on": list(node.depends_on),
+                "input_refs": list(node.input_refs),
+                "dependency_span_keys": [
+                    self._span_keys.get(item)
+                    for item in self._dependency_ids(node)
+                ],
+            },
+            output_summary={"configuration_valid": False},
+            error_type=failure.error_type if failure else "",
+            error_message=failure.message if failure else "",
+            termination_reason=result.termination_reason or "configuration_error",
+        )
+        span_key = str(payload.get("span_key") or "")
+        if span_key:
+            self._span_keys[node.node_id] = span_key
+
     async def _finalize_interrupted_batch(
         self,
         nodes: list[TaskGraphNode],
@@ -448,8 +545,10 @@ class AgentExecutor:
                     "Agent batch ended before the node produced a result",
                     termination_reason=reason,
                 )
-                self._record_synthetic_cancelled_span(node, reason)
+                self._record_synthetic_cancelled_span(node, reason, report.graph)
             self._store_result(report, node, result, interrupted=True)
+            report.graph.complete_source_handoffs(node.node_id)
+            report.graph.consume_handoffs(node.node_id)
             if node.status == "cancelled":
                 cancelled_ids.append(node.node_id)
 
@@ -480,32 +579,47 @@ class AgentExecutor:
                 report.failed_node_ids.append(node.node_id)
             else:
                 node.status = "skipped"
+                node.metadata = {
+                    **node.metadata,
+                    "skipped_reason": "optional_branch_failed",
+                    "optional_failure": result.failure.compact() if result.failure else {},
+                }
                 report.blocked_node_ids.append(node.node_id)
         else:
             node.status = "succeeded"
         report.failed_node_ids = list(dict.fromkeys(report.failed_node_ids))
         report.blocked_node_ids = list(dict.fromkeys(report.blocked_node_ids))
 
-    def _record_synthetic_cancelled_span(self, node: TaskGraphNode, reason: str) -> None:
+    def _record_synthetic_cancelled_span(
+        self,
+        node: TaskGraphNode,
+        reason: str,
+        graph: TaskGraph,
+    ) -> None:
         if self.span_recorder is None or node.node_id in self._span_keys:
             return
         record = getattr(self.span_recorder, "record_completed_span", None)
         if not callable(record):
             return
         payload = record(
-            f"agent:{node.agent_id}",
+            (
+                f"policy:{node.agent_id}"
+                if node.capability == "policy_gate"
+                else f"agent:{node.agent_id}"
+            ),
             duration_ms=0,
             label=node.metadata.get("phase") or node.capability,
-            parent_span_key=self._parent_span_key(node),
+            parent_span_key=self._parent_span_key(node, graph),
             task_id=node.task_id,
             agent_id=node.agent_id,
-            span_type="agent",
+            span_type="policy" if node.capability == "policy_gate" else "agent",
             attempt=node.attempt,
             status="cancelled",
             input_summary={
                 "node_id": node.node_id,
                 "capability": node.capability,
                 "depends_on": list(node.depends_on),
+                "input_refs": list(node.input_refs),
             },
             error_type="CancelledError",
             error_message="Agent task was cancelled before its span started",
@@ -525,12 +639,100 @@ class AgentExecutor:
         except (asyncio.CancelledError, Exception):
             pass
 
-    def _parent_span_key(self, node: TaskGraphNode) -> str | None:
-        for dependency_id in node.depends_on:
+    def _parent_span_key(self, node: TaskGraphNode, graph: TaskGraph) -> str | None:
+        incoming = graph.handoffs_to(node.node_id)
+        ordered = [
+            *[item for item in incoming if item.required],
+            *[item for item in incoming if not item.required],
+        ]
+        for handoff in ordered:
+            span_key = self._handoff_span_keys.get(handoff.handoff_id)
+            if span_key:
+                return span_key
+        for dependency_id in self._dependency_ids(node):
             span_key = self._span_keys.get(dependency_id)
             if span_key:
                 return span_key
         return None
+
+    def _dependency_ids(self, node: TaskGraphNode) -> list[str]:
+        return list(dict.fromkeys([*node.depends_on, *node.input_refs]))
+
+    def _handoff_events(self, graph: TaskGraph) -> list[ExecutorEvent]:
+        graph.sync_handoffs()
+        events: list[ExecutorEvent] = []
+        for handoff in sorted(graph.handoffs, key=lambda item: item.sequence):
+            previous = self._observed_handoff_statuses.get(handoff.handoff_id)
+            if previous == handoff.status:
+                continue
+            if handoff.status in {
+                "accepted",
+                "consumed",
+                "unavailable",
+                "blocked",
+                "superseded",
+            }:
+                self._record_handoff_span(handoff, graph)
+            self._observed_handoff_statuses[handoff.handoff_id] = handoff.status
+            events.append(
+                ExecutorEvent(
+                    kind="handoff_updated",
+                    node_id=handoff.to_node_id,
+                    payload={
+                        "handoff": handoff.model_dump(),
+                        "span_key": self._handoff_span_keys.get(handoff.handoff_id, ""),
+                    },
+                )
+            )
+        return events
+
+    def _record_handoff_span(self, handoff: AgentHandoff, graph: TaskGraph) -> None:
+        if handoff.handoff_id in self._handoff_span_keys or self.span_recorder is None:
+            return
+        record = getattr(self.span_recorder, "record_completed_span", None)
+        if not callable(record):
+            return
+        target = graph.get_node(handoff.to_node_id)
+        source = graph.get_node(handoff.from_node_id)
+        status = "succeeded"
+        if handoff.status == "blocked":
+            status = "failed"
+        elif handoff.status in {"unavailable", "superseded"}:
+            status = "degraded"
+        payload = record(
+            f"handoff:{handoff.handoff_type}",
+            duration_ms=0,
+            label=f"Agent 交接：{handoff.from_agent_id} -> {handoff.to_agent_id}",
+            parent_span_key=self._span_keys.get(handoff.from_node_id),
+            task_id=f"{graph.turn_id}:handoff:{handoff.sequence}",
+            agent_id="supervisor_handoff",
+            span_type="handoff",
+            attempt=target.attempt if target is not None else 1,
+            status=status,
+            input_summary={
+                "handoff_id": handoff.handoff_id,
+                "handoff_type": handoff.handoff_type,
+                "from_node_id": handoff.from_node_id,
+                "from_agent_id": handoff.from_agent_id,
+                "from_task_id": source.task_id if source is not None else "",
+                "to_node_id": handoff.to_node_id,
+                "to_agent_id": handoff.to_agent_id,
+                "to_task_id": target.task_id if target is not None else "",
+                "required": handoff.required,
+                "artifact_refs": list(handoff.artifact_refs),
+                "evidence_refs": list(handoff.evidence_refs),
+            },
+            output_summary={"handoff_status": handoff.status, "reason": handoff.reason},
+            metrics={
+                "required": handoff.required,
+                "artifact_ref_count": len(handoff.artifact_refs),
+                "evidence_ref_count": len(handoff.evidence_refs),
+            },
+            termination_reason=f"handoff_{handoff.status}",
+        )
+        span_key = str(payload.get("span_key") or "")
+        if span_key:
+            self._handoff_span_keys[handoff.handoff_id] = span_key
 
     def _output_for_dependency(self, node_id: str, base_context: AgentExecutionContext) -> dict[str, Any]:
         output = base_context.artifacts.get(node_id)

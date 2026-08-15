@@ -3,12 +3,11 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from app.db.session import get_sessionmaker
 from app.domain.need_slot_schemas import FinalAnswerSignal, NeedSlot, SlotCoverageDecision, MultiNeedState
 from app.domain.product_search_tool import ProductSearchTool
+from app.domain.retrieval_execution import RetrievalExecutionBoundary
 from app.domain.slot_retrieval_agent import SlotRetrievalAgent, SlotRetrievalAgentResult
 from app.schemas import IntentPlan, QueryPlan
-from app.services.product_repository import ProductRepository
 
 
 class MultiNeedRetrievalCoordinator:
@@ -19,9 +18,11 @@ class MultiNeedRetrievalCoordinator:
         self,
         search_tool: ProductSearchTool,
         slot_agent_cls: type[SlotRetrievalAgent] = SlotRetrievalAgent,
+        execution_boundary: RetrievalExecutionBoundary | None = None,
     ) -> None:
         self.search_tool = search_tool
         self.slot_agent_cls = slot_agent_cls
+        self.execution_boundary = execution_boundary or RetrievalExecutionBoundary(search_tool)
 
     async def run(
         self,
@@ -72,12 +73,28 @@ class MultiNeedRetrievalCoordinator:
         intent_plan: IntentPlan,
     ) -> SlotRetrievalAgentResult:
         async with semaphore:
-            return await asyncio.to_thread(
-                self._run_slot_agent_in_isolated_context,
-                slot.model_copy(deep=True),
-                plan.model_copy(deep=True),
-                intent_plan.model_copy(deep=True),
+            return await self.run_slot_isolated(
+                slot,
+                plan,
+                intent_plan,
             )
+
+    async def run_slot_isolated(
+        self,
+        slot: NeedSlot,
+        plan: QueryPlan,
+        intent_plan: IntentPlan,
+    ) -> SlotRetrievalAgentResult:
+        slot_copy = slot.model_copy(deep=True)
+        plan_copy = plan.model_copy(deep=True)
+        intent_plan_copy = intent_plan.model_copy(deep=True)
+        return await self.execution_boundary.run_product(
+            lambda search_tool: self.slot_agent_cls(search_tool).run(
+                slot_copy,
+                plan_copy,
+                intent_plan_copy,
+            )
+        )
 
     def _run_slot_agent_in_isolated_context(
         self,
@@ -85,33 +102,9 @@ class MultiNeedRetrievalCoordinator:
         plan: QueryPlan,
         intent_plan: IntentPlan,
     ) -> SlotRetrievalAgentResult:
-        self._ensure_thread_event_loop()
-        repository = getattr(self.search_tool, "product_repository", None)
-        current_db = getattr(repository, "db", None)
-        retriever = getattr(self.search_tool, "retriever", None)
-        reranker = getattr(self.search_tool, "reranker", None)
-
-        if current_db is None or retriever is None or reranker is None:
-            agent = self.slot_agent_cls(self.search_tool)
-            return agent.run(slot, plan, intent_plan)
-
-        db = get_sessionmaker()()
-        try:
-            product_repository = ProductRepository(db)
-            search_tool = ProductSearchTool(product_repository, retriever, reranker)
-            agent = self.slot_agent_cls(search_tool)
-            return agent.run(slot, plan, intent_plan)
-        finally:
-            db.close()
-
-    def _ensure_thread_event_loop(self) -> None:
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            asyncio.set_event_loop(asyncio.new_event_loop())
-            return
-        if loop.is_closed():
-            asyncio.set_event_loop(asyncio.new_event_loop())
+        return self.execution_boundary.run_product_sync(
+            lambda search_tool: self.slot_agent_cls(search_tool).run(slot, plan, intent_plan)
+        )
 
     def _record_slot_agent_result(
         self,

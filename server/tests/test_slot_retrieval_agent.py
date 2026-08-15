@@ -26,6 +26,10 @@ class EmptySearchTool:
             vector_query=query,
             keyword_query=query,
             attempts=[{"attempt": attempt_index, "query": query, "reason": reason}],
+            branch_status={
+                "vector": {"status": "degraded", "query": query, "reason": "embedding_failed"},
+                "keyword": {"status": "ok", "query": query, "hit_count": 0},
+            },
         )
 
 
@@ -45,3 +49,5 @@ def test_slot_agent_runs_initial_search_only_without_repair_loop() -> None:
         "search_products",
     ]
     assert len(result.slot_result["attempts"]) == 1
+    assert result.slot_result["retrieval_branches"]["vector"]["status"] == "degraded"
+    assert result.tool_calls[0].output_summary["retrieval_branches"]["keyword"]["status"] == "ok"

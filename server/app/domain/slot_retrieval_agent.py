@@ -117,6 +117,7 @@ class SlotRetrievalAgent:
         current["keyword_query"] = search_result.keyword_query
         current["categories"] = search_result.categories
         current["category_resolution"] = search_result.category_resolution
+        current["retrieval_branches"] = search_result.branch_status
         current["attempts"] = [*current.get("attempts", []), *search_result.attempts]
         current["counts"] = self._merge_counts(current.get("counts", {}), search_result.counts)
 
@@ -150,6 +151,7 @@ class SlotRetrievalAgent:
             "attempts": search_result.attempts,
             "categories": search_result.categories,
             "category_resolution": search_result.category_resolution,
+            "retrieval_branches": search_result.branch_status,
             "candidate_ids": [candidate.product_id for candidate in search_result.candidates],
         }
 

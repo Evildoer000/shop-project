@@ -7,6 +7,12 @@ from app.schemas import IntentPlan
 
 
 COMMERCE_RESEARCH_PLATFORMS = frozenset({"taobao", "douyin_ec", "xiaohongshu"})
+RESEARCH_TRIGGER_NEEDS = {
+    "explicit_web_request": "explicit_web",
+    "explicit_platform_request": "explicit_platform",
+    "freshness_required": "freshness_required",
+    "knowledge_bridge": "knowledge_bridge",
+}
 
 
 class IntentPlanContractError(ValueError):
@@ -87,9 +93,43 @@ def validate_intent_plan_contract(
 
     research_request_ids = [request.request_id.strip() for request in plan.research_requests]
     _validate_unique_non_empty("research request_id", research_request_ids, errors)
+    intents_by_id = {intent.intent_id: intent for intent in plan.intents}
     for request in plan.research_requests:
         if request.intent_id not in intent_id_set:
             errors.append(f"research request {request.request_id} references unknown intent_id {request.intent_id}")
+            continue
+        intent = intents_by_id[request.intent_id]
+        if not request.trigger_text.strip():
+            errors.append(f"research request {request.request_id} requires trigger_text")
+        expected_need = RESEARCH_TRIGGER_NEEDS[request.trigger_type]
+        if intent.route_basis.external_information_need != expected_need:
+            errors.append(
+                f"research request {request.request_id} trigger_type does not match intent route_basis"
+            )
+        if request.mode == "web_general" and request.consumer_capability == "commerce_research":
+            errors.append(
+                f"research request {request.request_id} web_general cannot be consumed by commerce_research"
+            )
+        if request.mode in {"marketplace", "social_content"} and request.consumer_capability != "commerce_research":
+            errors.append(
+                f"research request {request.request_id} commerce mode requires consumer_capability=commerce_research"
+            )
+        if request.trigger_type == "explicit_platform_request" and request.mode not in {
+            "marketplace",
+            "social_content",
+        }:
+            errors.append(
+                f"research request {request.request_id} explicit platform trigger requires commerce mode"
+            )
+        if request.trigger_type != "explicit_platform_request" and request.mode in {
+            "marketplace",
+            "social_content",
+        }:
+            errors.append(
+                f"research request {request.request_id} commerce mode requires explicit_platform_request"
+            )
+        if request.trigger_type == "knowledge_bridge" and not request.local_catalog_gap.strip():
+            errors.append(f"research request {request.request_id} knowledge_bridge requires local_catalog_gap")
         if request.mode in {"marketplace", "social_content"} and not request.platforms:
             errors.append(f"research request {request.request_id} requires at least one platform")
         if request.mode in {"marketplace", "social_content"}:
@@ -114,6 +154,16 @@ def validate_intent_plan_contract(
     proposal_id_set = set(proposal_ids)
     proposal_dependencies = {proposal.proposal_id: proposal.depends_on for proposal in plan.agent_proposals}
     _validate_dependencies("proposal", proposal_dependencies, proposal_id_set, errors)
+    optional_dependencies = {
+        proposal.proposal_id: proposal.optional_context_from
+        for proposal in plan.agent_proposals
+    }
+    _validate_dependency_references(
+        "proposal optional_context_from",
+        optional_dependencies,
+        proposal_id_set,
+        errors,
+    )
     for proposal in plan.agent_proposals:
         definition = resolved_catalog.get(proposal.capability)
         if definition is None:
@@ -126,6 +176,21 @@ def validate_intent_plan_contract(
         if unknown_intents:
             errors.append(
                 f"proposal {proposal.proposal_id} references unknown intent_ids {sorted(unknown_intents)}"
+            )
+        overlap = set(proposal.depends_on).intersection(proposal.optional_context_from)
+        if overlap:
+            errors.append(
+                f"proposal {proposal.proposal_id} cannot use the same dependency as hard and optional: {sorted(overlap)}"
+            )
+
+    proposals_by_capability = {
+        proposal.capability: proposal for proposal in plan.agent_proposals
+    }
+    for request in plan.research_requests:
+        consumer = proposals_by_capability.get(request.consumer_capability)
+        if consumer is None or request.intent_id not in consumer.intent_ids:
+            errors.append(
+                f"research request {request.request_id} has no matching consumer proposal"
             )
 
     proposed_capabilities = {proposal.capability for proposal in plan.agent_proposals}
@@ -168,6 +233,20 @@ def _validate_dependencies(
     cycle = _find_cycle(dependencies)
     if cycle:
         errors.append(f"{label} dependency cycle detected: {' -> '.join(cycle)}")
+
+
+def _validate_dependency_references(
+    label: str,
+    dependencies: dict[str, list[str]],
+    known_ids: set[str],
+    errors: list[str],
+) -> None:
+    for node_id, dependency_ids in dependencies.items():
+        unknown = set(dependency_ids) - known_ids
+        if unknown:
+            errors.append(f"{label} {node_id} has unknown references {sorted(unknown)}")
+        if node_id in dependency_ids:
+            errors.append(f"{label} {node_id} cannot reference itself")
 
 
 def _find_cycle(dependencies: dict[str, Iterable[str]]) -> list[str]:

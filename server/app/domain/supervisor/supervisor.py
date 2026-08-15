@@ -15,6 +15,10 @@ class SupervisorCompilationError(ValueError):
         super().__init__("Supervisor could not compile task graph: " + "; ".join(errors))
 
 
+class SupervisorPolicyRejectedError(SupervisorCompilationError):
+    """The deterministic PolicyGate rejected the Planner proposal."""
+
+
 class SupervisorPlanCompiler:
     """Compiles an IntentPlan proposal into a deterministic execution DAG."""
 
@@ -29,9 +33,24 @@ class SupervisorPlanCompiler:
         self.policy_gate = policy_gate or SupervisorPolicyGate(self.registry, self.catalog)
 
     def compile(self, plan: IntentPlan, *, turn_id: str | None = None) -> TaskGraph:
-        evaluation = self.policy_gate.evaluate(plan)
+        return self.compile_evaluated(
+            plan,
+            evaluation=self.evaluate(plan),
+            turn_id=turn_id,
+        )
+
+    def evaluate(self, plan: IntentPlan) -> PolicyEvaluation:
+        return self.policy_gate.evaluate(plan)
+
+    def compile_evaluated(
+        self,
+        plan: IntentPlan,
+        *,
+        evaluation: PolicyEvaluation,
+        turn_id: str | None = None,
+    ) -> TaskGraph:
         if not evaluation.approved:
-            raise SupervisorCompilationError(evaluation.errors)
+            raise SupervisorPolicyRejectedError(evaluation.errors)
 
         resolved_turn_id = turn_id or uuid.uuid4().hex
         graph = TaskGraph(
@@ -55,6 +74,22 @@ class SupervisorPlanCompiler:
             metadata={"plan_schema_version": plan.schema_version},
         )
         graph.entry_node_ids = [intent_node.node_id]
+        policy_node = TaskGraphNode(
+            node_id="system:policy_gate",
+            task_id=f"{resolved_turn_id}:policy_gate",
+            agent_id="supervisor_policy_gate",
+            capability="policy_gate",
+            depends_on=[intent_node.node_id],
+            status="succeeded",
+            metadata={
+                "phase": "initial_policy_approval",
+                "decision_count": len(evaluation.decisions),
+                "approved_proposal_ids": sorted(evaluation.selections),
+                "errors": list(evaluation.errors),
+                "implementation": "deterministic_code",
+            },
+        )
+        graph.add_node(policy_node)
 
         proposal_node_ids = {
             proposal.proposal_id: f"proposal:{proposal.proposal_id}"
@@ -71,8 +106,10 @@ class SupervisorPlanCompiler:
             for request in plan.context_requests
         )
         refine_node_id = ""
+        refine_policy_node_id = ""
         if needs_intent_refinement and profile_proposals:
             refine_node_id = "system:intent_refinement"
+            refine_policy_node_id = "system:policy_gate:refinement"
 
         for proposal in plan.agent_proposals:
             selected_agent_id = evaluation.selections.get(proposal.proposal_id)
@@ -83,11 +120,19 @@ class SupervisorPlanCompiler:
                 for dependency_id in proposal.depends_on
                 if dependency_id in proposal_node_ids
             ]
+            optional_input_ids = [
+                proposal_node_ids[dependency_id]
+                for dependency_id in proposal.optional_context_from
+                if dependency_id in proposal_node_ids
+                and dependency_id not in dependency_ids
+            ]
             if not dependency_ids:
-                if refine_node_id and proposal.capability != "profile_preference":
-                    dependency_ids = [refine_node_id]
+                if refine_policy_node_id and proposal.capability != "profile_preference":
+                    dependency_ids = [refine_policy_node_id]
                 else:
-                    dependency_ids = [intent_node.node_id]
+                    dependency_ids = [policy_node.node_id]
+            elif policy_node.node_id not in dependency_ids:
+                dependency_ids.append(policy_node.node_id)
             registration = self.registry.require(selected_agent_id)
             context_request = next(
                 (
@@ -106,8 +151,10 @@ class SupervisorPlanCompiler:
                     capability=proposal.capability,
                     intent_ids=list(proposal.intent_ids),
                     depends_on=dependency_ids,
-                    input_refs=list(proposal.optional_context_from),
-                    required=proposal.required,
+                    input_refs=optional_input_ids,
+                    # Ranking-only profile context may improve ordering but can
+                    # never block the user's core product task when unavailable.
+                    required=proposal.proposal_id in evaluation.core_proposal_ids,
                     max_attempts=registration.manifest.max_attempts,
                     metadata={
                         "proposal_id": proposal.proposal_id,
@@ -116,8 +163,18 @@ class SupervisorPlanCompiler:
                         "research_requests": [
                             request.model_dump()
                             for request in plan.research_requests
-                            if request.intent_id in proposal.intent_ids
+                            if request.request_id in evaluation.approved_research_request_ids
+                            and request.consumer_capability == proposal.capability
+                            and request.intent_id in proposal.intent_ids
                         ],
+                        "approved_research_request_ids": [
+                            request.request_id
+                            for request in plan.research_requests
+                            if request.request_id in evaluation.approved_research_request_ids
+                            and request.consumer_capability == proposal.capability
+                            and request.intent_id in proposal.intent_ids
+                        ],
+                        "effective_core": proposal.proposal_id in evaluation.core_proposal_ids,
                         **(
                             {
                                 "query": context_request.query,
@@ -137,15 +194,31 @@ class SupervisorPlanCompiler:
                 graph,
                 capability="intent_understanding",
                 node_id=refine_node_id,
-                depends_on=profile_node_ids,
+                depends_on=[policy_node.node_id],
+                input_refs=profile_node_ids,
                 attempt=2,
                 metadata={"reason": "Long-term profile was explicitly requested for intent refinement."},
+            )
+            self._fixed_node(
+                graph,
+                capability="policy_gate",
+                node_id=refine_policy_node_id,
+                depends_on=[refine_node_id],
+                metadata={
+                    "phase": "profile_refinement_policy_approval",
+                    "implementation": "deterministic_code",
+                },
             )
 
         proposal_nodes = [
             graph.require_node(proposal_node_ids[proposal_id])
             for proposal_id in proposal_node_ids
         ]
+        if refine_policy_node_id:
+            for node in proposal_nodes:
+                if node.capability == "profile_preference":
+                    continue
+                node.depends_on = _unique([*node.depends_on, refine_policy_node_id])
         profile_node_ids = [
             node.node_id for node in proposal_nodes if node.capability == "profile_preference"
         ]
@@ -157,9 +230,9 @@ class SupervisorPlanCompiler:
             for node in proposal_nodes:
                 if node.capability not in {"single_product_recommendation", "multi_product_bundle"}:
                     continue
-                if refine_node_id and refine_node_id in node.depends_on:
+                if refine_policy_node_id and refine_policy_node_id in node.depends_on:
                     continue
-                node.depends_on = _unique([*node.depends_on, *profile_node_ids])
+                node.input_refs = _unique([*node.input_refs, *profile_node_ids])
 
         # A bundle has an explicit dispatch node, one isolated retrieval node per
         # slot, and a merge node. This keeps parallel slot work visible in the
@@ -185,12 +258,23 @@ class SupervisorPlanCompiler:
                 )
                 slot_node_ids.append(slot_node_id)
             merge_node_id = f"{bundle_node.node_id}:merge"
-            merge_dependencies = slot_node_ids or [bundle_node.node_id]
+            required_slot_ids = [
+                node_id
+                for node_id, slot in zip(slot_node_ids, plan.need_slots)
+                if slot.need_type == "required"
+            ]
+            optional_slot_ids = [
+                node_id
+                for node_id, slot in zip(slot_node_ids, plan.need_slots)
+                if slot.need_type == "optional"
+            ]
+            merge_dependencies = required_slot_ids or [bundle_node.node_id]
             merge_node = self._fixed_node(
                 graph,
                 capability="multi_product_bundle",
                 node_id=merge_node_id,
                 depends_on=merge_dependencies,
+                input_refs=optional_slot_ids,
                 required=bundle_node.required,
                 metadata={
                     "phase": "merge_slot_evidence",
@@ -206,11 +290,17 @@ class SupervisorPlanCompiler:
                 if node.node_id in bundle_dispatch_ids or node.node_id in bundle_merge_ids or node.node_id in slot_node_ids:
                     continue
                 if bundle_node.node_id not in node.depends_on:
-                    continue
-                node.depends_on = [
-                    merge_node_id if dependency_id == bundle_node.node_id else dependency_id
-                    for dependency_id in node.depends_on
-                ]
+                    if bundle_node.node_id not in node.input_refs:
+                        continue
+                    node.input_refs = [
+                        merge_node_id if dependency_id == bundle_node.node_id else dependency_id
+                        for dependency_id in node.input_refs
+                    ]
+                else:
+                    node.depends_on = [
+                        merge_node_id if dependency_id == bundle_node.node_id else dependency_id
+                        for dependency_id in node.depends_on
+                    ]
 
         if plan.execution_mode == "clarify":
             clarification_nodes = [node for node in proposal_nodes if node.capability == "clarification"]
@@ -229,26 +319,31 @@ class SupervisorPlanCompiler:
             return graph
 
         evidence_node_ids = []
+        optional_evidence_node_ids = []
         for node in graph.nodes:
             if node.node_id in bundle_dispatch_ids:
                 continue
             if node.node_id in bundle_merge_ids:
-                evidence_node_ids.append(node.node_id)
+                (evidence_node_ids if node.required else optional_evidence_node_ids).append(node.node_id)
                 continue
             if node.capability == "slot_product_retrieval":
                 # The merge node is the single evidence boundary for a bundle.
                 continue
             definition = self.catalog.get(node.capability)
             if definition and definition.evidence_producing:
-                evidence_node_ids.append(node.node_id)
+                (evidence_node_ids if node.required else optional_evidence_node_ids).append(node.node_id)
         final_dependency_ids: list[str]
         if evidence_node_ids:
             verifier_node = self._fixed_node(
                 graph,
                 capability="evidence_verification",
                 node_id="system:evidence_verification",
-                depends_on=_unique(evidence_node_ids + profile_node_ids),
-                metadata={"evidence_node_ids": evidence_node_ids},
+                depends_on=_unique(evidence_node_ids),
+                input_refs=_unique(optional_evidence_node_ids + profile_node_ids),
+                metadata={
+                    "evidence_node_ids": evidence_node_ids,
+                    "optional_evidence_node_ids": optional_evidence_node_ids,
+                },
             )
             final_dependency_ids = [verifier_node.node_id]
             if plan.execution_mode == "multi_product":
@@ -260,14 +355,14 @@ class SupervisorPlanCompiler:
                 )
                 final_dependency_ids = [optimizer_node.node_id]
         else:
-            final_dependency_ids = [node.node_id for node in proposal_nodes] or [intent_node.node_id]
+            final_dependency_ids = [node.node_id for node in proposal_nodes] or [policy_node.node_id]
 
-        final_dependency_ids = _unique(final_dependency_ids + profile_node_ids)
         answer_node = self._fixed_node(
             graph,
             capability="answer_generation",
             node_id="system:answer_generation",
             depends_on=final_dependency_ids,
+            input_refs=profile_node_ids,
         )
         memory_node = self._fixed_node(
             graph,
@@ -328,7 +423,13 @@ class SupervisorPlanCompiler:
                 failed_node.model_copy(
                     update={
                         "node_id": retry_node_id,
+                        "task_id": f"{graph.turn_id}:{retry_node_id}",
                         "depends_on": retry_dependencies,
+                        "input_refs": [
+                            replacements.get(dependency_id, dependency_id)
+                            for dependency_id in failed_node.input_refs
+                            if replacements.get(dependency_id, dependency_id) != retry_node_id
+                        ],
                         "dependency_policy": "all_succeeded",
                         "status": "pending",
                         "attempt": failed_node.attempt + 1,
@@ -352,6 +453,9 @@ class SupervisorPlanCompiler:
                 if replacement not in updated_dependencies:
                     updated_dependencies.append(replacement)
             node.depends_on = updated_dependencies
+            node.input_refs = _unique(
+                [replacements.get(dependency_id, dependency_id) for dependency_id in node.input_refs]
+            )
 
         graph.add_node(
             TaskGraphNode(
@@ -391,6 +495,7 @@ class SupervisorPlanCompiler:
         capability: str,
         node_id: str,
         depends_on: list[str],
+        input_refs: list[str] | None = None,
         status: str = "pending",
         attempt: int = 1,
         asynchronous: bool = False,
@@ -404,6 +509,7 @@ class SupervisorPlanCompiler:
             agent_id=registration.manifest.agent_id,
             capability=capability,
             depends_on=depends_on,
+            input_refs=input_refs or [],
             status=status,  # type: ignore[arg-type]
             attempt=attempt,
             max_attempts=max(attempt, registration.manifest.max_attempts),

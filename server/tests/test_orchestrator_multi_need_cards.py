@@ -11,6 +11,7 @@ from app.domain.task_lifecycle import TurnTaskState
 from app.domain.input_processor import InputProcessor, NormalizedInput
 from app.domain.retrieval_plan_builder import RetrievalPlanBuilder
 from app.harness import BudgetManager, InMemoryEvidenceCache, TraceRecorder
+from app.harness.span_recorder import SpanRecorder
 from app.schemas import (
     ChatStreamRequest,
     ImageAttributes,
@@ -60,6 +61,15 @@ def slot_candidate(product: Product, score: float = 0.8) -> SlotCandidate:
     )
 
 
+def make_orchestrator() -> EcommerceOrchestrator:
+    orchestrator = EcommerceOrchestrator.__new__(EcommerceOrchestrator)
+    recorder = SpanRecorder()
+    recorder._persist_run = lambda: None  # type: ignore[method-assign]
+    recorder._persist_span = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    orchestrator.span_recorder = recorder
+    return orchestrator
+
+
 def test_multi_need_product_cards_include_final_combo_and_alternatives_deduped() -> None:
     primary = make_product("primary", "主推运动鞋")
     alternative = make_product("alternative", "备选运动鞋")
@@ -80,7 +90,7 @@ def test_multi_need_product_cards_include_final_combo_and_alternatives_deduped()
         },
     )
 
-    orchestrator = EcommerceOrchestrator.__new__(EcommerceOrchestrator)
+    orchestrator = make_orchestrator()
     cards = orchestrator._card_candidates_from_reflection(state, selection, reflection)
 
     assert [candidate.product_id for candidate in cards] == ["primary", "alternative"]
@@ -105,7 +115,7 @@ def test_multi_need_product_cards_are_globally_limited() -> None:
         },
     )
 
-    orchestrator = EcommerceOrchestrator.__new__(EcommerceOrchestrator)
+    orchestrator = make_orchestrator()
     cards = orchestrator._card_candidates_from_reflection(state, selection, reflection)
 
     assert len(cards) == MULTI_NEED_PRODUCT_CARD_LIMIT
@@ -326,7 +336,7 @@ class FakeProductRepository:
 
 
 def test_stream_stops_with_failure_text_when_intent_planner_retry_exhausted() -> None:
-    orchestrator = EcommerceOrchestrator.__new__(EcommerceOrchestrator)
+    orchestrator = make_orchestrator()
     orchestrator.input_processor = InputProcessor()
     orchestrator.intent_planner = FailingIntentPlanner()
     orchestrator.memory_manager = FakeMemoryManager()
@@ -357,7 +367,7 @@ def test_stream_stops_with_failure_text_when_intent_planner_retry_exhausted() ->
 
 
 def test_stream_emits_planner_agent_update_before_answer_token_and_sanitizes_trace() -> None:
-    orchestrator = EcommerceOrchestrator.__new__(EcommerceOrchestrator)
+    orchestrator = make_orchestrator()
     orchestrator.input_processor = InputProcessor()
     orchestrator.intent_planner = FakeStreamingIntentPlanner()
     orchestrator.memory_manager = FakeMemoryManager()
@@ -392,7 +402,7 @@ def test_stream_emits_planner_agent_update_before_answer_token_and_sanitizes_tra
 def test_stream_context_reference_emits_product_cards() -> None:
     p1 = make_product("p1", "欧莱雅防晒", "170")
     p2 = make_product("p2", "理肤泉防晒", "268")
-    orchestrator = EcommerceOrchestrator.__new__(EcommerceOrchestrator)
+    orchestrator = make_orchestrator()
     orchestrator.input_processor = InputProcessor()
     orchestrator.intent_planner = FakeReferenceIntentPlanner()
     orchestrator.memory_manager = FakeReferenceMemoryManager()
@@ -425,7 +435,7 @@ def test_vlm_unavailable_still_runs_image_retrieval(tmp_path) -> None:
     image_path.write_bytes(b"fake image")
     state = MultiNeedState(original_query="", intent_plan=IntentPlan(), plan=QueryPlan())
     retrieval_worker = FakeRetrievalWorker(state)
-    orchestrator = EcommerceOrchestrator.__new__(EcommerceOrchestrator)
+    orchestrator = make_orchestrator()
     orchestrator.input_processor = FakeInputProcessor(image_path)
     orchestrator.image_attribute_extractor = UnavailableImageAttributeExtractor()
     orchestrator.intent_planner = FakeImageIntentPlanner()
@@ -480,7 +490,7 @@ def test_pure_image_fast_path_skips_planner(tmp_path) -> None:
     image_path.write_bytes(b"fake image")
     state = MultiNeedState(original_query="", intent_plan=IntentPlan(), plan=QueryPlan())
     retrieval_worker = FakeRetrievalWorker(state)
-    orchestrator = EcommerceOrchestrator.__new__(EcommerceOrchestrator)
+    orchestrator = make_orchestrator()
     orchestrator.input_processor = FakeInputProcessor(image_path)
     orchestrator.image_attribute_extractor = UnavailableImageAttributeExtractor()
     orchestrator.intent_planner = PlannerShouldNotBeCalled()
@@ -554,7 +564,7 @@ def test_stream_multi_need_emits_product_cards_for_over_budget_combo() -> None:
             "selected_product_ids_by_slot": {"s1": ["shoe"], "s2": ["shorts"]},
         },
     )
-    orchestrator = EcommerceOrchestrator.__new__(EcommerceOrchestrator)
+    orchestrator = make_orchestrator()
     orchestrator.multi_need_coordinator = FakeCoordinator(state)
     orchestrator.retrieval_worker = FakeRetrievalWorker(state)
     orchestrator.corrective_agent = FakeCorrective(reflection)
@@ -587,7 +597,7 @@ def test_stream_multi_need_emits_product_cards_for_over_budget_combo() -> None:
 
 
 def test_multi_need_optional_slot_missing_does_not_downgrade_route() -> None:
-    orchestrator = EcommerceOrchestrator.__new__(EcommerceOrchestrator)
+    orchestrator = make_orchestrator()
     reflection = ReflectionResult(
         has_passed_products=True,
         passed_product_ids=["foundation"],
@@ -606,7 +616,7 @@ def test_multi_need_optional_slot_missing_does_not_downgrade_route() -> None:
 
 
 def test_multi_need_required_slot_missing_downgrades_route() -> None:
-    orchestrator = EcommerceOrchestrator.__new__(EcommerceOrchestrator)
+    orchestrator = make_orchestrator()
     reflection = ReflectionResult(
         has_passed_products=True,
         passed_product_ids=["foundation"],
@@ -621,7 +631,7 @@ def test_multi_need_required_slot_missing_downgrades_route() -> None:
 
 
 def test_multi_need_inferred_missing_required_slot_does_not_downgrade_route() -> None:
-    orchestrator = EcommerceOrchestrator.__new__(EcommerceOrchestrator)
+    orchestrator = make_orchestrator()
     state = MultiNeedState(
         original_query="露营拍照和徒步都要用，推荐一套轻量户外装备。",
         intent_plan=IntentPlan(original_query="露营拍照和徒步都要用，推荐一套轻量户外装备。", plan_type="multi_retrieval"),
@@ -648,7 +658,7 @@ def test_multi_need_inferred_missing_required_slot_does_not_downgrade_route() ->
 
 
 def test_multi_need_explicit_missing_required_slot_still_downgrades_route() -> None:
-    orchestrator = EcommerceOrchestrator.__new__(EcommerceOrchestrator)
+    orchestrator = make_orchestrator()
     state = MultiNeedState(
         original_query="买粉底和口红",
         intent_plan=IntentPlan(original_query="买粉底和口红", plan_type="multi_retrieval"),
@@ -675,7 +685,7 @@ def test_multi_need_explicit_missing_required_slot_still_downgrades_route() -> N
 
 
 def test_previous_evidence_reference_does_not_skip_retrieval_for_multi_plan() -> None:
-    orchestrator = EcommerceOrchestrator.__new__(EcommerceOrchestrator)
+    orchestrator = make_orchestrator()
     orchestrator.evidence_cache = InMemoryEvidenceCache()
     task = TurnTaskState(user_id="u1", session_id="s1")
     context = ConversationContext(

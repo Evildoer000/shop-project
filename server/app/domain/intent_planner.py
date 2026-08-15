@@ -18,6 +18,7 @@ from app.schemas import (
     IntentItem,
     IntentPlan,
     IntentQueryRewrite,
+    IntentRouteBasis,
     IntentUncertainty,
     ProfileLookupProposal,
     ResearchRequest,
@@ -47,6 +48,13 @@ class IntentPlanner:
     }
     EXECUTION_MODES = {"direct", "clarify", "context_evidence", "single_product", "multi_product"}
     INPUT_MODALITIES = {"text", "image", "audio"}
+    RESEARCH_CONSUMERS = {"knowledge_research", "comparison", "commerce_research"}
+    RESEARCH_TRIGGER_TYPES = {
+        "explicit_web_request",
+        "explicit_platform_request",
+        "freshness_required",
+        "knowledge_bridge",
+    }
 
     def __init__(
         self,
@@ -588,8 +596,13 @@ class IntentPlanner:
             "- query_rewrite 应属于具体 intent；multi_product 的检索词应继续下沉到对应 need_slots。\n"
             "- context_requests 只提出上下文读取需求。长期画像用途必须是 intent_refinement、ranking_only 或 answer_personalization。\n"
             "- clarification 说明是否阻塞、缺失字段和澄清目标；不要在这里直接生成最终回答。\n"
+            "- 每个 intent 的 route_basis 只记录可核验路由事实：商品目标是否明确、本地目录是否足够、为什么需要外部信息，以及当前 query 中的原文触发片段。\n"
             "- research_requests 只描述 web_general/marketplace/social_content 等抽象研究需求和平台，不得填写 MCP 名、URL、Cookie 或具体 Tool。\n"
-            "- agent_proposals 只能从 available_agent_capabilities 中选择，并说明 intent_ids、依赖和理由。\n"
+            "- 只有当前 query 明确要求联网/指定平台、明确需要最新信息，或确实需要 knowledge_bridge 才能确定商品族时，才能输出 research_requests；普通商品推荐和可由本地商品详情回答的问题不得联网。\n"
+            "- 每个 research_request 必须指定唯一 consumer_capability。淘宝、抖音电商、小红书请求统一交给 commerce_research；通用网页资料交给 knowledge_research 或 comparison，不能广播给多个 Agent。\n"
+            "- trigger_text 必须逐字来自当前 query。knowledge_bridge 还必须说明 local_catalog_gap，且当前 query 不能已经含有明确商品族。\n"
+            "- agent_proposals 只能从 available_agent_capabilities 中选择，并说明 intent_ids、硬依赖 depends_on、软上下文 optional_context_from 和理由。capability 是能力提案，不是具体 Agent 实例；最终 Agent 由 Supervisor 绑定。\n"
+            "- depends_on / optional_context_from 只能引用 proposal_id，不能引用 context request_id。ranking_only 画像只能放在 optional_context_from，不能成为商品任务的硬依赖；intent_refinement 的执行顺序由 Supervisor 固定节点控制。\n"
             "- EvidenceVerifier、BundleOptimizer、Repair、AnswerGenerator、MemoryDistillation 由 Supervisor 固定或按运行时失败插入，绝不能写入 agent_proposals。\n"
             "- 长期画像产生的约束只能是 soft，不能覆盖当前 query 中的 hard constraints。\n"
             "- 用户只有效果/症状/模糊用途而没有可确认商品族时，优先 execution_mode=context_evidence 并提案 knowledge_research；"
@@ -609,6 +622,14 @@ class IntentPlanner:
                     "depends_on": [],
                     "query_rewrite": {"semantic_query": "", "keyword_query": ""},
                     "referenced_product_ids": [],
+                    "route_basis": {
+                        "target_clarity": "not_applicable | explicit_product | context_product | vague_effect_or_use",
+                        "local_catalog_status": "sufficient | insufficient | unknown",
+                        "external_information_need": "none | explicit_web | explicit_platform | freshness_required | knowledge_bridge",
+                        "trigger_text": "verbatim current-query fragment or empty",
+                        "product_family": "concrete product family or empty",
+                        "reason": "short routing basis",
+                    },
                 }
             ],
             "execution_mode": "direct | clarify | context_evidence | single_product | multi_product",
@@ -650,9 +671,13 @@ class IntentPlanner:
                     "request_id": "r1",
                     "intent_id": "i1",
                     "mode": "web_general | marketplace | social_content",
+                    "consumer_capability": "knowledge_research | comparison | commerce_research",
+                    "trigger_type": "explicit_web_request | explicit_platform_request | freshness_required | knowledge_bridge",
+                    "trigger_text": "verbatim fragment from current query",
                     "platforms": [],
                     "query": "research goal",
                     "freshness": "any | recent | realtime",
+                    "local_catalog_gap": "required for knowledge_bridge, otherwise empty",
                     "reason": "why research is needed",
                     "required": False,
                 }
@@ -663,7 +688,7 @@ class IntentPlanner:
                     "capability": "one available_agent_capabilities value",
                     "intent_ids": ["i1"],
                     "reason": "why this capability is needed",
-                    "required": True,
+                    "required": False,
                     "depends_on": [],
                     "optional_context_from": [],
                     "expected_output_schema": "short schema name",
@@ -804,6 +829,29 @@ class IntentPlanner:
                 if intent_id in seen_ids:
                     continue
                 rewrite = item.get("query_rewrite") if isinstance(item.get("query_rewrite"), dict) else {}
+                route_basis = item.get("route_basis") if isinstance(item.get("route_basis"), dict) else {}
+                target_clarity = str(route_basis.get("target_clarity") or "not_applicable").strip()
+                if target_clarity not in {
+                    "not_applicable",
+                    "explicit_product",
+                    "context_product",
+                    "vague_effect_or_use",
+                }:
+                    target_clarity = "not_applicable"
+                local_catalog_status = str(route_basis.get("local_catalog_status") or "unknown").strip()
+                if local_catalog_status not in {"sufficient", "insufficient", "unknown"}:
+                    local_catalog_status = "unknown"
+                external_information_need = str(
+                    route_basis.get("external_information_need") or "none"
+                ).strip()
+                if external_information_need not in {
+                    "none",
+                    "explicit_web",
+                    "explicit_platform",
+                    "freshness_required",
+                    "knowledge_bridge",
+                }:
+                    external_information_need = "none"
                 result.append(
                     IntentItem(
                         intent_id=intent_id,
@@ -815,6 +863,14 @@ class IntentPlanner:
                             keyword_query=str(rewrite.get("keyword_query") or "").strip(),
                         ),
                         referenced_product_ids=self._string_list(item.get("referenced_product_ids")),
+                        route_basis=IntentRouteBasis(
+                            target_clarity=target_clarity,  # type: ignore[arg-type]
+                            local_catalog_status=local_catalog_status,  # type: ignore[arg-type]
+                            external_information_need=external_information_need,  # type: ignore[arg-type]
+                            trigger_text=str(route_basis.get("trigger_text") or "").strip(),
+                            product_family=str(route_basis.get("product_family") or "").strip(),
+                            reason=str(route_basis.get("reason") or "").strip(),
+                        ),
                     )
                 )
                 seen_ids.add(intent_id)
@@ -830,6 +886,17 @@ class IntentPlanner:
                     keyword_query=keyword_query,
                 ),
                 referenced_product_ids=referenced_product_ids,
+                route_basis=IntentRouteBasis(
+                    target_clarity=(
+                        "context_product"
+                        if referenced_product_ids
+                        else "explicit_product"
+                        if primary_intent == "product_recommendation"
+                        else "not_applicable"
+                    ),
+                    local_catalog_status="unknown",
+                    external_information_need="none",
+                ),
             )
         ]
 
@@ -951,15 +1018,28 @@ class IntentPlanner:
             request_id = str(item.get("request_id") or f"r{index}").strip() or f"r{index}"
             if request_id in seen_ids:
                 continue
+            consumer_capability = str(item.get("consumer_capability") or "").strip()
+            trigger_type = str(item.get("trigger_type") or "").strip()
+            trigger_text = str(item.get("trigger_text") or "").strip()
+            if (
+                consumer_capability not in self.RESEARCH_CONSUMERS
+                or trigger_type not in self.RESEARCH_TRIGGER_TYPES
+                or not trigger_text
+            ):
+                continue
             freshness = item.get("freshness") if item.get("freshness") in {"any", "recent", "realtime"} else "recent"
             result.append(
                 ResearchRequest(
                     request_id=request_id,
                     intent_id=intent_id,
                     mode=mode,  # type: ignore[arg-type]
+                    consumer_capability=consumer_capability,  # type: ignore[arg-type]
+                    trigger_type=trigger_type,  # type: ignore[arg-type]
+                    trigger_text=trigger_text,
                     platforms=self._string_list(item.get("platforms")),
                     query=str(item.get("query") or "").strip(),
                     freshness=freshness,
+                    local_catalog_gap=str(item.get("local_catalog_gap") or "").strip(),
                     reason=str(item.get("reason") or "需要补充外部证据。").strip(),
                     required=self._bool_or_false(item.get("required")),
                 )
@@ -970,35 +1050,6 @@ class IntentPlanner:
         # the planner omitted a research request. Product QA about an already
         # referenced catalog item can be grounded locally; open-ended shopping
         # knowledge still receives the controlled web-search template.
-        referenced = set(referenced_product_ids)
-        for intent in intents:
-            if intent.intent_type not in {"shopping_knowledge", "product_qa"}:
-                continue
-            has_local_reference = bool(referenced or intent.referenced_product_ids)
-            if intent.intent_type == "product_qa" and has_local_reference:
-                continue
-            if any(
-                request.intent_id == intent.intent_id and request.mode == "web_general"
-                for request in result
-            ):
-                continue
-            request_id = f"r_web_{intent.intent_id}"
-            suffix = 2
-            while request_id in seen_ids:
-                request_id = f"r_web_{intent.intent_id}_{suffix}"
-                suffix += 1
-            result.append(
-                ResearchRequest(
-                    request_id=request_id,
-                    intent_id=intent.intent_id,
-                    mode="web_general",
-                    query=intent.goal or query,
-                    freshness="recent",
-                    reason="该知识目标需要可追溯的外部资料，不能把模型常识伪装成联网证据。",
-                    required=False,
-                )
-            )
-            seen_ids.add(request_id)
         return result
 
     def _sanitize_agent_proposals(
@@ -1033,7 +1084,7 @@ class IntentPlanner:
                 if existing is not None:
                     proposal_aliases[proposal_id] = existing.proposal_id
                     existing.intent_ids = list(dict.fromkeys([*existing.intent_ids, *intent_ids_for_proposal]))
-                    existing.required = existing.required or self._bool_or_true(item.get("required"))
+                    existing.required = existing.required or self._bool_or_false(item.get("required"))
                     existing.depends_on = list(
                         dict.fromkeys([*existing.depends_on, *self._string_list(item.get("depends_on"))])
                     )
@@ -1056,7 +1107,7 @@ class IntentPlanner:
                     capability=capability,  # type: ignore[arg-type]
                     intent_ids=intent_ids_for_proposal,
                     reason=str(item.get("reason") or "该能力支持当前意图。").strip(),
-                    required=self._bool_or_true(item.get("required")),
+                    required=self._bool_or_false(item.get("required")),
                     depends_on=self._string_list(item.get("depends_on")),
                     optional_context_from=self._string_list(item.get("optional_context_from")),
                     expected_output_schema=str(item.get("expected_output_schema") or "").strip(),
@@ -1095,6 +1146,7 @@ class IntentPlanner:
             selected_intent_ids: list[str],
             reason: str,
             depends_on: list[str] | None = None,
+            optional_context_from: list[str] | None = None,
         ) -> str:
             existing = next((item for item in result if item.capability == capability), None)
             if existing:
@@ -1103,6 +1155,16 @@ class IntentPlanner:
                     dict.fromkeys(
                         dependency
                         for dependency in [*existing.depends_on, *(depends_on or [])]
+                        if dependency and dependency != existing.proposal_id
+                    )
+                )
+                existing.optional_context_from = list(
+                    dict.fromkeys(
+                        dependency
+                        for dependency in [
+                            *existing.optional_context_from,
+                            *(optional_context_from or []),
+                        ]
                         if dependency and dependency != existing.proposal_id
                     )
                 )
@@ -1119,6 +1181,7 @@ class IntentPlanner:
                     intent_ids=selected_intent_ids,
                     reason=reason,
                     depends_on=depends_on or [],
+                    optional_context_from=optional_context_from or [],
                 )
             )
             seen_ids.add(unique_id)
@@ -1155,6 +1218,7 @@ class IntentPlanner:
             dict.fromkeys(
                 request.intent_id
                 for request in research_requests
+                if request.consumer_capability == "commerce_research"
                 if request.mode in {"marketplace", "social_content"}
                 and any(platform in {"taobao", "douyin_ec", "xiaohongshu"} for platform in request.platforms)
             )
@@ -1166,31 +1230,74 @@ class IntentPlanner:
                 "commerce_research",
                 commerce_intent_ids,
                 "用户请求需要三平台外部商品或口碑证据。",
-                [core_proposal_id] if core_proposal_id else [],
             )
 
-        comparison_intents = [intent.intent_id for intent in intents if intent.intent_type == "product_comparison"]
+        comparison_intents = list(
+            dict.fromkeys(
+                [intent.intent_id for intent in intents if intent.intent_type == "product_comparison"]
+                + [
+                    request.intent_id
+                    for request in research_requests
+                    if request.consumer_capability == "comparison"
+                ]
+            )
+        )
         if comparison_intents:
+            comparison_depends_on_core = any(
+                intent.intent_id in comparison_intents
+                and any(
+                    dependency_id in {
+                        candidate.intent_id
+                        for candidate in intents
+                        if candidate.intent_type == "product_recommendation"
+                    }
+                    for dependency_id in intent.depends_on
+                )
+                for intent in intents
+            )
             add_missing(
                 "p_comparison",
                 "comparison",
                 comparison_intents,
                 "用户明确要求商品对比。",
-                list(dict.fromkeys(item for item in [core_proposal_id, commerce_proposal_id] if item)),
+                [core_proposal_id] if core_proposal_id and comparison_depends_on_core else [],
+                [commerce_proposal_id] if commerce_proposal_id else [],
             )
-        knowledge_intents = [
-            intent.intent_id
-            for intent in intents
-            if intent.intent_type in {"product_qa", "shopping_knowledge"}
-        ]
+        knowledge_intents = list(
+            dict.fromkeys(
+                [
+                    intent.intent_id
+                    for intent in intents
+                    if intent.intent_type in {"product_qa", "shopping_knowledge"}
+                    or intent.route_basis.external_information_need == "knowledge_bridge"
+                ]
+                + [
+                    request.intent_id
+                    for request in research_requests
+                    if request.consumer_capability == "knowledge_research"
+                ]
+            )
+        )
         if knowledge_intents:
+            recommendation_intent_ids = {
+                intent.intent_id
+                for intent in intents
+                if intent.intent_type == "product_recommendation"
+            }
+            knowledge_depends_on_core = any(
+                intent.intent_id in knowledge_intents
+                and bool(set(intent.depends_on).intersection(recommendation_intent_ids))
+                for intent in intents
+            )
             add_missing(
                 "p_knowledge",
                 "knowledge_research",
                 knowledge_intents,
                 "用户需要商品事实或选购知识解释。",
-                [core_proposal_id] if core_proposal_id else [],
+                [core_proposal_id] if core_proposal_id and knowledge_depends_on_core else [],
             )
+
+        self._normalize_context_proposal_references(result, context_requests)
 
         # Clarification is a terminal business branch. Do not let a noisy LLM
         # proposal trigger retrieval or network work before the user answers.
@@ -1202,6 +1309,61 @@ class IntentPlanner:
         elif execution_mode == "direct":
             result = []
         return result
+
+    def _normalize_context_proposal_references(
+        self,
+        proposals: list[AgentTaskProposal],
+        context_requests: list[ContextRequest],
+    ) -> None:
+        """Translate Planner context IDs into proposal lineage.
+
+        Context requests describe what should be read; task dependencies refer
+        only to executable proposals. Profile data is contextual input, not a
+        hard prerequisite for the user's core product task. Intent refinement
+        ordering is compiled separately by the Supervisor.
+        """
+        profile = next(
+            (proposal for proposal in proposals if proposal.capability == "profile_preference"),
+            None,
+        )
+        if profile is None:
+            return
+        context_to_proposal = {
+            request.request_id: profile.proposal_id
+            for request in context_requests
+            if request.context_type == "long_term_profile"
+        }
+        if not context_to_proposal:
+            return
+
+        for proposal in proposals:
+            hard_dependencies: list[str] = []
+            optional_dependencies = list(proposal.optional_context_from)
+            for dependency in proposal.depends_on:
+                resolved = context_to_proposal.get(dependency, dependency)
+                if resolved == profile.proposal_id:
+                    optional_dependencies.append(resolved)
+                else:
+                    hard_dependencies.append(resolved)
+            optional_dependencies = [
+                context_to_proposal.get(dependency, dependency)
+                for dependency in optional_dependencies
+            ]
+            proposal.depends_on = list(
+                dict.fromkeys(
+                    dependency
+                    for dependency in hard_dependencies
+                    if dependency != proposal.proposal_id
+                )
+            )
+            proposal.optional_context_from = list(
+                dict.fromkeys(
+                    dependency
+                    for dependency in optional_dependencies
+                    if dependency != proposal.proposal_id
+                    and dependency not in proposal.depends_on
+                )
+            )
 
     def _sanitize_uncertainties(self, value: Any) -> list[IntentUncertainty]:
         if not isinstance(value, list):

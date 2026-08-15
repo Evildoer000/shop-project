@@ -89,12 +89,44 @@ def test_single_retrieval_worker_maps_product_search_tool_result_without_correct
     )
 
     assert search_tool.calls
+    assert search_tool.calls[0]["vector_query"] == "sunscreen"
+    assert search_tool.calls[0]["keyword_query"] == "sunscreen"
     assert evidence.failure_trigger == ""
     assert evidence.after_structured_filter == 2
     assert evidence.after_score_filter == 2
     assert evidence.after_rerank == 2
     assert evidence.tool_call_count == 3
     assert [product.product_id for product, _ in evidence.ranked] == ["p1", "p2"]
+
+
+def test_single_retrieval_worker_preserves_distinct_planner_queries() -> None:
+    product = make_product("p1", "Lightweight sunscreen milk")
+    result = SlotSearchResult(
+        slot_id="single_retrieval",
+        query="find sunscreen",
+        vector_query="lightweight sunscreen for oily skin commute",
+        keyword_query="sunscreen SPF50 oil control",
+        candidates=[make_candidate(product, 0.9)],
+        counts={"before_structured_filter": 1, "after_structured_filter": 1, "after_score_filter": 1},
+        structured_products=[product],
+        score_filtered_products=[product],
+    )
+    search_tool = FakeSearchTool(result)
+    worker = SingleRetrievalWorker(search_tool)  # type: ignore[arg-type]
+
+    worker.run(
+        "find sunscreen",
+        IntentPlan(
+            original_query="find sunscreen",
+            vector_query="lightweight sunscreen for oily skin commute",
+            keyword_query="sunscreen SPF50 oil control",
+        ),
+        QueryPlan(),
+    )
+
+    assert search_tool.calls[0]["query"] == "find sunscreen"
+    assert search_tool.calls[0]["vector_query"] == "lightweight sunscreen for oily skin commute"
+    assert search_tool.calls[0]["keyword_query"] == "sunscreen SPF50 oil control"
 
 
 def test_single_retrieval_worker_stops_when_structured_pool_is_empty() -> None:

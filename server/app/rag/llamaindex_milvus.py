@@ -142,12 +142,12 @@ class LlamaIndexMilvusRetriever:
             embed_dim: int = dim
 
             def _get_query_embedding(self, query: str) -> list[float]:
-                return EmbeddingClient().embed(query)
+                return EmbeddingClient().embed_remote_required(query)
 
             async def _aget_query_embedding(self, query: str) -> list[float]:
                 return self._get_query_embedding(query)
 
             def _get_text_embedding(self, text: str) -> list[float]:
-                return EmbeddingClient().embed(text)
+                return EmbeddingClient().embed_remote_required(text)
 
         return RemoteEmbedding()

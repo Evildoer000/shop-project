@@ -319,7 +319,7 @@ def test_intent_planner_retries_then_raises_invalid_json() -> None:
 
 def test_intent_planner_expands_compound_request_into_supervisor_contract() -> None:
     payload = base_payload(
-        normalized_query="推荐油皮通勤防晒并与上一款比较，解释清爽依据",
+        normalized_query="推荐油皮通勤防晒并与上一款比较，解释清爽依据并看看小红书评价",
         primary_intent="product_recommendation",
         intents=[
             {
@@ -330,6 +330,14 @@ def test_intent_planner_expands_compound_request_into_supervisor_contract() -> N
                     "semantic_query": "适合油皮通勤且清爽的防晒霜",
                     "keyword_query": "防晒霜 油皮 清爽 通勤 150元以内",
                 },
+                "route_basis": {
+                    "target_clarity": "explicit_product",
+                    "local_catalog_status": "sufficient",
+                    "external_information_need": "none",
+                    "trigger_text": "",
+                    "product_family": "防晒霜",
+                    "reason": "当前请求已明确商品目标。",
+                },
             },
             {
                 "intent_id": "i2",
@@ -337,6 +345,14 @@ def test_intent_planner_expands_compound_request_into_supervisor_contract() -> N
                 "goal": "与上一款防晒比较",
                 "depends_on": ["i1"],
                 "referenced_product_ids": ["p1"],
+                "route_basis": {
+                    "target_clarity": "context_product",
+                    "local_catalog_status": "sufficient",
+                    "external_information_need": "explicit_platform",
+                    "trigger_text": "小红书",
+                    "product_family": "防晒霜",
+                    "reason": "用户明确要求查看小红书评价。",
+                },
             },
             {
                 "intent_id": "i3",
@@ -362,6 +378,9 @@ def test_intent_planner_expands_compound_request_into_supervisor_contract() -> N
                 "request_id": "r1",
                 "intent_id": "i2",
                 "mode": "social_content",
+                "consumer_capability": "commerce_research",
+                "trigger_type": "explicit_platform_request",
+                "trigger_text": "小红书",
                 "platforms": ["xiaohongshu"],
                 "query": "两款防晒评价",
                 "reason": "用户要求查看小红书评价",
@@ -385,6 +404,7 @@ def test_intent_planner_expands_compound_request_into_supervisor_contract() -> N
                 "capability": "comparison",
                 "intent_ids": ["i2"],
                 "depends_on": ["p_single"],
+                "optional_context_from": ["p_commerce"],
                 "reason": "用户要求对比",
             },
             {
@@ -393,6 +413,12 @@ def test_intent_planner_expands_compound_request_into_supervisor_contract() -> N
                 "intent_ids": ["i3"],
                 "depends_on": ["p_single"],
                 "reason": "用户要求解释原理",
+            },
+            {
+                "proposal_id": "p_commerce",
+                "capability": "commerce_research",
+                "intent_ids": ["i2"],
+                "reason": "用户明确要求查看小红书评价",
             },
         ],
         referenced_product_ids=["p1"],
@@ -420,7 +446,11 @@ def test_intent_planner_expands_compound_request_into_supervisor_contract() -> N
         "single_product_recommendation",
         "comparison",
         "knowledge_research",
+        "commerce_research",
     ]
+    assert plan.agent_proposals[2].optional_context_from == ["p_commerce"]
+    assert plan.research_requests[0].consumer_capability == "commerce_research"
+    assert plan.research_requests[0].trigger_type == "explicit_platform_request"
 
 
 def test_intent_planner_prompt_exposes_only_planner_proposable_capabilities() -> None:
@@ -437,6 +467,62 @@ def test_intent_planner_prompt_exposes_only_planner_proposable_capabilities() ->
     assert "repair" not in capabilities
     assert "answer_generation" not in capabilities
     assert "memory_distillation" not in capabilities
+
+
+def test_intent_planner_maps_profile_context_id_to_optional_proposal_reference() -> None:
+    payload = base_payload(
+        execution_mode="single_product",
+        primary_intent="product_recommendation",
+        intents=[
+            {
+                "intent_id": "i1",
+                "intent_type": "product_recommendation",
+                "goal": "按长期偏好推荐防晒",
+            }
+        ],
+        context_requests=[
+            {
+                "request_id": "ctx1",
+                "context_type": "long_term_profile",
+                "usage": "ranking_only",
+                "query": "防晒肤感偏好",
+                "reason": "用户明确要求按长期偏好推荐",
+            }
+        ],
+        agent_proposals=[
+            {
+                "proposal_id": "p1",
+                "capability": "profile_preference",
+                "intent_ids": ["i1"],
+                "reason": "读取长期画像作为软偏好",
+            },
+            {
+                "proposal_id": "p2",
+                "capability": "single_product_recommendation",
+                "intent_ids": ["i1"],
+                "reason": "检索单商品",
+                "depends_on": ["p1"],
+                "optional_context_from": ["ctx1"],
+            },
+        ],
+        profile_lookup={
+            "requested": True,
+            "query": "防晒肤感偏好",
+            "usage": "ranking_only",
+            "reason": "用户明确要求按长期偏好推荐",
+        },
+    )
+
+    plan = asyncio.run(IntentPlanner(StaticLlmClient(payload)).plan("按我的偏好推荐防晒", {}))
+    recommendation = next(
+        proposal
+        for proposal in plan.agent_proposals
+        if proposal.capability == "single_product_recommendation"
+    )
+
+    validate_intent_plan_contract(plan)
+    assert recommendation.depends_on == []
+    assert recommendation.optional_context_from == ["p1"]
 
 
 async def _collect_stream(generator):

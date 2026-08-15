@@ -26,10 +26,12 @@ from app.domain.profile_lookup_tool import ProfileLookupTool
 from app.domain.reranker import build_reranker
 from app.domain.repair_worker import RepairAgent, RepairPlan
 from app.domain.retrieval_worker import RetrievalWorker
+from app.domain.retrieval_execution import RetrievalExecutionBoundary
 from app.domain.retrieval_plan_builder import RetrievalPlanBuilder
 from app.domain.single_retrieval_worker import SingleRetrievalEvidence, SingleRetrievalWorker
 from app.domain.task_lifecycle import OrchestratorDecision, TurnTaskState
 from app.domain.supervisor import (
+    SupervisorPolicyRejectedError,
     build_default_capability_catalog,
     build_default_prompt_registry,
     build_foundation_agent_registry,
@@ -102,15 +104,23 @@ class EcommerceOrchestrator:
         self.answer_generator = AnswerGenerator()
         self.product_search_tool = ProductSearchTool(self.product_repository, self.retriever, self.reranker)
         self.image_search_tool = ImageSearchTool(self.product_repository)
+        self.retrieval_execution_boundary = RetrievalExecutionBoundary(
+            self.product_search_tool,
+            self.image_search_tool,
+        )
         self.single_retrieval_worker = SingleRetrievalWorker(self.product_search_tool)
         self.image_retrieval_worker = ImageRetrievalWorker(self.image_search_tool)
         self.repair_agent = RepairAgent()
-        self.multi_need_coordinator = MultiNeedRetrievalCoordinator(self.product_search_tool)
+        self.multi_need_coordinator = MultiNeedRetrievalCoordinator(
+            self.product_search_tool,
+            execution_boundary=self.retrieval_execution_boundary,
+        )
         self.retrieval_worker = RetrievalWorker(
             product_search_tool=self.product_search_tool,
             single_retrieval_worker=self.single_retrieval_worker,
             multi_need_coordinator=self.multi_need_coordinator,
             image_retrieval_worker=self.image_retrieval_worker,
+            execution_boundary=self.retrieval_execution_boundary,
         )
         self.harness = HarnessRuntime.from_settings()
         self.budget_manager = self.harness.budget_manager
@@ -1062,6 +1072,43 @@ class EcommerceOrchestrator:
                 error=exc,
             ):
                 yield event
+        except SupervisorPolicyRejectedError as exc:
+            logger.warning("Supervisor PolicyGate rejected request: %s", exc)
+            evaluation = {
+                "policy_gate": {
+                    "approved": False,
+                    "errors": list(exc.errors),
+                }
+            }
+            if self.span_recorder.status == "running":
+                self.span_recorder.finish_run(
+                    route="policy_rejected",
+                    plan_type=intent_plan.plan_type if intent_plan else "",
+                    product_ids=[],
+                    evaluation_summary=evaluation,
+                    status="failed",
+                    termination_reason="policy_rejected",
+                )
+            await trace_run.end(
+                error=str(exc),
+                metadata={
+                    **self._trace_metadata(),
+                    "run_id": self.span_recorder.run_id,
+                    "termination_reason": "policy_rejected",
+                },
+            )
+            yield self._agent_update(
+                stage="supervisor",
+                title="执行计划未获批准",
+                content_delta="本次没有形成可安全执行的计划，请补充需求后重试。",
+                done=True,
+            )
+            yield {
+                "type": "token",
+                "content": "本次没有形成可安全执行的计划，请补充需求后重试。",
+            }
+            yield self._timing_event()
+            yield {"type": "done", "run_id": self.span_recorder.run_id}
         except asyncio.CancelledError:
             if self.span_recorder.status == "running":
                 self.span_recorder.finish_run(
@@ -1123,12 +1170,7 @@ class EcommerceOrchestrator:
         plan: QueryPlan,
         intent_plan: IntentPlan,
     ) -> Any:
-        return await asyncio.to_thread(
-            self.multi_need_coordinator._run_slot_agent_in_isolated_context,
-            slot.model_copy(deep=True),
-            plan.model_copy(deep=True),
-            intent_plan.model_copy(deep=True),
-        )
+        return await self.multi_need_coordinator.run_slot_isolated(slot, plan, intent_plan)
 
     def _schedule_graph_memory(self, context: Any, answer_text: str) -> None:
         request = context.metadata.get("request")
@@ -3555,6 +3597,14 @@ class EcommerceOrchestrator:
         decision_trace: dict[str, Any],
         evidence_bundle: EvidenceBundle | None = None,
     ) -> None:
+        trace_with_run = {
+            **decision_trace,
+            "run_id": str(decision_trace.get("run_id") or self.span_recorder.run_id),
+            "trace_schema_version": str(
+                decision_trace.get("trace_schema_version")
+                or self.span_recorder.trace_schema_version
+            ),
+        }
         task = asyncio.create_task(
             self._write_memory_update(
                 request=request,
@@ -3563,7 +3613,7 @@ class EcommerceOrchestrator:
                 route=route,
                 product_ids=product_ids,
                 intent_plan=intent_plan,
-                decision_trace=decision_trace,
+                decision_trace=trace_with_run,
                 evidence_bundle=evidence_bundle,
             )
         )
@@ -3618,7 +3668,11 @@ class EcommerceOrchestrator:
 
     def _compact_trace_for_memory(self, decision_trace: dict[str, Any]) -> dict[str, Any]:
         summary = decision_trace.get("retrieval_summary") or {}
+        task = decision_trace.get("task") if isinstance(decision_trace.get("task"), dict) else {}
         return {
+            "run_id": decision_trace.get("run_id"),
+            "trace_schema_version": decision_trace.get("trace_schema_version") or "v2",
+            "graph_id": task.get("graph_id"),
             "route": decision_trace.get("route"),
             "passed_product_ids": summary.get("passed_product_ids") or [],
             "slot_coverage": summary.get("slot_coverage") or [],

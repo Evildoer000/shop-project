@@ -103,6 +103,13 @@ def build_foundation_agent_registry(
             supervisor_managed=True,
         ),
         AgentManifest(
+            agent_id="supervisor_policy_gate",
+            capability="policy_gate",
+            description="确定性代码策略门：校验计划契约、Agent 路由和 Tool 授权，不调用 LLM。",
+            execution_modes=("direct", "clarify", "context_evidence", "single_product", "multi_product"),
+            supervisor_managed=True,
+        ),
+        AgentManifest(
             agent_id="profile_preference_agent",
             capability="profile_preference",
             description="按 Supervisor 批准读取长期画像和行为偏好。",

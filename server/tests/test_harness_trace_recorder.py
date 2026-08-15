@@ -38,3 +38,39 @@ def test_trace_recorder_finish_trace_writes_task_and_agent_path() -> None:
         "CorrectiveAgent",
         "AnswerGenerator",
     ]
+
+
+def test_decision_trace_v2_preserves_execution_lineage_fields() -> None:
+    trace = DecisionTrace(
+        run_id="run_123",
+        agent_path=[{"node_id": "proposal:p1", "agent_id": "single_product_recommendation_agent"}],
+        tool_calls=[
+            {
+                "call_id": "turn:p1:tool:1",
+                "tool": "product_search",
+                "operation": "single_initial",
+                "status": "succeeded",
+            }
+        ],
+        handoffs=[
+            {
+                "handoff_id": "handoff:planner->p1:hard",
+                "from_agent_id": "intent_understanding_agent",
+                "to_agent_id": "single_product_recommendation_agent",
+                "required": True,
+                "status": "consumed",
+            }
+        ],
+        failed_node_ids=["proposal:failed"],
+        blocked_node_ids=["system:answer_generation"],
+    )
+
+    payload = trace.model_dump()
+
+    assert payload["trace_schema_version"] == "v2"
+    assert payload["run_id"] == "run_123"
+    assert payload["agent_path"][0]["node_id"] == "proposal:p1"
+    assert payload["tool_calls"][0]["tool"] == "product_search"
+    assert payload["handoffs"][0]["status"] == "consumed"
+    assert payload["failed_node_ids"] == ["proposal:failed"]
+    assert payload["blocked_node_ids"] == ["system:answer_generation"]

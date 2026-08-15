@@ -23,6 +23,7 @@ class SingleRetrievalEvidence:
     rerank_query: str = ""
     failure_trigger: str = ""
     tool_call_count: int = 0
+    branch_status: dict[str, dict] = field(default_factory=dict)
 
     @property
     def after_structured_filter(self) -> int:
@@ -66,6 +67,7 @@ class SingleRetrievalEvidence:
             "rewritten_query": intent_plan.vector_query,
             "vector_query": self.vector_query,
             "keyword_query": self.keyword_query,
+            "retrieval_branches": self.branch_status,
             "plan_type": intent_plan.plan_type,
             "retrieval_strategy": plan.retrieval_strategy.model_dump(),
             "failure_trigger": self.failure_trigger,
@@ -83,7 +85,9 @@ class SingleRetrievalWorker:
         plan: QueryPlan,
     ) -> SingleRetrievalEvidence:
         self._widen_review_pool(plan)
-        query = intent_plan.vector_query or intent_plan.keyword_query or intent_plan.original_query or original_query
+        query = intent_plan.original_query or original_query
+        vector_query = intent_plan.vector_query or intent_plan.keyword_query or query
+        keyword_query = intent_plan.keyword_query or intent_plan.vector_query or query
         slot = NeedSlot(
             slot_id="single_retrieval",
             goal=query,
@@ -101,6 +105,8 @@ class SingleRetrievalWorker:
             query=query,
             attempt_index=1,
             reason="single_retrieval",
+            vector_query=vector_query,
+            keyword_query=keyword_query,
             use_base_plan=True,
         )
         evidence = SingleRetrievalEvidence(
@@ -115,6 +121,7 @@ class SingleRetrievalWorker:
             ranked=[(candidate.product, candidate.rerank_score) for candidate in search_result.candidates],
             rerank_query=self._rerank_query(original_query, intent_plan),
             tool_call_count=self._tool_call_count(search_result.counts),
+            branch_status=search_result.branch_status,
         )
         if evidence.after_structured_filter == 0:
             evidence.failure_trigger = "no_candidates"

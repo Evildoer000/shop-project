@@ -172,8 +172,8 @@ class AgentRunSpan(Base):
     sequence: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
     trace_schema_version: Mapped[str] = mapped_column(
         String(32),
-        default="v1",
-        server_default=text("'v1'"),
+        default="v2",
+        server_default=text("'v2'"),
         nullable=False,
     )
     name: Mapped[str] = mapped_column(String(96), nullable=False)

@@ -28,6 +28,7 @@ import {
 import { useAppIdentity } from "../lib/app-state";
 import { createId } from "../lib/storage";
 import type {
+  AgentHandoff,
   AgentUpdate,
   ChatMessage,
   ChatSessionSummary,
@@ -227,6 +228,7 @@ export function ChatPage() {
       isStreaming: true,
       traceLogs: [],
       agentUpdates: [],
+      handoffs: [],
       timingSpans: [],
       timingSummary: null,
       ruleEvaluation: null,
@@ -300,6 +302,14 @@ export function ChatPage() {
             contentDelta: String(event.content_delta ?? ""),
             done: Boolean(event.done),
           }),
+        }));
+        break;
+      case "handoff_update":
+        const handoff = event.handoff;
+        if (!isAgentHandoff(handoff)) break;
+        updateAssistant(assistantId, (message) => ({
+          ...message,
+          handoffs: mergeHandoff(message.handoffs ?? [], handoff),
         }));
         break;
       case "timing_update":
@@ -520,7 +530,7 @@ export function ChatPage() {
           evaluation={latestAssistant?.ruleEvaluation}
         />
 
-        <TracePanel trace={latestAssistant?.decisionTrace} />
+        <TracePanel trace={latestAssistant?.decisionTrace} handoffs={latestAssistant?.handoffs} />
 
         <section className="panel">
           <div className="panel-title">
@@ -567,6 +577,7 @@ function messagesFromTurns(turns: ChatSessionTurn[]): ChatMessage[] {
       ruleEvaluation: null,
       traceLogs: [],
       agentUpdates: [],
+      handoffs: [],
     },
   ]);
 }
@@ -594,6 +605,22 @@ function mergeAgentUpdate(current: AgentUpdate[], next: AgentUpdate): AgentUpdat
         }
       : item
   ));
+}
+
+function mergeHandoff(current: AgentHandoff[], next: AgentHandoff): AgentHandoff[] {
+  const index = current.findIndex((item) => item.handoff_id === next.handoff_id);
+  if (index < 0) return [...current, next].sort((left, right) => (left.sequence ?? 0) - (right.sequence ?? 0));
+  return current.map((item, itemIndex) => (itemIndex === index ? next : item));
+}
+
+function isAgentHandoff(value: unknown): value is AgentHandoff {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && "handoff_id" in value
+    && "from_agent_id" in value
+    && "to_agent_id" in value
+    && "status" in value;
 }
 
 function isDecisionTrace(value: unknown): value is DecisionTrace {

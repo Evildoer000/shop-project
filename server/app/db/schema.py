@@ -75,7 +75,7 @@ def _ensure_agent_run_span_tree_columns(engine: Engine) -> None:
         "span_type": f"{version_type} NOT NULL DEFAULT 'stage'",
         "attempt": "INTEGER NOT NULL DEFAULT 1",
         "sequence": "INTEGER NOT NULL DEFAULT 0",
-        "trace_schema_version": f"{version_type} NOT NULL DEFAULT 'v1'",
+        "trace_schema_version": f"{version_type} NOT NULL DEFAULT 'v2'",
         "termination_reason": f"{reason_type} NOT NULL DEFAULT ''",
     }
     with engine.begin() as connection:

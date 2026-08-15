@@ -11,7 +11,11 @@ from app.domain.supervisor.policy_gate import (
     SupervisorPolicyGate,
 )
 from app.domain.supervisor.prompts import PromptRegistry, PromptSpec, build_default_prompt_registry
-from app.domain.supervisor.supervisor import SupervisorPlanCompiler
+from app.domain.supervisor.supervisor import (
+    SupervisorCompilationError,
+    SupervisorPlanCompiler,
+    SupervisorPolicyRejectedError,
+)
 from app.domain.supervisor.task_graph import TaskGraph, TaskGraphNode
 from app.domain.supervisor.validators import IntentPlanContractError, validate_intent_plan_contract
 
@@ -26,8 +30,10 @@ __all__ = [
     "PolicyEvaluation",
     "PromptRegistry",
     "PromptSpec",
+    "SupervisorCompilationError",
     "SupervisorPlanCompiler",
     "SupervisorPolicyGate",
+    "SupervisorPolicyRejectedError",
     "TaskGraph",
     "TaskGraphNode",
     "build_default_capability_catalog",

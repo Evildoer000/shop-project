@@ -21,6 +21,10 @@ def test_tool_registry_register_get_describe_and_require() -> None:
             "kind": "tool",
             "owner": "Orchestrator",
             "description": "文字商品检索原子能力",
+            "networked": False,
+            "sensitive": False,
+            "platforms": [],
+            "timeout_ms": 30_000,
         }
     ]
 
