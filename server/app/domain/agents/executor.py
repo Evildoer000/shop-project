@@ -130,7 +130,9 @@ class AgentExecutor:
                 yield handoff_event
             while True:
                 while True:
-                    blocked = graph.mark_blocked_nodes()
+                    blocked = graph.mark_blocked_nodes(
+                        exclude_capabilities=stop_before_capabilities,
+                    )
                     if not blocked:
                         break
                     execution_report.blocked_node_ids.extend(blocked)
@@ -147,13 +149,13 @@ class AgentExecutor:
                 if not ready:
                     pending = [node for node in graph.nodes if node.status == "pending"]
                     if pending:
-                        if execution_report.failed_node_ids or any(
-                            node.status in FAILURE_STATUSES
-                            or node.status == "skipped"
-                            and node.metadata.get("skipped_reason")
-                            in {"dependency_failed", "optional_branch_failed"}
-                            for node in graph.nodes
-                        ):
+                        deferred = [
+                            node
+                            for node in pending
+                            if stop_before_capabilities
+                            and node.capability in stop_before_capabilities
+                        ]
+                        if len(deferred) == len(pending):
                             break
                         raise GraphExecutionError(
                             "Task graph has pending nodes but none are ready: "
@@ -255,10 +257,6 @@ class AgentExecutor:
 
                 active_nodes = []
                 node_tasks = {}
-                if execution_report.failed_node_ids:
-                    # Leave failed nodes terminal so the Supervisor can append a
-                    # Repair node and re-enter this executor without losing lineage.
-                    break
 
             execution_report.completed = not [node for node in graph.nodes if node.status == "pending"]
             for handoff_event in self._handoff_events(graph):
@@ -368,6 +366,13 @@ class AgentExecutor:
                 dependency_id: self._output_for_dependency(dependency_id, base_context)
                 for dependency_id in self._dependency_ids(node)
             }
+            dependency_artifacts = {
+                dependency_id: self._artifacts_for_dependency(
+                    dependency_id,
+                    base_context,
+                )
+                for dependency_id in graph.ancestor_node_ids(node.node_id)
+            }
             context = AgentExecutionContext(
                 node=node,
                 graph=graph,
@@ -381,6 +386,7 @@ class AgentExecutor:
                 image_attributes=base_context.image_attributes,
                 artifacts=base_context.artifacts,
                 dependency_outputs=dependency_outputs,
+                dependency_artifacts=dependency_artifacts,
                 tool_access=self.tool_access,
                 prompt_registry=self.prompt_registry,
                 span_recorder=self.span_recorder,
@@ -572,7 +578,7 @@ class AgentExecutor:
         report.artifacts[node.node_id] = result.output
         report.artifacts[f"evidence:{node.node_id}"] = list(result.evidence)
         report.artifacts[f"tool_calls:{node.node_id}"] = list(result.tool_calls)
-        report.artifacts.update(result.artifacts)
+        report.artifacts[f"artifacts:{node.node_id}"] = dict(result.artifacts)
         if result.status in {"failed", "timeout", "cancelled"}:
             if node.required or interrupted:
                 node.status = result.status  # type: ignore[assignment]
@@ -737,3 +743,11 @@ class AgentExecutor:
     def _output_for_dependency(self, node_id: str, base_context: AgentExecutionContext) -> dict[str, Any]:
         output = base_context.artifacts.get(node_id)
         return output if isinstance(output, dict) else {}
+
+    def _artifacts_for_dependency(
+        self,
+        node_id: str,
+        base_context: AgentExecutionContext,
+    ) -> dict[str, Any]:
+        value = base_context.artifacts.get(f"artifacts:{node_id}")
+        return value if isinstance(value, dict) else {}

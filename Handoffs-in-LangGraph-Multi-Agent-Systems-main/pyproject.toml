@@ -1,0 +1,54 @@
+[project]
+name = "langgraph-multi-agent-handoff-real-estate"
+version = "0.1.0"
+description = "Multi agent handoff example (real estate) with LangGraph"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=1.0.3",
+    "langchain>=1.0.7",
+    "langchain-openai>=1.0.3",
+    "pandas>=2.3.3",
+    "pre-commit>=4.4.0"
+]
+
+[project.optional-dependencies]
+dev = ["mypy>=1.18.2", "ruff>=0.14.4"]
+
+[build-system]
+requires = ["setuptools>=80.9.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-data]
+"*" = ["py.typed"]
+
+[tool.ruff]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # isort
+    "D",    # pydocstyle
+    "D401", # First line should be in imperative mood
+    "T201",
+    "UP",
+]
+ignore = [
+    "UP006",
+    "UP007",
+    # We actually do want to import from typing_extensions
+    "UP035",
+    # Relax the convention by _not_ requiring documentation for every function parameter.
+    "D417",
+    "E501",
+    "T201"
+]
+
+[tool.ruff.per-file-ignores]
+"tests/*" = ["D", "UP"]
+
+[tool.ruff.pydocstyle]
+convention = "google"
+[tool.pytest.ini_options]
+pythonpath = [
+  "src"
+]

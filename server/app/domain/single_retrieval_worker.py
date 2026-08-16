@@ -20,6 +20,7 @@ class SingleRetrievalEvidence:
     score_filtered_products: list[Product] = field(default_factory=list)
     hybrid_ranked_products: list[Product] = field(default_factory=list)
     ranked: list[tuple[Product, float]] = field(default_factory=list)
+    candidate_sources: dict[str, list[str]] = field(default_factory=dict)
     rerank_query: str = ""
     failure_trigger: str = ""
     tool_call_count: int = 0
@@ -119,6 +120,10 @@ class SingleRetrievalWorker:
             score_filtered_products=search_result.score_filtered_products,
             hybrid_ranked_products=search_result.hybrid_ranked_products,
             ranked=[(candidate.product, candidate.rerank_score) for candidate in search_result.candidates],
+            candidate_sources={
+                candidate.product_id: ["retrieved"]
+                for candidate in search_result.candidates
+            },
             rerank_query=self._rerank_query(original_query, intent_plan),
             tool_call_count=self._tool_call_count(search_result.counts),
             branch_status=search_result.branch_status,

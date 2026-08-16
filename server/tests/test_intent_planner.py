@@ -4,7 +4,10 @@ import json
 import pytest
 
 from app.domain.intent_planner import IntentPlanner
-from app.domain.supervisor.validators import validate_intent_plan_contract
+from app.domain.supervisor.validators import (
+    IntentPlanContractError,
+    validate_intent_plan_contract,
+)
 from app.services.structured_llm import StructuredLlmValidationError
 
 
@@ -14,33 +17,49 @@ class StaticLlmClient:
         self.stream_chunks = stream_chunks
         self.calls: list[dict] = []
 
-    async def generate(self, system_prompt: str, user_prompt: str, response_format: dict | None = None) -> str:
+    async def generate_required(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        response_format: dict | None = None,
+        **kwargs,
+    ) -> str:
         self.calls.append(
             {
                 "system_prompt": system_prompt,
                 "user_prompt": user_prompt,
                 "response_format": response_format,
+                **kwargs,
             }
         )
-        if isinstance(self.payload, str):
-            return self.payload
-        return json.dumps(self.payload, ensure_ascii=False)
+        return (
+            self.payload
+            if isinstance(self.payload, str)
+            else json.dumps(self.payload, ensure_ascii=False)
+        )
 
-    async def generate_required(self, system_prompt: str, user_prompt: str, response_format: dict | None = None) -> str:
-        return await self.generate(system_prompt, user_prompt, response_format)
-
-    async def generate_stream_required(self, system_prompt: str, user_prompt: str, response_format: dict | None = None):
+    async def generate_stream_required(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        response_format: dict | None = None,
+        **kwargs,
+    ):
         self.calls.append(
             {
                 "system_prompt": system_prompt,
                 "user_prompt": user_prompt,
                 "response_format": response_format,
+                **kwargs,
             }
         )
         chunks = self.stream_chunks
         if chunks is None:
-            content = self.payload if isinstance(self.payload, str) else json.dumps(self.payload, ensure_ascii=False)
-            chunks = [content]
+            chunks = [
+                self.payload
+                if isinstance(self.payload, str)
+                else json.dumps(self.payload, ensure_ascii=False)
+            ]
         for chunk in chunks:
             yield chunk
 
@@ -48,481 +67,431 @@ class StaticLlmClient:
         return True
 
 
-def base_payload(**overrides) -> dict:
-    payload = {
-        "original_query": "帮我推荐防晒，200以内",
-        "plan_type": "single_retrieval",
-        "vector_query": "防晒 200以内",
-        "keyword_query": "防晒 200以内",
-        "budget_min": None,
-        "budget_max": 200,
-        "budget_scope": "per_item",
-        "need_slots": [],
-        "referenced_product_ids": [],
-        "profile_lookup": {"requested": False, "query": "", "reason": ""},
-        "plan_reason": "用户明确要推荐防晒。",
+def route_basis(
+    *,
+    target_clarity: str = "explicit_product",
+    external_information_need: str = "none",
+    trigger_text: str = "",
+    product_family: str = "防晒霜",
+) -> dict:
+    return {
+        "target_clarity": target_clarity,
+        "external_information_need": external_information_need,
+        "trigger_text": trigger_text,
+        "product_family": product_family,
+        "reason": "测试路由依据",
     }
-    payload.update(overrides)
-    return payload
 
 
-def test_intent_planner_direct_answer_contract() -> None:
-    payload = base_payload(
-        original_query="你是谁？",
-        plan_type="direct_answer",
-        vector_query="",
-        keyword_query="",
-        budget_max=None,
-        budget_scope="unknown",
-        plan_reason="用户询问助手身份，不需要商品证据。",
+def intent_payload(
+    intent_id: str,
+    goal: str,
+    *,
+    intent_type: str = "product_recommendation",
+    priority: str = "required",
+    route: dict | None = None,
+    constraints: list[dict] | None = None,
+    product_needs: list[dict] | None = None,
+    referenced_product_ids: list[str] | None = None,
+) -> dict:
+    return {
+        "intent_id": intent_id,
+        "intent_type": intent_type,
+        "priority": priority,
+        "goal": goal,
+        "resolved_query": goal,
+        "constraints": constraints or [],
+        "referenced_product_ids": referenced_product_ids or [],
+        "product_needs": product_needs or [],
+        "uncertainties": [],
+        "route_basis": route or route_basis(),
+    }
+
+
+def task_payload(
+    task_id: str,
+    capability: str,
+    intent_id: str,
+    *,
+    depends_on: list[str] | None = None,
+    optional_context_from: list[str] | None = None,
+    parameters: dict | None = None,
+) -> dict:
+    return {
+        "task_id": task_id,
+        "capability": capability,
+        "intent_ids": [intent_id],
+        "objective": f"执行 {intent_id} 的 {capability}",
+        "reason": "用户目标需要该专家能力",
+        "depends_on": depends_on or [],
+        "optional_context_from": optional_context_from or [],
+        "parameters": parameters or {},
+    }
+
+
+def plan_payload(intents: list[dict], tasks: list[dict], *, summary: str = "已拆分任务") -> dict:
+    return {
+        "schema_version": "3.0",
+        "summary": summary,
+        "intents": intents,
+        "task_proposals": tasks,
+    }
+
+
+def single_product_payload() -> dict:
+    intent = intent_payload(
+        "i1",
+        "推荐150元以内适合油皮通勤的防晒霜",
+        constraints=[
+            {
+                "name": "budget_max",
+                "value": 150,
+                "strength": "hard",
+                "source": "current_query",
+                "reason": "用户明确预算",
+            },
+            {
+                "name": "skin_type",
+                "value": "油皮",
+                "strength": "hard",
+                "source": "current_query",
+                "reason": "用户明确肤质",
+            },
+        ],
+        product_needs=[
+            {
+                "need_id": "n1",
+                "priority": "required",
+                "goal": "清爽通勤防晒霜",
+                "product_type": "防晒霜",
+                "constraints": [],
+                "exclusions": ["厚重"],
+            }
+        ],
+    )
+    task = task_payload(
+        "t1",
+        "single_product_recommendation",
+        "i1",
+        parameters={"product_need_ids": ["n1"]},
+    )
+    return plan_payload([intent], [task], summary="检索一款油皮通勤防晒")
+
+
+def test_parses_single_intent_v3_without_global_retrieval_fields() -> None:
+    plan = asyncio.run(
+        IntentPlanner(StaticLlmClient(single_product_payload())).plan(
+            "我是油皮，预算150以内，推荐夏天通勤不闷的防晒霜",
+            {},
+        )
     )
 
-    plan = asyncio.run(IntentPlanner(StaticLlmClient(payload)).plan("你是谁？", {}))
+    validate_intent_plan_contract(plan)
+    assert plan.schema_version == "3.0"
+    assert [item.intent_id for item in plan.intents] == ["i1"]
+    assert plan.intents[0].constraints[0].value == 150
+    assert plan.task_proposals[0].capability == "single_product_recommendation"
+    assert "plan_type" not in plan.model_dump()
+    assert "vector_query" not in plan.model_dump()
+    assert "need_slots" not in plan.model_dump()
 
-    assert plan.plan_type == "direct_answer"
-    assert plan.vector_query == ""
-    assert plan.keyword_query == ""
-    assert plan.need_slots == []
+
+def test_context_only_recommendation_is_executable_without_retrieval_task() -> None:
+    intent = intent_payload(
+        "i_context",
+        "在刚才推荐的面部补水商品里选两个含芦荟的",
+        route=route_basis(target_clarity="context_product", product_family="面部补水商品"),
+        referenced_product_ids=["p_face_1", "p_face_2", "p_face_3"],
+    )
+    intent["recommendation_policy"] = {
+        "candidate_source": "context_only",
+        "reference_policy": "eligible",
+        "requested_count": 2,
+        "count_mode": "exact",
+        "reason": "用户明确限定在上一轮商品中筛选两个",
+    }
+    payload = plan_payload([intent], [])
+
+    plan = asyncio.run(
+        IntentPlanner(StaticLlmClient(payload)).plan("就在刚才那些里选两个", {})
+    )
+
+    validate_intent_plan_contract(plan)
+    policy = plan.intents[0].recommendation_policy
+    assert policy.candidate_source == "context_only"
+    assert policy.reference_policy == "eligible"
+    assert policy.requested_count == 2
+    assert policy.count_mode == "exact"
+    assert plan.task_proposals == []
 
 
-def test_intent_planner_streams_summary_then_parses_json() -> None:
-    summary = "我会先理解商品需求，再筛选匹配候选。"
-    tagged_output = (
+def test_streams_summary_and_preserves_three_intents_in_user_order() -> None:
+    intents = [
+        intent_payload(
+            "i_skin",
+            "为敏感肌判断适合买什么商品",
+            route=route_basis(
+                target_clarity="vague_effect_or_use",
+                external_information_need="knowledge_bridge",
+                trigger_text="敏感肌",
+                product_family="",
+            ),
+        ),
+        intent_payload(
+            "i_throat",
+            "为喉咙不舒服判断适合买什么商品",
+            route=route_basis(
+                target_clarity="vague_effect_or_use",
+                external_information_need="knowledge_bridge",
+                trigger_text="喉咙不舒服",
+                product_family="",
+            ),
+        ),
+        intent_payload(
+            "i_outfit",
+            "下周去海边从头到脚搭配一套",
+            product_needs=[
+                {
+                    "need_id": "n_hat",
+                    "priority": "required",
+                    "goal": "海边遮阳帽",
+                    "product_type": "遮阳帽",
+                    "constraints": [],
+                    "exclusions": [],
+                },
+                {
+                    "need_id": "n_top",
+                    "priority": "required",
+                    "goal": "海边透气上装",
+                    "product_type": "短袖上衣",
+                    "constraints": [],
+                    "exclusions": [],
+                },
+                {
+                    "need_id": "n_shoes",
+                    "priority": "required",
+                    "goal": "海边轻便鞋",
+                    "product_type": "凉鞋",
+                    "constraints": [],
+                    "exclusions": [],
+                },
+            ],
+        ),
+    ]
+    tasks = [
+        task_payload(
+            "t_skin_knowledge",
+            "knowledge_research",
+            "i_skin",
+            parameters={
+                "query": "敏感肌适用商品类型",
+                "trigger_type": "knowledge_bridge",
+                "trigger_text": "敏感肌",
+            },
+        ),
+        task_payload(
+            "t_throat_knowledge",
+            "knowledge_research",
+            "i_throat",
+            parameters={
+                "query": "喉咙不舒服可购买商品类型",
+                "trigger_type": "knowledge_bridge",
+                "trigger_text": "喉咙不舒服",
+            },
+        ),
+        task_payload(
+            "t_outfit",
+            "multi_product_bundle",
+            "i_outfit",
+            parameters={"product_need_ids": ["n_hat", "n_top", "n_shoes"]},
+        ),
+    ]
+    summary = "拆成两个知识桥任务和一个海边穿搭任务"
+    content = (
         f"<summary>{summary}</summary>"
-        "<json>"
-        + json.dumps(base_payload(summary=summary), ensure_ascii=False)
-        + "</json>"
+        f"<json>{json.dumps(plan_payload(intents, tasks, summary=summary), ensure_ascii=False)}</json>"
+    )
+    planner = IntentPlanner(
+        StaticLlmClient({}, stream_chunks=[content[:31], content[31:97], content[97:]])
     )
 
     events = asyncio.run(
         _collect_stream(
-            IntentPlanner(
-                StaticLlmClient({}, stream_chunks=[tagged_output[:20], tagged_output[20:45], tagged_output[45:]])
-            ).stream_plan_with_summary("帮我推荐防晒，200以内", {})
+            planner.stream_plan_with_summary(
+                "我是敏感肌帮我看看买什么；我喉咙不舒服帮我看看买什么；下周去海边帮我从头到脚搭一套",
+                {},
+            )
         )
     )
 
-    assert "".join(event.content for event in events if event.kind == "summary_delta") == summary
-    plan = next(event.intent_plan for event in events if event.kind == "plan")
+    assert "".join(item.content for item in events if item.kind == "summary_delta") == summary
+    plan = next(item.intent_plan for item in events if item.kind == "plan")
     assert plan is not None
-    assert plan.summary == summary
-    assert plan.plan_type == "single_retrieval"
+    assert [item.intent_id for item in plan.intents] == ["i_skin", "i_throat", "i_outfit"]
+    assert [item.task_id for item in plan.task_proposals] == [
+        "t_skin_knowledge",
+        "t_throat_knowledge",
+        "t_outfit",
+    ]
+    assert [item.capability for item in plan.task_proposals[:2]] == [
+        "knowledge_research",
+        "knowledge_research",
+    ]
+    validate_intent_plan_contract(plan)
 
 
-def test_intent_planner_stream_prompt_contains_compositional_need_contract() -> None:
-    summary = "我会先判断是单品需求还是组合任务。"
-    tagged_output = f"<summary>{summary}</summary><json>{json.dumps(base_payload(summary=summary), ensure_ascii=False)}</json>"
-
-    client = StaticLlmClient({}, stream_chunks=[tagged_output])
-
-    asyncio.run(_collect_stream(IntentPlanner(client).stream_plan_with_summary("推荐适合新手的电脑", {})))
-
-    system_prompt = client.calls[0]["system_prompt"]
-    assert "新手、入门、适合春天、通勤、旅行、预算、轻薄、好看等词本身只是约束" in system_prompt
-    assert "单一商品目标 + 多个约束仍是 single_retrieval" in system_prompt
-    assert "组合任务/生活任务/搭配任务/装备清单应输出 multi_retrieval" in system_prompt
-    assert "泛数量表达不等于多槽" in system_prompt
-    assert "如果「套装」修饰的是上位品类、生活任务或搭配目标" in system_prompt
-    assert "只有「装备」或场景词并不等于多槽" in system_prompt
-    assert "场景词不能直接变成 required slot" in system_prompt
-    assert "Planner 自己推断的补充件、配饰、拍照/露营/通勤衍生件应 optional" in system_prompt
-    assert "不要把「新手化妆品套装」「春天穿搭套装」「开学装备」这类组合目标本身当成一个 slot" in system_prompt
-    assert "「推荐适合新手的电脑」=> single_retrieval" in system_prompt
-    assert "「根据我平时偏好，选几件日常通勤穿的衣服」=> single_retrieval" in system_prompt
-    assert "「新手化妆品套装」=> multi_retrieval" in system_prompt
-    assert "「户外露营装备推荐下」=> single_retrieval" in system_prompt
-    assert "不要拆帐篷/相机" in system_prompt
-    assert "profile_lookup.requested=true" in system_prompt
-
-
-def test_intent_planner_accepts_minimal_direct_answer_payload() -> None:
-    plan = asyncio.run(IntentPlanner(StaticLlmClient({"plan_type": "direct_answer"})).plan("你是谁？", {}))
-
-    assert plan.original_query == "你是谁？"
-    assert plan.plan_type == "direct_answer"
-    assert plan.vector_query == ""
-    assert plan.keyword_query == ""
-    assert plan.budget_min is None
-    assert plan.budget_max is None
-    assert plan.budget_scope == "unknown"
-    assert plan.need_slots == []
-    assert plan.referenced_product_ids == []
-    assert plan.profile_lookup.requested is False
-
-
-def test_intent_planner_prompt_contains_context_inheritance_guardrails() -> None:
-    client = StaticLlmClient({"plan_type": "direct_answer"})
-
-    asyncio.run(
-        IntentPlanner(client).plan(
-            "你是谁",
-            {
-                "recent_turns": [
-                    {
-                        "user": "帮我买防晒和面霜，预算 500",
-                        "product_ids": ["p1", "p2"],
-                        "rewrite": {"need_slots": [{"slot_id": "s1", "goal": "防晒"}]},
-                    }
-                ]
-            },
-        )
-    )
-
-    system_prompt = client.calls[0]["system_prompt"]
-    user_prompt = client.calls[0]["user_prompt"]
-    assert "当前 query 永远优先" in system_prompt
-    assert "不能机械继承上一轮商品目标、预算、need_slots 或 product_ids" in system_prompt
-    assert "必须输出 plan_type=direct_answer" in system_prompt
-    assert "当前问题是询问助手身份，不能继承上一轮防晒和面霜的商品计划" in user_prompt
-    assert "referenced_product_ids" in user_prompt
-
-
-def test_intent_planner_plan_prompt_contains_compositional_need_contract() -> None:
-    client = StaticLlmClient({"plan_type": "single_retrieval"})
-
-    asyncio.run(IntentPlanner(client).plan("推荐适合新手的电脑", {}))
-
-    system_prompt = client.calls[0]["system_prompt"]
-    assert "新手、入门、适合春天、通勤、旅行、预算、轻薄、好看等词本身只是约束" in system_prompt
-    assert "单一商品目标 + 多个约束仍是 single_retrieval" in system_prompt
-    assert "组合任务/生活任务/搭配任务/装备清单应输出 multi_retrieval" in system_prompt
-    assert "泛数量表达不等于多槽" in system_prompt
-    assert "套装边界：如果用户是在找现成售卖的单一套装 SKU" in system_prompt
-    assert "如果「套装」修饰的是上位品类、生活任务或搭配目标" in system_prompt
-    assert "「适合春天的穿搭套装」=> multi_retrieval" in system_prompt
-    assert "「户外露营装备推荐下」=> single_retrieval" in system_prompt
-    assert "配件只能 optional" in system_prompt
-    assert "profile_lookup.requested=true" in system_prompt
-
-
-def test_intent_planner_normalizes_direct_answer_shape_variation() -> None:
-    payload = base_payload(
-        original_query="你是谁？",
-        plan_type="direct_answer",
-        vector_query="你是谁",
-        keyword_query="你是谁",
-        budget_max=None,
-        budget_scope="unknown",
-        need_slots=[
-            {"slot_id": "s1", "goal": "助手身份", "product_type": "助手", "query": "你是谁"},
+def test_mixed_request_keeps_constraints_and_dependencies_intent_scoped() -> None:
+    payload = plan_payload(
+        [
+            intent_payload("i_recommend", "推荐油皮防晒"),
+            intent_payload(
+                "i_explain",
+                "解释为什么清爽不闷",
+                intent_type="shopping_knowledge",
+                route=route_basis(
+                    target_clarity="not_applicable",
+                    external_information_need="explicit_web",
+                    trigger_text="解释",
+                    product_family="",
+                ),
+            ),
+            intent_payload(
+                "i_compare",
+                "与上一款防晒比较",
+                intent_type="product_comparison",
+                route=route_basis(target_clarity="context_product"),
+                referenced_product_ids=["p_previous"],
+            ),
         ],
-        profile_lookup={"requested": "false", "query": "", "reason": ""},
-        plan_reason="用户询问助手身份，不需要商品证据。",
-    )
-
-    plan = asyncio.run(IntentPlanner(StaticLlmClient(payload)).plan("你是谁", {}))
-
-    assert plan.original_query == "你是谁"
-    assert plan.plan_type == "direct_answer"
-    assert plan.vector_query == ""
-    assert plan.keyword_query == ""
-    assert plan.need_slots == []
-    assert plan.profile_lookup.requested is False
-
-
-def test_intent_planner_accepts_minimal_single_retrieval_payload() -> None:
-    plan = asyncio.run(IntentPlanner(StaticLlmClient({"plan_type": "single_retrieval"})).plan("推荐耳机", {}))
-
-    assert plan.plan_type == "single_retrieval"
-    assert plan.vector_query == "推荐耳机"
-    assert plan.keyword_query == "推荐耳机"
-    assert plan.need_slots == []
-
-
-def test_intent_planner_clarify_contract() -> None:
-    payload = base_payload(
-        original_query="推荐点东西吧",
-        plan_type="clarify",
-        vector_query="",
-        keyword_query="",
-        budget_max=None,
-        budget_scope="unknown",
-        plan_reason="用户没有给出商品目标。",
-    )
-
-    plan = asyncio.run(IntentPlanner(StaticLlmClient(payload)).plan("推荐点东西吧", {}))
-
-    assert plan.plan_type == "clarify"
-    assert plan.vector_query == ""
-    assert plan.keyword_query == ""
-
-
-def test_intent_planner_budget_min_and_max() -> None:
-    payload = base_payload(
-        original_query="预算300到500，推荐耳机",
-        vector_query="预算300到500 耳机",
-        keyword_query="耳机 预算300到500",
-        budget_min=300,
-        budget_max=500,
-    )
-
-    plan = asyncio.run(IntentPlanner(StaticLlmClient(payload)).plan("预算300到500，推荐耳机", {}))
-
-    assert plan.plan_type == "single_retrieval"
-    assert plan.budget_min == 300
-    assert plan.budget_max == 500
-
-
-def test_intent_planner_multi_retrieval_slots_and_total_budget() -> None:
-    payload = base_payload(
-        original_query="总预算1000，买运动鞋和运动服装",
-        plan_type="multi_retrieval",
-        vector_query="运动鞋 运动服装 总预算1000",
-        keyword_query="运动鞋 运动服装 总预算1000",
-        budget_max=1000,
-        budget_scope="total",
-        need_slots=[
-            {"slot_id": "s1", "need_type": "required", "goal": "运动鞋", "product_type": "运动鞋", "query": "运动鞋", "soft_constraints": [], "exclude_terms": [], "min_candidates": 1},
-            {"slot_id": "s2", "need_type": "required", "goal": "运动服装", "product_type": "运动服装", "query": "运动服装", "soft_constraints": [], "exclude_terms": [], "min_candidates": 1},
-        ],
-    )
-
-    plan = asyncio.run(IntentPlanner(StaticLlmClient(payload)).plan("总预算1000，买运动鞋和运动服装", {}))
-
-    assert plan.plan_type == "multi_retrieval"
-    assert plan.budget_scope == "total"
-    assert [slot.goal for slot in plan.need_slots] == ["运动鞋", "运动服装"]
-
-
-def test_intent_planner_context_reference_and_profile_lookup() -> None:
-    payload = base_payload(
-        original_query="这两个哪个更适合跑步？",
-        plan_type="direct_answer",
-        vector_query="",
-        keyword_query="",
-        budget_max=None,
-        budget_scope="unknown",
-        referenced_product_ids=["p1", "p2"],
-        profile_lookup={"requested": True, "query": "跑步偏好", "reason": "用户询问个人适合度。"},
-    )
-
-    plan = asyncio.run(
-        IntentPlanner(StaticLlmClient(payload)).plan(
-            "这两个哪个更适合跑步？",
-            {"recent_turns": [{"product_ids": ["p1", "p2"]}]},
-        )
-    )
-
-    assert plan.referenced_product_ids == ["p1", "p2"]
-    assert plan.profile_lookup.requested is True
-
-
-def test_intent_planner_retries_then_raises_invalid_json() -> None:
-    client = StaticLlmClient("not json")
-
-    with pytest.raises(StructuredLlmValidationError):
-        asyncio.run(IntentPlanner(client).plan("你是谁", {}))
-
-    assert len(client.calls) == 2
-    assert "输出不是可解析的 JSON object" in client.calls[1]["user_prompt"]
-
-
-def test_intent_planner_expands_compound_request_into_supervisor_contract() -> None:
-    payload = base_payload(
-        normalized_query="推荐油皮通勤防晒并与上一款比较，解释清爽依据并看看小红书评价",
-        primary_intent="product_recommendation",
-        intents=[
-            {
-                "intent_id": "i1",
-                "intent_type": "product_recommendation",
-                "goal": "推荐油皮通勤防晒",
-                "query_rewrite": {
-                    "semantic_query": "适合油皮通勤且清爽的防晒霜",
-                    "keyword_query": "防晒霜 油皮 清爽 通勤 150元以内",
+        [
+            task_payload("t_recommend", "single_product_recommendation", "i_recommend"),
+            task_payload(
+                "t_explain",
+                "knowledge_research",
+                "i_explain",
+                depends_on=["t_recommend"],
+                parameters={
+                    "query": "防晒清爽不闷原理",
+                    "trigger_type": "explicit_web_request",
+                    "trigger_text": "解释",
                 },
-                "route_basis": {
-                    "target_clarity": "explicit_product",
-                    "local_catalog_status": "sufficient",
-                    "external_information_need": "none",
-                    "trigger_text": "",
-                    "product_family": "防晒霜",
-                    "reason": "当前请求已明确商品目标。",
-                },
-            },
-            {
-                "intent_id": "i2",
-                "intent_type": "product_comparison",
-                "goal": "与上一款防晒比较",
-                "depends_on": ["i1"],
-                "referenced_product_ids": ["p1"],
-                "route_basis": {
-                    "target_clarity": "context_product",
-                    "local_catalog_status": "sufficient",
-                    "external_information_need": "explicit_platform",
-                    "trigger_text": "小红书",
-                    "product_family": "防晒霜",
-                    "reason": "用户明确要求查看小红书评价。",
-                },
-            },
-            {
-                "intent_id": "i3",
-                "intent_type": "shopping_knowledge",
-                "goal": "解释清爽不闷依据",
-                "depends_on": ["i1"],
-            },
+            ),
+            task_payload(
+                "t_compare",
+                "comparison",
+                "i_compare",
+                depends_on=["t_recommend"],
+                parameters={"referenced_product_ids": ["p_previous"]},
+            ),
         ],
-        execution_mode="single_product",
-        input_modalities=["text"],
-        constraints={"budget_max": 150, "budget_scope": "per_item", "items": []},
-        context_requests=[
-            {
-                "request_id": "ctx_profile",
-                "context_type": "long_term_profile",
-                "usage": "ranking_only",
-                "query": "防晒偏好",
-                "reason": "用户明确要求按照平时偏好",
-            }
-        ],
-        research_requests=[
-            {
-                "request_id": "r1",
-                "intent_id": "i2",
-                "mode": "social_content",
-                "consumer_capability": "commerce_research",
-                "trigger_type": "explicit_platform_request",
-                "trigger_text": "小红书",
-                "platforms": ["xiaohongshu"],
-                "query": "两款防晒评价",
-                "reason": "用户要求查看小红书评价",
-            }
-        ],
-        agent_proposals=[
-            {
-                "proposal_id": "p_profile",
-                "capability": "profile_preference",
-                "intent_ids": ["i1"],
-                "reason": "需要个性化排序",
-            },
-            {
-                "proposal_id": "p_single",
-                "capability": "single_product_recommendation",
-                "intent_ids": ["i1"],
-                "reason": "需要召回一个商品目标",
-            },
-            {
-                "proposal_id": "p_compare",
-                "capability": "comparison",
-                "intent_ids": ["i2"],
-                "depends_on": ["p_single"],
-                "optional_context_from": ["p_commerce"],
-                "reason": "用户要求对比",
-            },
-            {
-                "proposal_id": "p_knowledge",
-                "capability": "knowledge_research",
-                "intent_ids": ["i3"],
-                "depends_on": ["p_single"],
-                "reason": "用户要求解释原理",
-            },
-            {
-                "proposal_id": "p_commerce",
-                "capability": "commerce_research",
-                "intent_ids": ["i2"],
-                "reason": "用户明确要求查看小红书评价",
-            },
-        ],
-        referenced_product_ids=["p1"],
-        profile_lookup={
-            "requested": True,
-            "query": "防晒偏好",
-            "usage": "ranking_only",
-            "reason": "用户明确依赖长期偏好",
-        },
     )
 
-    plan = asyncio.run(IntentPlanner(StaticLlmClient(payload)).plan(payload["normalized_query"], {}))
+    plan = asyncio.run(IntentPlanner(StaticLlmClient(payload)).plan("混合请求", {}))
 
     validate_intent_plan_contract(plan)
-    assert [intent.intent_type for intent in plan.intents] == [
-        "product_recommendation",
-        "product_comparison",
-        "shopping_knowledge",
-    ]
-    assert plan.execution_mode == "single_product"
-    assert plan.context_requests[0].usage == "ranking_only"
-    assert plan.research_requests[0].platforms == ["xiaohongshu"]
-    assert [proposal.capability for proposal in plan.agent_proposals] == [
-        "profile_preference",
-        "single_product_recommendation",
-        "comparison",
-        "knowledge_research",
-        "commerce_research",
-    ]
-    assert plan.agent_proposals[2].optional_context_from == ["p_commerce"]
-    assert plan.research_requests[0].consumer_capability == "commerce_research"
-    assert plan.research_requests[0].trigger_type == "explicit_platform_request"
+    by_id = {task.task_id: task for task in plan.task_proposals}
+    assert by_id["t_explain"].intent_ids == ["i_explain"]
+    assert by_id["t_explain"].depends_on == ["t_recommend"]
+    assert by_id["t_compare"].intent_ids == ["i_compare"]
+    assert plan.intents[2].referenced_product_ids == ["p_previous"]
 
 
-def test_intent_planner_prompt_exposes_only_planner_proposable_capabilities() -> None:
-    client = StaticLlmClient({"plan_type": "direct_answer"})
+def test_prompt_defines_v3_boundaries_and_excludes_supervisor_capabilities() -> None:
+    client = StaticLlmClient(single_product_payload())
 
-    asyncio.run(IntentPlanner(client).plan("你好", {}))
+    asyncio.run(IntentPlanner(client).plan("推荐防晒", {}))
 
-    user_prompt = json.loads(client.calls[0]["user_prompt"])
+    system_prompt = client.calls[0]["system_prompt"]
+    user_payload = json.loads(client.calls[0]["user_prompt"])
+    assert "顶层只允许 schema_version、summary、intents、task_proposals" in system_prompt
+    assert "相同 capability 可以出现多次" in system_prompt
+    assert "不得提案 EvidenceVerifier、BundleOptimizer、Repair、AnswerGenerator" in system_prompt
+    assert "检索 Agent 自己生成 RetrievalPlan" in system_prompt
+    assert "不得重建或修改其它 intent" not in system_prompt
     capabilities = {
-        item["capability"] for item in user_prompt["available_agent_capabilities"]
+        item["capability"] for item in user_payload["available_agent_capabilities"]
     }
     assert "single_product_recommendation" in capabilities
     assert "comparison" in capabilities
     assert "repair" not in capabilities
     assert "answer_generation" not in capabilities
-    assert "memory_distillation" not in capabilities
 
 
-def test_intent_planner_maps_profile_context_id_to_optional_proposal_reference() -> None:
-    payload = base_payload(
-        execution_mode="single_product",
-        primary_intent="product_recommendation",
-        intents=[
-            {
-                "intent_id": "i1",
-                "intent_type": "product_recommendation",
-                "goal": "按长期偏好推荐防晒",
-            }
-        ],
-        context_requests=[
-            {
-                "request_id": "ctx1",
-                "context_type": "long_term_profile",
-                "usage": "ranking_only",
-                "query": "防晒肤感偏好",
-                "reason": "用户明确要求按长期偏好推荐",
-            }
-        ],
-        agent_proposals=[
-            {
-                "proposal_id": "p1",
-                "capability": "profile_preference",
-                "intent_ids": ["i1"],
-                "reason": "读取长期画像作为软偏好",
-            },
-            {
-                "proposal_id": "p2",
-                "capability": "single_product_recommendation",
-                "intent_ids": ["i1"],
-                "reason": "检索单商品",
-                "depends_on": ["p1"],
-                "optional_context_from": ["ctx1"],
-            },
-        ],
-        profile_lookup={
-            "requested": True,
-            "query": "防晒肤感偏好",
-            "usage": "ranking_only",
-            "reason": "用户明确要求按长期偏好推荐",
+def test_policy_replan_feedback_requests_a_complete_v3_replacement() -> None:
+    client = StaticLlmClient(single_product_payload())
+    context = {
+        "replan_attempt": 1,
+        "previous_intent_plan": plan_payload([], []),
+        "policy_evaluation": {
+            "approved": False,
+            "errors": ["no required intent has an executable task branch"],
         },
+    }
+
+    asyncio.run(IntentPlanner(client).plan("推荐防晒", context))
+
+    assert "策略拒绝后的受限重规划" in client.calls[0]["system_prompt"]
+    prompt_context = json.loads(client.calls[0]["user_prompt"])["context"]
+    assert prompt_context["replan_attempt"] == 1
+    assert prompt_context["policy_evaluation"]["approved"] is False
+
+
+def test_knowledge_revision_prompt_is_limited_to_one_target_intent() -> None:
+    client = StaticLlmClient(single_product_payload())
+    context = {
+        "intent_revision": {
+            "intent_id": "i1",
+            "target_intent": single_product_payload()["intents"][0],
+            "knowledge_result": {"candidate_concepts": ["物理防晒霜"]},
+        }
+    }
+
+    asyncio.run(IntentPlanner(client).plan("敏感肌适合买什么", context))
+
+    prompt = client.calls[0]["system_prompt"]
+    assert "本次只能输出 target_intent 对应的一个 intent" in prompt
+    assert "不得重建或修改其它 intent" in prompt
+    assert "已完成的 knowledge_research 不得再次提案" in prompt
+
+
+def test_rejects_removed_global_route_fields() -> None:
+    payload = single_product_payload()
+    payload["execution_mode"] = "single_product"
+    payload["plan_type"] = "single_retrieval"
+    client = StaticLlmClient(payload)
+
+    with pytest.raises(StructuredLlmValidationError) as error:
+        asyncio.run(IntentPlanner(client).plan("推荐防晒", {}))
+
+    assert "V3 顶层包含已删除字段" in " ".join(error.value.errors)
+    assert len(client.calls) == 2
+
+
+def test_contract_rejects_one_task_bound_to_multiple_intents() -> None:
+    payload = plan_payload(
+        [intent_payload("i1", "推荐防晒"), intent_payload("i2", "推荐耳机")],
+        [task_payload("t1", "single_product_recommendation", "i1")],
+    )
+    payload["task_proposals"][0]["intent_ids"] = ["i1", "i2"]
+    plan = asyncio.run(IntentPlanner(StaticLlmClient(payload)).plan("两个任务", {}))
+
+    with pytest.raises(IntentPlanContractError, match="exactly one intent"):
+        validate_intent_plan_contract(plan)
+
+
+def test_rejects_duplicate_task_ids_before_compilation() -> None:
+    payload = plan_payload(
+        [intent_payload("i1", "推荐防晒"), intent_payload("i2", "推荐耳机")],
+        [
+            task_payload("t1", "single_product_recommendation", "i1"),
+            task_payload("t1", "single_product_recommendation", "i2"),
+        ],
     )
 
-    plan = asyncio.run(IntentPlanner(StaticLlmClient(payload)).plan("按我的偏好推荐防晒", {}))
-    recommendation = next(
-        proposal
-        for proposal in plan.agent_proposals
-        if proposal.capability == "single_product_recommendation"
-    )
+    with pytest.raises(StructuredLlmValidationError) as error:
+        asyncio.run(IntentPlanner(StaticLlmClient(payload)).plan("两个任务", {}))
 
-    validate_intent_plan_contract(plan)
-    assert recommendation.depends_on == []
-    assert recommendation.optional_context_from == ["p1"]
+    assert "duplicate task_id" in " ".join(error.value.errors)
 
 
 async def _collect_stream(generator):

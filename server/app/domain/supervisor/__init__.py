@@ -5,7 +5,6 @@ from app.domain.supervisor.capability_catalog import (
     build_default_capability_catalog,
 )
 from app.domain.supervisor.policy_gate import (
-    KnowledgeFollowUpDecision,
     PolicyDecision,
     PolicyEvaluation,
     SupervisorPolicyGate,
@@ -25,7 +24,6 @@ __all__ = [
     "CapabilityCatalog",
     "CapabilityDefinition",
     "IntentPlanContractError",
-    "KnowledgeFollowUpDecision",
     "PolicyDecision",
     "PolicyEvaluation",
     "PromptRegistry",

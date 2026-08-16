@@ -12,7 +12,6 @@ class AgentManifest:
     capability: str
     description: str
     allowed_tools: tuple[str, ...] = ()
-    execution_modes: tuple[str, ...] = ()
     timeout_ms: int = 30_000
     max_attempts: int = 1
     priority: int = 100
@@ -62,14 +61,8 @@ class AgentRegistry:
             key=lambda item: item.manifest.priority,
         )
 
-    def select_for_capability(self, capability: str, *, execution_mode: str = "") -> AgentRegistration | None:
+    def select_for_capability(self, capability: str) -> AgentRegistration | None:
         candidates = self.enabled_for_capability(capability)
-        if execution_mode:
-            candidates = [
-                item
-                for item in candidates
-                if not item.manifest.execution_modes or execution_mode in item.manifest.execution_modes
-            ]
         return candidates[0] if candidates else None
 
     def describe(self, *, include_supervisor_managed: bool = True) -> list[dict[str, Any]]:
@@ -80,7 +73,6 @@ class AgentRegistry:
                 "capability": item.manifest.capability,
                 "description": item.manifest.description,
                 "allowed_tools": list(item.manifest.allowed_tools),
-                "execution_modes": list(item.manifest.execution_modes),
                 "enabled": item.manifest.enabled,
                 "supervisor_managed": item.manifest.supervisor_managed,
             }
@@ -99,14 +91,12 @@ def build_foundation_agent_registry(
             agent_id="intent_understanding_agent",
             capability="intent_understanding",
             description="强制解析用户意图、约束、上下文引用和候选 Agent 提案。",
-            execution_modes=("direct", "clarify", "context_evidence", "single_product", "multi_product"),
             supervisor_managed=True,
         ),
         AgentManifest(
             agent_id="supervisor_policy_gate",
             capability="policy_gate",
             description="确定性代码策略门：校验计划契约、Agent 路由和 Tool 授权，不调用 LLM。",
-            execution_modes=("direct", "clarify", "context_evidence", "single_product", "multi_product"),
             supervisor_managed=True,
         ),
         AgentManifest(
@@ -114,36 +104,31 @@ def build_foundation_agent_registry(
             capability="profile_preference",
             description="按 Supervisor 批准读取长期画像和行为偏好。",
             allowed_tools=("profile_lookup",),
-            execution_modes=("single_product", "multi_product", "context_evidence"),
         ),
         AgentManifest(
             agent_id="clarification_agent",
             capability="clarification",
             description="生成阻塞执行的最小澄清问题。",
-            execution_modes=("clarify",),
         ),
         AgentManifest(
             agent_id="single_product_recommendation_agent",
             capability="single_product_recommendation",
             description="执行单商品目标的文本、关键词和图片辅助检索。",
-            allowed_tools=("product_search", "image_search", "image_understanding", "product_detail"),
-            execution_modes=("single_product",),
+            allowed_tools=("product_search", "image_search", "image_understanding"),
             max_attempts=3,
         ),
         AgentManifest(
             agent_id="multi_product_bundle_agent",
             capability="multi_product_bundle",
-            description="并行执行多个商品 Slot，并形成组合证据。",
-            allowed_tools=("product_search", "image_search", "image_understanding", "product_detail"),
-            execution_modes=("multi_product",),
+            description="拆分、调度并合并多个商品 Slot；商品检索由独立 Slot Agent 执行。",
+            allowed_tools=("image_understanding",),
             max_attempts=3,
         ),
         AgentManifest(
             agent_id="slot_retrieval_agent",
             capability="slot_product_retrieval",
             description="只处理一个商品 Slot 的独立检索，供多商品路线并行调度。",
-            allowed_tools=("product_search", "image_search", "image_understanding", "product_detail"),
-            execution_modes=("multi_product",),
+            allowed_tools=("product_search",),
             max_attempts=3,
             supervisor_managed=True,
         ),
@@ -152,29 +137,27 @@ def build_foundation_agent_registry(
             capability="commerce_research",
             description="仅查询淘宝、抖音电商和小红书，输出带来源的外部商品与口碑证据。",
             allowed_tools=("commerce_search", "commerce_product_detail", "commerce_reviews"),
-            execution_modes=("context_evidence", "single_product", "multi_product"),
             max_attempts=2,
         ),
         AgentManifest(
             agent_id="comparison_agent",
             capability="comparison",
-            description="基于商品证据和获批外部研究执行多维对比。",
-            allowed_tools=("web_search", "product_detail"),
-            execution_modes=("context_evidence", "single_product", "multi_product"),
+            description="读取上游检索与研究证据，并用本地商品详情执行多维对比。",
+            allowed_tools=("product_detail",),
             max_attempts=3,
         ),
         AgentManifest(
-            agent_id="knowledge_research_agent",
+            agent_id="product_knowledge_agent",
             capability="knowledge_research",
-            description="解释商品原理、成分、规格和选购知识。",
-            allowed_tools=("web_search", "product_detail"),
-            execution_modes=("context_evidence", "single_product", "multi_product"),
+            description="补充本地商品详情、商品原理、成分和选购知识，并输出可追溯证据。",
+            allowed_tools=("product_detail", "web_search"),
             max_attempts=3,
         ),
         AgentManifest(
             agent_id="evidence_verifier_agent",
             capability="evidence_verification",
-            description="校验商品和研究证据是否支撑用户需求。",
+            description="合并上下文与召回候选，校验证据并选择最终推荐集合。",
+            allowed_tools=("product_detail",),
             max_attempts=3,
             supervisor_managed=True,
         ),
@@ -182,7 +165,6 @@ def build_foundation_agent_registry(
             agent_id="bundle_optimizer",
             capability="bundle_optimization",
             description="多商品证据通过后进行预算和搭配优化。",
-            execution_modes=("multi_product",),
             supervisor_managed=True,
         ),
         AgentManifest(

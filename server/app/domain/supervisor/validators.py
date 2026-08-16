@@ -1,213 +1,179 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
-
-from app.domain.supervisor.capability_catalog import CapabilityCatalog, build_default_capability_catalog
-from app.schemas import IntentPlan
-
-
-COMMERCE_RESEARCH_PLATFORMS = frozenset({"taobao", "douyin_ec", "xiaohongshu"})
-RESEARCH_TRIGGER_NEEDS = {
-    "explicit_web_request": "explicit_web",
-    "explicit_platform_request": "explicit_platform",
-    "freshness_required": "freshness_required",
-    "knowledge_bridge": "knowledge_bridge",
-}
+from app.domain.supervisor.capability_catalog import (
+    CapabilityCatalog,
+    build_default_capability_catalog,
+)
+from app.schemas import IntentPlanV3
 
 
 class IntentPlanContractError(ValueError):
     def __init__(self, errors: list[str]) -> None:
         self.errors = errors
-        super().__init__("Invalid IntentPlan contract: " + "; ".join(errors))
+        super().__init__("Invalid IntentPlan V3 contract: " + "; ".join(errors))
 
 
 def validate_intent_plan_contract(
-    plan: IntentPlan,
+    plan: IntentPlanV3,
     catalog: CapabilityCatalog | None = None,
 ) -> None:
     resolved_catalog = catalog or build_default_capability_catalog()
     errors: list[str] = []
 
-    if plan.schema_version != "2.0":
-        errors.append("schema_version must be 2.0")
-    if not plan.normalized_query.strip() and not plan.original_query.strip():
-        errors.append("normalized_query or original_query is required")
-    if not plan.input_modalities:
-        errors.append("input_modalities cannot be empty")
-    if len(plan.input_modalities) != len(set(plan.input_modalities)):
-        errors.append("input_modalities cannot contain duplicates")
-
-    intent_ids = [intent.intent_id.strip() for intent in plan.intents]
-    if not intent_ids:
+    if plan.schema_version != "3.0":
+        errors.append("schema_version must be 3.0")
+    if not plan.original_query.strip() and not plan.normalized_query.strip():
+        errors.append("original_query or normalized_query is required")
+    if not plan.intents:
         errors.append("intents cannot be empty")
+
+    intent_ids = [item.intent_id.strip() for item in plan.intents]
     _validate_unique_non_empty("intent_id", intent_ids, errors)
-    intent_id_set = set(intent_ids)
-    intent_types = {intent.intent_type for intent in plan.intents}
-    if plan.intents and plan.primary_intent not in intent_types:
-        errors.append("primary_intent must match one item in intents")
-    intent_dependencies = {intent.intent_id: intent.depends_on for intent in plan.intents}
-    _validate_dependencies("intent", intent_dependencies, intent_id_set, errors)
+    intent_by_id = {item.intent_id: item for item in plan.intents}
 
-    if plan.constraints.budget_min is not None and plan.constraints.budget_min < 0:
-        errors.append("constraints.budget_min must be non-negative")
-    if plan.constraints.budget_max is not None and plan.constraints.budget_max < 0:
-        errors.append("constraints.budget_max must be non-negative")
-    if (
-        plan.constraints.budget_min is not None
-        and plan.constraints.budget_max is not None
-        and plan.constraints.budget_min > plan.constraints.budget_max
-    ):
-        errors.append("constraints.budget_min cannot exceed constraints.budget_max")
-    if any(item.source == "long_term_profile" and item.strength == "hard" for item in plan.constraints.items):
-        errors.append("long_term_profile constraints must be soft")
-
-    slot_ids = [slot.slot_id.strip() for slot in plan.need_slots]
-    _validate_unique_non_empty("slot_id", slot_ids, errors)
-    for slot in plan.need_slots:
-        if slot.intent_id and slot.intent_id not in intent_id_set:
-            errors.append(f"slot {slot.slot_id} references unknown intent_id {slot.intent_id}")
-        if not any([slot.query.strip(), slot.semantic_query.strip(), slot.keyword_query.strip()]):
-            errors.append(f"slot {slot.slot_id} requires a retrieval query")
-    if plan.execution_mode == "multi_product" and not plan.need_slots:
-        errors.append("multi_product execution requires need_slots")
-
-    referenced_ids = set(plan.referenced_product_ids)
+    need_owner: dict[str, str] = {}
     for intent in plan.intents:
-        referenced_ids.update(intent.referenced_product_ids)
-    if (
-        plan.execution_mode == "context_evidence"
-        and not referenced_ids
-        and not any(proposal.capability == "knowledge_research" for proposal in plan.agent_proposals)
-    ):
-        errors.append("context_evidence execution requires referenced products or knowledge_research")
-    if plan.execution_mode == "clarify":
-        if not plan.clarification.required or not plan.clarification.blocking:
-            errors.append("clarify execution requires a blocking clarification proposal")
-    if plan.clarification.blocking and plan.execution_mode != "clarify":
-        errors.append("blocking clarification requires execution_mode=clarify")
-
-    context_request_ids = [request.request_id.strip() for request in plan.context_requests]
-    _validate_unique_non_empty("context request_id", context_request_ids, errors)
-    if any(request.context_type == "long_term_profile" and not request.reason.strip() for request in plan.context_requests):
-        errors.append("long_term profile requests require a reason")
-
-    research_request_ids = [request.request_id.strip() for request in plan.research_requests]
-    _validate_unique_non_empty("research request_id", research_request_ids, errors)
-    intents_by_id = {intent.intent_id: intent for intent in plan.intents}
-    for request in plan.research_requests:
-        if request.intent_id not in intent_id_set:
-            errors.append(f"research request {request.request_id} references unknown intent_id {request.intent_id}")
-            continue
-        intent = intents_by_id[request.intent_id]
-        if not request.trigger_text.strip():
-            errors.append(f"research request {request.request_id} requires trigger_text")
-        expected_need = RESEARCH_TRIGGER_NEEDS[request.trigger_type]
-        if intent.route_basis.external_information_need != expected_need:
-            errors.append(
-                f"research request {request.request_id} trigger_type does not match intent route_basis"
-            )
-        if request.mode == "web_general" and request.consumer_capability == "commerce_research":
-            errors.append(
-                f"research request {request.request_id} web_general cannot be consumed by commerce_research"
-            )
-        if request.mode in {"marketplace", "social_content"} and request.consumer_capability != "commerce_research":
-            errors.append(
-                f"research request {request.request_id} commerce mode requires consumer_capability=commerce_research"
-            )
-        if request.trigger_type == "explicit_platform_request" and request.mode not in {
-            "marketplace",
-            "social_content",
-        }:
-            errors.append(
-                f"research request {request.request_id} explicit platform trigger requires commerce mode"
-            )
-        if request.trigger_type != "explicit_platform_request" and request.mode in {
-            "marketplace",
-            "social_content",
-        }:
-            errors.append(
-                f"research request {request.request_id} commerce mode requires explicit_platform_request"
-            )
-        if request.trigger_type == "knowledge_bridge" and not request.local_catalog_gap.strip():
-            errors.append(f"research request {request.request_id} knowledge_bridge requires local_catalog_gap")
-        if request.mode in {"marketplace", "social_content"} and not request.platforms:
-            errors.append(f"research request {request.request_id} requires at least one platform")
-        if request.mode in {"marketplace", "social_content"}:
-            unsupported = sorted(set(request.platforms) - COMMERCE_RESEARCH_PLATFORMS)
-            if unsupported:
+        if not intent.goal.strip() or not intent.resolved_query.strip():
+            errors.append(f"intent {intent.intent_id} requires goal and resolved_query")
+        for constraint in intent.constraints:
+            if constraint.source == "long_term_profile" and constraint.strength == "hard":
                 errors.append(
-                    f"research request {request.request_id} uses unsupported commerce platforms {unsupported}"
+                    f"intent {intent.intent_id} long_term_profile constraints must be soft"
+                )
+        for need in intent.product_needs:
+            if not need.need_id.strip():
+                errors.append(f"intent {intent.intent_id} has an empty product need_id")
+                continue
+            if need.need_id in need_owner:
+                errors.append(
+                    f"duplicate product need_id {need.need_id} in intents "
+                    f"{need_owner[need.need_id]} and {intent.intent_id}"
+                )
+            need_owner[need.need_id] = intent.intent_id
+            if not need.goal.strip():
+                errors.append(f"product need {need.need_id} requires a goal")
+            for constraint in need.constraints:
+                if constraint.source == "long_term_profile" and constraint.strength == "hard":
+                    errors.append(
+                        f"product need {need.need_id} long_term_profile constraints must be soft"
+                    )
+        policy = intent.recommendation_policy
+        if intent.intent_type == "product_recommendation":
+            if (
+                policy.candidate_source in {"context_only", "context_plus_new"}
+                and not intent.referenced_product_ids
+            ):
+                errors.append(
+                    f"recommendation intent {intent.intent_id} uses "
+                    f"{policy.candidate_source} without referenced_product_ids"
+                )
+            if (
+                policy.reference_policy != "none"
+                and not intent.referenced_product_ids
+            ):
+                errors.append(
+                    f"recommendation intent {intent.intent_id} uses "
+                    f"{policy.reference_policy} without referenced_product_ids"
+                )
+            if (
+                policy.requested_count is None
+                and policy.count_mode != "unknown"
+            ):
+                errors.append(
+                    f"recommendation intent {intent.intent_id} has count_mode "
+                    "without requested_count"
                 )
 
-    proposal_ids = [proposal.proposal_id.strip() for proposal in plan.agent_proposals]
-    _validate_unique_non_empty("proposal_id", proposal_ids, errors)
-    proposal_capabilities = [proposal.capability for proposal in plan.agent_proposals]
-    duplicate_capabilities = sorted(
-        {
-            capability
-            for capability in proposal_capabilities
-            if proposal_capabilities.count(capability) > 1
-        }
-    )
-    if duplicate_capabilities:
-        errors.append(f"duplicate proposal capabilities: {duplicate_capabilities}")
-    proposal_id_set = set(proposal_ids)
-    proposal_dependencies = {proposal.proposal_id: proposal.depends_on for proposal in plan.agent_proposals}
-    _validate_dependencies("proposal", proposal_dependencies, proposal_id_set, errors)
-    optional_dependencies = {
-        proposal.proposal_id: proposal.optional_context_from
-        for proposal in plan.agent_proposals
-    }
+    task_ids = [item.task_id.strip() for item in plan.task_proposals]
+    _validate_unique_non_empty("task_id", task_ids, errors)
+    known_tasks = set(task_ids)
+    known_intents = set(intent_ids)
+    dependencies = {item.task_id: item.depends_on for item in plan.task_proposals}
+    _validate_dependencies("task", dependencies, known_tasks, errors)
     _validate_dependency_references(
-        "proposal optional_context_from",
-        optional_dependencies,
-        proposal_id_set,
+        "task optional_context_from",
+        {item.task_id: item.optional_context_from for item in plan.task_proposals},
+        known_tasks,
         errors,
     )
-    for proposal in plan.agent_proposals:
-        definition = resolved_catalog.get(proposal.capability)
+
+    for task in plan.task_proposals:
+        definition = resolved_catalog.get(task.capability)
         if definition is None:
-            errors.append(f"proposal {proposal.proposal_id} uses unknown capability {proposal.capability}")
+            errors.append(f"task {task.task_id} uses unknown capability {task.capability}")
         elif not definition.planner_proposable:
             errors.append(
-                f"proposal {proposal.proposal_id} cannot request Supervisor-managed capability {proposal.capability}"
+                f"task {task.task_id} cannot request Supervisor-managed capability {task.capability}"
             )
-        unknown_intents = set(proposal.intent_ids) - intent_id_set
-        if unknown_intents:
+        if len(task.intent_ids) != 1:
             errors.append(
-                f"proposal {proposal.proposal_id} references unknown intent_ids {sorted(unknown_intents)}"
+                f"task {task.task_id} must belong to exactly one intent; split independent work into separate tasks"
             )
-        overlap = set(proposal.depends_on).intersection(proposal.optional_context_from)
+            continue
+        intent_id = task.intent_ids[0]
+        if intent_id not in known_intents:
+            errors.append(f"task {task.task_id} references unknown intent_id {intent_id}")
+            continue
+        overlap = set(task.depends_on).intersection(task.optional_context_from)
         if overlap:
             errors.append(
-                f"proposal {proposal.proposal_id} cannot use the same dependency as hard and optional: {sorted(overlap)}"
+                f"task {task.task_id} cannot use the same dependency as hard and optional: {sorted(overlap)}"
             )
-
-    proposals_by_capability = {
-        proposal.capability: proposal for proposal in plan.agent_proposals
-    }
-    for request in plan.research_requests:
-        consumer = proposals_by_capability.get(request.consumer_capability)
-        if consumer is None or request.intent_id not in consumer.intent_ids:
+        intent = intent_by_id[intent_id]
+        selected_need_ids = task.parameters.product_need_ids
+        unknown_needs = [
+            need_id
+            for need_id in selected_need_ids
+            if need_owner.get(need_id) != intent_id
+        ]
+        if unknown_needs:
             errors.append(
-                f"research request {request.request_id} has no matching consumer proposal"
+                f"task {task.task_id} references product needs outside intent {intent_id}: {unknown_needs}"
+            )
+        effective_needs = [
+            need
+            for need in intent.product_needs
+            if not selected_need_ids or need.need_id in selected_need_ids
+        ]
+        if task.capability == "multi_product_bundle" and len(effective_needs) < 2:
+            errors.append(f"task {task.task_id} multi_product_bundle requires at least two product needs")
+        if task.capability == "single_product_recommendation" and len(effective_needs) > 1:
+            errors.append(
+                f"task {task.task_id} single_product_recommendation cannot own multiple product needs"
+            )
+        if (
+            intent.recommendation_policy.candidate_source == "context_only"
+            and task.capability
+            in {"single_product_recommendation", "multi_product_bundle"}
+        ):
+            errors.append(
+                f"context-only recommendation intent {intent_id} must not create "
+                f"product retrieval task {task.task_id}"
             )
 
-    proposed_capabilities = {proposal.capability for proposal in plan.agent_proposals}
-    expected_capability = {
-        "clarify": "clarification",
-        "single_product": "single_product_recommendation",
-        "multi_product": "multi_product_bundle",
-    }.get(plan.execution_mode)
-    if expected_capability and expected_capability not in proposed_capabilities:
-        errors.append(f"execution_mode={plan.execution_mode} requires proposal capability {expected_capability}")
-    if "profile_preference" in proposed_capabilities and not any(
-        request.context_type == "long_term_profile" for request in plan.context_requests
-    ):
-        errors.append("profile_preference proposal requires a long_term_profile context request")
+    covered_intents = {
+        intent_id
+        for task in plan.task_proposals
+        for intent_id in task.intent_ids
+    }
+    for intent in plan.intents:
+        if intent.priority != "required" or intent.intent_type == "social_chat":
+            continue
+        if _is_context_only_recommendation(intent):
+            continue
+        if intent.intent_id not in covered_intents:
+            errors.append(f"required intent {intent.intent_id} has no task proposal")
 
     if errors:
         raise IntentPlanContractError(errors)
+
+
+def _is_context_only_recommendation(intent) -> bool:
+    return bool(
+        intent.intent_type == "product_recommendation"
+        and intent.recommendation_policy.candidate_source == "context_only"
+        and intent.referenced_product_ids
+    )
 
 
 def _validate_unique_non_empty(label: str, values: list[str], errors: list[str]) -> None:
@@ -224,10 +190,8 @@ def _validate_dependencies(
     known_ids: set[str],
     errors: list[str],
 ) -> None:
+    _validate_dependency_references(label, dependencies, known_ids, errors)
     for node_id, dependency_ids in dependencies.items():
-        unknown = set(dependency_ids) - known_ids
-        if unknown:
-            errors.append(f"{label} {node_id} has unknown dependencies {sorted(unknown)}")
         if node_id in dependency_ids:
             errors.append(f"{label} {node_id} cannot depend on itself")
     cycle = _find_cycle(dependencies)
@@ -244,12 +208,12 @@ def _validate_dependency_references(
     for node_id, dependency_ids in dependencies.items():
         unknown = set(dependency_ids) - known_ids
         if unknown:
-            errors.append(f"{label} {node_id} has unknown references {sorted(unknown)}")
-        if node_id in dependency_ids:
-            errors.append(f"{label} {node_id} cannot reference itself")
+            errors.append(f"{label} {node_id} has unknown dependencies {sorted(unknown)}")
+        if len(dependency_ids) != len(set(dependency_ids)):
+            errors.append(f"{label} {node_id} has duplicate dependencies")
 
 
-def _find_cycle(dependencies: dict[str, Iterable[str]]) -> list[str]:
+def _find_cycle(dependencies: dict[str, list[str]]) -> list[str]:
     visiting: list[str] = []
     visited: set[str] = set()
 
@@ -261,8 +225,6 @@ def _find_cycle(dependencies: dict[str, Iterable[str]]) -> list[str]:
             return []
         visiting.append(node_id)
         for dependency_id in dependencies.get(node_id, []):
-            if dependency_id not in dependencies:
-                continue
             cycle = visit(dependency_id)
             if cycle:
                 return cycle
@@ -270,8 +232,8 @@ def _find_cycle(dependencies: dict[str, Iterable[str]]) -> list[str]:
         visited.add(node_id)
         return []
 
-    for candidate in dependencies:
-        cycle = visit(candidate)
+    for node_id in dependencies:
+        cycle = visit(node_id)
         if cycle:
             return cycle
     return []

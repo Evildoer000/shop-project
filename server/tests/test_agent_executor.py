@@ -389,7 +389,8 @@ def test_executor_blocks_required_dependents_after_failure() -> None:
 
     assert report.succeeded is False
     assert report.failed_node_ids == ["failed"]
-    assert graph.require_node("dependent").status == "pending"
+    assert graph.require_node("dependent").status == "skipped"
+    assert report.blocked_node_ids == ["dependent"]
 
 
 def test_executor_closing_stream_cancels_running_agent_and_finishes_span() -> None:

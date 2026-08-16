@@ -15,7 +15,7 @@ from app.domain.tools.commerce_mcp import (
     _normalize_response,
 )
 from app.harness.tool_registry import ToolRegistry
-from app.schemas import IntentItem, IntentPlan
+from app.schemas import IntentItem, IntentPlanV3, IntentRouteBasis
 
 
 class FakeCommerceTransport(CommerceMcpTransport):
@@ -110,15 +110,15 @@ def test_commerce_agent_deeply_enriches_at_most_two_search_results() -> None:
                 task_id="t_commerce:commerce",
                 agent_id="commerce_research_agent",
                 capability="commerce_research",
+                intent_ids=["i1"],
                 metadata={
-                    "research_requests": [
-                        {
-                            "request_id": "r_xhs",
-                            "mode": "social_content",
-                            "platforms": ["xiaohongshu"],
-                            "query": "油皮防晒评价",
-                        }
-                    ]
+                    "planner_task_id": "t_xhs",
+                    "parameters": {
+                        "platforms": ["xiaohongshu"],
+                        "query": "油皮防晒评价",
+                        "trigger_type": "explicit_platform_request",
+                        "trigger_text": "小红书",
+                    },
                 },
             )
         ],
@@ -130,18 +130,23 @@ def test_commerce_agent_deeply_enriches_at_most_two_search_results() -> None:
         user_id="u1",
         session_id="s1",
         turn_id=graph.turn_id,
-        intent_plan=IntentPlan(
+        intent_plan=IntentPlanV3(
             original_query="看看小红书评价",
             normalized_query="看看小红书评价",
-            primary_intent="product_comparison",
             intents=[
                 IntentItem(
                     intent_id="i1",
                     intent_type="product_comparison",
                     goal="查看口碑",
+                    resolved_query="查看小红书油皮防晒口碑",
+                    route_basis=IntentRouteBasis(
+                        target_clarity="context_product",
+                        external_information_need="explicit_platform",
+                        trigger_text="小红书",
+                        product_family="防晒霜",
+                    ),
                 )
             ],
-            execution_mode="context_evidence",
         ),
     )
 

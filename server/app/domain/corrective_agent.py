@@ -141,31 +141,59 @@ class CorrectiveAgentController:
         ranked: list[tuple[Product, float]],
         vector_scores: dict[str, float],
         keyword_scores: dict[str, float],
+        candidate_sources: dict[str, list[str]] | None = None,
         image_attributes: dict[str, Any] | None = None,
         system_prompt_prefix: str = "",
     ) -> ReflectionResult:
+        policy = intent_plan.recommendation_policy
+        candidate_sources = {
+            product.product_id: list(
+                (candidate_sources or {}).get(product.product_id) or ["retrieved"]
+            )
+            for product, _ in ranked
+        }
         if not ranked:
+            repairable = policy.candidate_source != "context_only"
             return ReflectionResult(
                 has_passed_products=False,
                 reason="No candidate products entered Corrective Agent review.",
                 used_llm=False,
-                fallback_plan="none",
+                quantity_status="unavailable",
+                fallback_plan="none" if repairable else "no_product",
                 repair_hint=RepairHint(
-                    repairable=True,
-                    target_slot_ids=["single"],
+                    repairable=repairable,
+                    target_slot_ids=["single"] if repairable else [],
                     failure_type="no_candidates",
                     reason="No candidate products entered Corrective Agent review.",
                 ),
             )
         review_limit = self._single_review_limit(plan, ranked)
+        review_ranked = ranked[:review_limit]
+        review_ids = [product.product_id for product, _ in review_ranked]
         if not self._llm_is_configured():
-            passed_ids = [product.product_id for product, _ in ranked[:review_limit]]
+            passed_ids = list(review_ids)
+            selected_ids, quantity_status, reference_decisions = (
+                self._finalize_single_selection(
+                    passed_ids=passed_ids,
+                    requested_selected_ids=[],
+                    ranked_ids=review_ids,
+                    referenced_product_ids=intent_plan.referenced_product_ids,
+                    candidate_sources=candidate_sources,
+                    reference_policy=policy.reference_policy,
+                    requested_count=policy.requested_count,
+                    count_mode=policy.count_mode,
+                )
+            )
             return ReflectionResult(
-                has_passed_products=bool(passed_ids),
+                has_passed_products=bool(selected_ids),
                 reason="LLM is not configured; using ranked candidates as semantic fallback.",
                 used_llm=False,
+                verified_product_ids=passed_ids,
                 passed_product_ids=passed_ids,
-                fallback_plan="none" if passed_ids else "no_product",
+                selected_product_ids=selected_ids,
+                quantity_status=quantity_status,
+                reference_decisions=reference_decisions,
+                fallback_plan="none" if selected_ids else "no_product",
             )
 
         candidates = [
@@ -184,13 +212,22 @@ class CorrectiveAgentController:
                 "rerank_score": round(rerank_score, 4),
                 "vector_score": round(vector_scores.get(product.product_id, 0.0), 4),
                 "keyword_score": round(keyword_scores.get(product.product_id, 0.0), 4),
+                "sources": candidate_sources.get(product.product_id, ["retrieved"]),
+                "is_explicit_reference": product.product_id
+                in set(intent_plan.referenced_product_ids),
+                "reference_policy": (
+                    policy.reference_policy
+                    if "context"
+                    in candidate_sources.get(product.product_id, ["retrieved"])
+                    else "none"
+                ),
             }
-            for product, rerank_score in ranked[:review_limit]
+            for product, rerank_score in review_ranked
         ]
-        valid_ids = {product.product_id for product, _ in ranked}
+        valid_ids = set(review_ids)
         system_prompt = system_prompt_prefix + ("\n\n" if system_prompt_prefix else "") + (
-            "你是电商 RAG Harness 的 CorrectiveAgent（证据反射 Worker Agent）。只输出 JSON object，不要输出 Markdown。\n"
-            "你的职责是审核 rerank 后的候选商品证据是否真的支撑当前用户需求；你不决定 final_route，不生成回答。\n"
+            "你是电商 RAG Harness 的 CorrectiveAgent（证据反射 Worker Agent），负责证据校验与最终候选选择。只输出 JSON object，不要输出 Markdown。\n"
+            "你的职责分两步：先审核统一候选池里的商品证据是否支撑当前需求，再从通过集合中选择本轮正式推荐商品；你不生成回答。\n"
             "只能依据输入候选证据，不得补充商品、价格、库存、优惠、功效或用户没有说过的约束。\n"
             "必须重点检查商品形态、商品族、核心功能、使用场景、适用对象、用户明确偏好、排除项和商品证据。\n\n"
             "## 语义审核标准\n"
@@ -219,10 +256,20 @@ class CorrectiveAgentController:
             "- 如果用户确实有购物意图但商品需求缺关键条件，设置 fallback_plan='clarify'。\n"
             "- 如果商品需求明确但候选都不匹配，设置 fallback_plan='no_product'。\n"
             "- fallback_plan 只是给 Orchestrator 的反射建议，不是 final_route。\n\n"
+            "## 上下文商品与最终选择\n"
+            "- candidates.sources=context 表示商品来自本会话真实引用；retrieved 表示来自本轮检索；同一商品可以同时有两种来源。\n"
+            "- passed_product_ids 是语义校验通过集合；selected_product_ids 是按 recommendation_policy 选择的正式推荐集合，必须是 passed_product_ids 的有序子集。\n"
+            "- must_include：上下文商品只有在语义校验通过时才必须进入 selected_product_ids；不匹配硬约束时仍应拒绝并说明原因。\n"
+            "- eligible：上下文商品和新召回商品同池竞争，不保证入选；comparison_only：上下文商品不得进入 selected_product_ids。\n"
+            "- exact/at_most/at_least 必须按 requested_count 选择；通过商品不足时如实返回 partial，不得补造商品。\n"
+            "- selected_product_ids 的顺序就是最终推荐顺序；优先选择证据最充分、最符合硬约束和用户当前目标的商品。\n\n"
             "返回 JSON schema: {"
             "\"reason\":\"中文原因\","
             "\"fallback_plan\":\"none|direct_answer|clarify|no_product\","
             "\"passed_product_ids\":[\"...\"],"
+            "\"selected_product_ids\":[\"...\"],"
+            "\"quantity_status\":\"met|partial|unavailable|constraint_conflict\","
+            "\"reference_decisions\":[{\"product_id\":\"...\",\"decision\":\"selected|verified_not_selected|rejected_or_missing|comparison_only\",\"reason\":\"中文原因\"}],"
             "\"rejected_products\":[{\"product_id\":\"...\",\"reason\":\"中文拒绝原因\"}],"
             "\"repair_hint\":{\"repairable\":false,\"target_slot_ids\":[\"single\"],\"failure_type\":\"\",\"missing_terms\":[\"...\"],\"avoid_terms\":[\"...\"],\"reason\":\"中文诊断原因\"}"
             "}"
@@ -232,6 +279,7 @@ class CorrectiveAgentController:
                 "original_query": original_query,
                 "intent_plan": intent_plan.model_dump(),
                 "query_plan": plan.model_dump(),
+                "recommendation_policy": policy.model_dump(),
                 "image_attributes": image_attributes or {},
                 "candidates": candidates,
             },
@@ -254,28 +302,165 @@ class CorrectiveAgentController:
                 used_llm=True,
                 rejected_products=[
                     {"product_id": product.product_id, "reason": "Corrective Agent output validation failed."}
-                    for product, _ in ranked[:review_limit]
+                    for product, _ in review_ranked
                 ],
+                quantity_status="unavailable",
                 fallback_plan="no_product",
             )
 
-        passed_ids = [product_id for product_id in self._string_list(data.get("passed_product_ids")) if product_id in valid_ids]
+        passed_ids = self._unique(
+            [
+                product_id
+                for product_id in self._string_list(data.get("passed_product_ids"))
+                if product_id in valid_ids
+            ]
+        )
+        requested_selected_ids = self._unique(
+            [
+                product_id
+                for product_id in self._string_list(data.get("selected_product_ids"))
+                if product_id in valid_ids
+            ]
+        )
+        selected_ids, quantity_status, reference_decisions = (
+            self._finalize_single_selection(
+                passed_ids=passed_ids,
+                requested_selected_ids=requested_selected_ids,
+                ranked_ids=review_ids,
+                referenced_product_ids=intent_plan.referenced_product_ids,
+                candidate_sources=candidate_sources,
+                reference_policy=policy.reference_policy,
+                requested_count=policy.requested_count,
+                count_mode=policy.count_mode,
+            )
+        )
         rejected_products = data.get("rejected_products") if isinstance(data.get("rejected_products"), list) else []
         fallback_plan = self._fallback_plan(data.get("fallback_plan"))
-        if passed_ids:
+        if selected_ids:
             fallback_plan = "none"
         repair_hint = self._repair_hint(data.get("repair_hint"), fallback_plan, default_slot_ids=["single"])
-        if passed_ids:
+        if quantity_status == "partial" and policy.candidate_source != "context_only":
+            repair_hint = RepairHint(
+                repairable=True,
+                target_slot_ids=["single"],
+                failure_type="insufficient_verified_candidates",
+                reason=(
+                    f"用户要求 {policy.requested_count} 个商品，但当前只能选择 "
+                    f"{len(selected_ids)} 个通过校验的候选。"
+                ),
+            )
+        elif selected_ids:
             repair_hint = RepairHint()
+        reason = str(data.get("reason") or "")
+        if quantity_status == "partial" and policy.requested_count is not None:
+            reason = (
+                f"{reason} 当前要求 {policy.requested_count} 个，"
+                f"最终有 {len(selected_ids)} 个候选满足校验。"
+            ).strip()
         return ReflectionResult(
-            has_passed_products=bool(passed_ids),
-            reason=str(data.get("reason") or ""),
+            has_passed_products=bool(selected_ids),
+            reason=reason,
             used_llm=True,
+            verified_product_ids=passed_ids,
             passed_product_ids=passed_ids,
+            selected_product_ids=selected_ids,
+            quantity_status=quantity_status,
+            reference_decisions=reference_decisions,
             rejected_products=rejected_products,
             fallback_plan=fallback_plan,
             repair_hint=repair_hint,
         )
+
+    def _finalize_single_selection(
+        self,
+        *,
+        passed_ids: list[str],
+        requested_selected_ids: list[str],
+        ranked_ids: list[str],
+        referenced_product_ids: list[str],
+        candidate_sources: dict[str, list[str]],
+        reference_policy: str,
+        requested_count: int | None,
+        count_mode: str,
+    ) -> tuple[list[str], str, list[dict[str, str]]]:
+        passed = self._unique(
+            [
+                *[product_id for product_id in passed_ids if product_id in ranked_ids],
+                *[product_id for product_id in ranked_ids if product_id in passed_ids],
+            ]
+        )
+        context_ids = [
+            product_id
+            for product_id in referenced_product_ids
+            if "context" in candidate_sources.get(product_id, [])
+        ]
+        blocked_context_ids = (
+            set(context_ids) if reference_policy == "comparison_only" else set()
+        )
+        selectable = [
+            product_id for product_id in passed if product_id not in blocked_context_ids
+        ]
+        mandatory = (
+            [product_id for product_id in context_ids if product_id in selectable]
+            if reference_policy == "must_include"
+            else []
+        )
+        proposed = [
+            product_id
+            for product_id in requested_selected_ids
+            if product_id in selectable
+        ]
+        ordered_pool = self._unique([*mandatory, *proposed, *selectable])
+
+        target = requested_count if requested_count and requested_count > 0 else None
+        quantity_status = "not_applicable"
+        if count_mode in {"exact", "at_most"} and target is not None:
+            if len(mandatory) > target:
+                selected = list(mandatory)
+                quantity_status = "constraint_conflict"
+            elif count_mode == "exact":
+                selected = ordered_pool[:target]
+                quantity_status = "met" if len(selected) == target else "partial"
+            else:
+                seed = self._unique([*mandatory, *proposed])
+                selected = (seed or ordered_pool)[:target]
+                quantity_status = "met" if selected else "unavailable"
+        elif count_mode == "at_least" and target is not None:
+            seed = self._unique([*mandatory, *proposed])
+            selected = list(seed)
+            for product_id in ordered_pool:
+                if len(selected) >= target:
+                    break
+                if product_id not in selected:
+                    selected.append(product_id)
+            quantity_status = "met" if len(selected) >= target else "partial"
+        else:
+            seed = self._unique([*mandatory, *proposed])
+            selected = (seed or ordered_pool)[:SINGLE_RECOMMENDATION_LIMIT]
+            quantity_status = "met" if selected else "unavailable"
+
+        reference_decisions: list[dict[str, str]] = []
+        for product_id in referenced_product_ids:
+            if product_id in selected:
+                decision = "selected"
+                reason = "上下文商品通过校验并进入正式推荐集合。"
+            elif reference_policy == "comparison_only" and product_id in context_ids:
+                decision = "comparison_only"
+                reason = "该上下文商品只作为比较背景，不进入正式推荐集合。"
+            elif product_id in passed:
+                decision = "verified_not_selected"
+                reason = "商品通过语义校验，但未在数量与排序约束下入选。"
+            else:
+                decision = "rejected_or_missing"
+                reason = "商品未找到本地详情或未通过当前需求校验。"
+            reference_decisions.append(
+                {
+                    "product_id": product_id,
+                    "decision": decision,
+                    "reason": reason,
+                }
+            )
+        return selected, quantity_status, reference_decisions
 
     def _single_review_limit(self, plan: QueryPlan, ranked: list[tuple[Product, float]]) -> int:
         requested = max(SINGLE_RECOMMENDATION_LIMIT, plan.retrieval_strategy.final_top_k)
@@ -790,6 +975,46 @@ class CorrectiveAgentController:
         unknown_passed = [product_id for product_id in passed_ids if product_id not in valid_ids]
         if unknown_passed:
             errors.append(f"passed_product_ids contains unknown ids: {', '.join(unknown_passed)}.")
+        selected_ids = data.get("selected_product_ids")
+        if selected_ids is not None:
+            if not isinstance(selected_ids, list) or not all(
+                isinstance(product_id, str) for product_id in selected_ids
+            ):
+                errors.append("selected_product_ids must be a string array.")
+                selected_ids = []
+            unknown_selected = [
+                product_id
+                for product_id in selected_ids
+                if product_id not in valid_ids
+            ]
+            if unknown_selected:
+                errors.append(
+                    "selected_product_ids contains unknown ids: "
+                    f"{', '.join(unknown_selected)}."
+                )
+            outside_passed = [
+                product_id
+                for product_id in selected_ids
+                if product_id not in passed_ids
+            ]
+            if outside_passed:
+                errors.append(
+                    "selected_product_ids must be a subset of passed_product_ids: "
+                    f"{', '.join(outside_passed)}."
+                )
+        quantity_status = data.get("quantity_status")
+        if quantity_status is not None and quantity_status not in {
+            "met",
+            "partial",
+            "unavailable",
+            "constraint_conflict",
+        }:
+            errors.append("quantity_status is invalid.")
+        reference_decisions = data.get("reference_decisions")
+        if reference_decisions is not None and not isinstance(
+            reference_decisions, list
+        ):
+            errors.append("reference_decisions must be an array.")
         self._validate_rejected_products(data.get("rejected_products"), valid_ids, errors)
         return errors
 

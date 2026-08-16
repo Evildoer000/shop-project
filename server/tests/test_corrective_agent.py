@@ -5,7 +5,7 @@ from decimal import Decimal
 from app.db.models import Product
 from app.domain.corrective_agent import CorrectiveAgentController
 from app.domain.need_slot_schemas import MultiNeedState, NeedSlot, SlotCandidate, SlotCoverageDecision
-from app.schemas import IntentPlan, QueryBudget, QueryPlan
+from app.schemas import IntentPlan, QueryBudget, QueryPlan, RecommendationPolicy
 
 
 class StaticLlmClient:
@@ -117,6 +117,55 @@ def test_single_reflection_passed_products_force_fallback_none() -> None:
     assert result.has_passed_products is True
     assert result.passed_product_ids == ["p1"]
     assert result.fallback_plan == "none"
+
+
+def test_single_reflection_enforces_must_include_and_exact_count() -> None:
+    previous = make_product("previous", "上一轮芦荟面霜", sub_category="面霜")
+    new_a = make_product("new_a", "新召回补水面霜 A", sub_category="面霜")
+    new_b = make_product("new_b", "新召回补水面霜 B", sub_category="面霜")
+    new_c = make_product("new_c", "新召回补水面霜 C", sub_category="面霜")
+    payload = {
+        "reason": "四个候选都符合补水需求。",
+        "fallback_plan": "none",
+        "passed_product_ids": ["previous", "new_a", "new_b", "new_c"],
+        "selected_product_ids": ["new_b", "new_a"],
+        "quantity_status": "met",
+        "reference_decisions": [],
+        "rejected_products": [],
+    }
+    intent_plan = IntentPlan(
+        original_query="算上上一轮这款，总共推荐三个补水面霜",
+        plan_type="single_retrieval",
+        referenced_product_ids=["previous"],
+        recommendation_policy=RecommendationPolicy(
+            candidate_source="context_plus_new",
+            reference_policy="must_include",
+            requested_count=3,
+            count_mode="exact",
+        ),
+    )
+
+    result = asyncio.run(
+        CorrectiveAgentController(StaticLlmClient(payload)).review(
+            intent_plan.original_query,
+            intent_plan,
+            QueryPlan(),
+            [(previous, 0.0), (new_a, 0.9), (new_b, 0.8), (new_c, 0.7)],
+            {"new_a": 0.4, "new_b": 0.3, "new_c": 0.2},
+            {"new_a": 0.5, "new_b": 0.4, "new_c": 0.3},
+            candidate_sources={
+                "previous": ["context"],
+                "new_a": ["retrieved"],
+                "new_b": ["retrieved"],
+                "new_c": ["retrieved"],
+            },
+        )
+    )
+
+    assert result.verified_product_ids == ["previous", "new_a", "new_b", "new_c"]
+    assert result.selected_product_ids == ["previous", "new_b", "new_a"]
+    assert result.quantity_status == "met"
+    assert result.reference_decisions[0]["decision"] == "selected"
 
 
 def test_single_corrective_prompt_keeps_old_semantic_guardrails() -> None:

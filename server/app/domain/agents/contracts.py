@@ -153,6 +153,7 @@ class AgentExecutionContext:
     image_attributes: Any = None
     artifacts: dict[str, Any] = field(default_factory=dict)
     dependency_outputs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    dependency_artifacts: dict[str, dict[str, Any]] = field(default_factory=dict)
     tool_access: Any = None
     prompt_registry: Any = None
     span_recorder: Any = None
@@ -166,7 +167,16 @@ class AgentExecutionContext:
         return self.dependency_outputs.get(node_id, {})
 
     def artifact(self, key: str, default: Any = None) -> Any:
+        for node_artifacts in reversed(list(self.dependency_artifacts.values())):
+            if key in node_artifacts:
+                return node_artifacts[key]
         return self.artifacts.get(key, default)
+
+    def artifact_from(self, node_id: str, key: str, default: Any = None) -> Any:
+        return self.dependency_artifacts.get(node_id, {}).get(key, default)
+
+    def artifacts_from(self, node_id: str) -> dict[str, Any]:
+        return dict(self.dependency_artifacts.get(node_id, {}))
 
     def tool(self, name: str) -> Any:
         if self.tool_access is None:

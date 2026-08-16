@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
-from app.domain.supervisor.agent_registry import AgentRegistry, build_foundation_agent_registry
-from app.domain.supervisor.capability_catalog import CapabilityCatalog, build_default_capability_catalog
+from app.domain.supervisor.agent_registry import (
+    AgentRegistry,
+    build_foundation_agent_registry,
+)
+from app.domain.supervisor.capability_catalog import (
+    CapabilityCatalog,
+    build_default_capability_catalog,
+)
 from app.domain.supervisor.policy_gate import PolicyEvaluation, SupervisorPolicyGate
 from app.domain.supervisor.task_graph import TaskGraph, TaskGraphNode
-from app.schemas import AgentTaskProposal, IntentPlan
+from app.schemas import AgentTaskProposal, IntentItem, IntentPlanV3, IntentProductNeed
 
 
 class SupervisorCompilationError(ValueError):
@@ -16,11 +23,16 @@ class SupervisorCompilationError(ValueError):
 
 
 class SupervisorPolicyRejectedError(SupervisorCompilationError):
-    """The deterministic PolicyGate rejected the Planner proposal."""
+    """The deterministic PolicyGate rejected the complete planner proposal."""
+
+    def __init__(self, evaluation: PolicyEvaluation) -> None:
+        self.evaluation = evaluation
+        self.policy_span_payload: dict | None = None
+        super().__init__(list(evaluation.errors))
 
 
 class SupervisorPlanCompiler:
-    """Compiles an IntentPlan proposal into a deterministic execution DAG."""
+    """Compile intent-scoped V3 tasks into independently executable branches."""
 
     def __init__(
         self,
@@ -32,37 +44,39 @@ class SupervisorPlanCompiler:
         self.registry = registry or build_foundation_agent_registry(self.catalog)
         self.policy_gate = policy_gate or SupervisorPolicyGate(self.registry, self.catalog)
 
-    def compile(self, plan: IntentPlan, *, turn_id: str | None = None) -> TaskGraph:
-        return self.compile_evaluated(
-            plan,
-            evaluation=self.evaluate(plan),
-            turn_id=turn_id,
-        )
+    def compile(self, plan: IntentPlanV3, *, turn_id: str | None = None) -> TaskGraph:
+        return self.compile_evaluated(plan, evaluation=self.evaluate(plan), turn_id=turn_id)
 
-    def evaluate(self, plan: IntentPlan) -> PolicyEvaluation:
+    def evaluate(self, plan: IntentPlanV3) -> PolicyEvaluation:
         return self.policy_gate.evaluate(plan)
 
     def compile_evaluated(
         self,
-        plan: IntentPlan,
+        plan: IntentPlanV3,
         *,
         evaluation: PolicyEvaluation,
         turn_id: str | None = None,
     ) -> TaskGraph:
         if not evaluation.approved:
-            raise SupervisorPolicyRejectedError(evaluation.errors)
+            raise SupervisorPolicyRejectedError(evaluation)
 
         resolved_turn_id = turn_id or uuid.uuid4().hex
         graph = TaskGraph(
+            schema_version="3.0",
             graph_id=uuid.uuid4().hex,
             turn_id=resolved_turn_id,
             metadata={
                 "intent_plan_schema_version": plan.schema_version,
-                "execution_mode": plan.execution_mode,
-                "primary_intent": plan.primary_intent,
-                "input_modalities": list(plan.input_modalities),
+                "intent_order": [intent.intent_id for intent in plan.intents],
+                "intent_goals": {
+                    intent.intent_id: intent.goal for intent in plan.intents
+                },
+                "intent_statuses": {
+                    item.intent_id: item.model_dump() for item in evaluation.intent_statuses
+                },
                 "policy_evaluation": evaluation.model_dump(),
                 "repair_history": [],
+                "branch_terminal_nodes": {},
             },
         )
         intent_node = self._fixed_node(
@@ -70,6 +84,7 @@ class SupervisorPlanCompiler:
             capability="intent_understanding",
             node_id="system:intent_understanding",
             depends_on=[],
+            intent_ids=[intent.intent_id for intent in plan.intents],
             status="succeeded",
             metadata={"plan_schema_version": plan.schema_version},
         )
@@ -79,303 +94,359 @@ class SupervisorPlanCompiler:
             task_id=f"{resolved_turn_id}:policy_gate",
             agent_id="supervisor_policy_gate",
             capability="policy_gate",
+            intent_ids=[intent.intent_id for intent in plan.intents],
             depends_on=[intent_node.node_id],
             status="succeeded",
             metadata={
                 "phase": "initial_policy_approval",
                 "decision_count": len(evaluation.decisions),
-                "approved_proposal_ids": sorted(evaluation.selections),
-                "errors": list(evaluation.errors),
+                "approved_task_ids": sorted(evaluation.selections),
+                "rejected_task_ids": list(evaluation.rejected_task_ids),
                 "implementation": "deterministic_code",
             },
         )
         graph.add_node(policy_node)
 
-        proposal_node_ids = {
-            proposal.proposal_id: f"proposal:{proposal.proposal_id}"
-            for proposal in plan.agent_proposals
-            if proposal.proposal_id in evaluation.selections
-        }
-        profile_proposals = [
-            proposal
-            for proposal in plan.agent_proposals
-            if proposal.proposal_id in evaluation.selections and proposal.capability == "profile_preference"
-        ]
-        needs_intent_refinement = any(
-            request.context_type == "long_term_profile" and request.usage == "intent_refinement"
-            for request in plan.context_requests
+        task_outputs = self._append_task_nodes(
+            graph,
+            plan,
+            evaluation,
+            root_node_id=policy_node.node_id,
+            prefix="proposal",
         )
-        refine_node_id = ""
-        refine_policy_node_id = ""
-        if needs_intent_refinement and profile_proposals:
-            refine_node_id = "system:intent_refinement"
-            refine_policy_node_id = "system:policy_gate:refinement"
+        self._append_branch_boundaries(graph, plan, evaluation, task_outputs)
+        graph.refresh_terminal_nodes()
+        graph.terminal_node_ids = ["system:memory_distillation"]
+        graph.validate_graph()
+        return graph
 
-        for proposal in plan.agent_proposals:
-            selected_agent_id = evaluation.selections.get(proposal.proposal_id)
-            if not selected_agent_id:
-                continue
-            dependency_ids = [
-                proposal_node_ids[dependency_id]
-                for dependency_id in proposal.depends_on
-                if dependency_id in proposal_node_ids
+    def append_revised_branch(
+        self,
+        graph: TaskGraph,
+        plan: IntentPlanV3,
+        evaluation: PolicyEvaluation,
+        *,
+        intent_id: str,
+        root_node_id: str,
+        prefix: str,
+    ) -> list[str]:
+        """Append one evidence-informed intent revision without touching siblings."""
+        if not evaluation.approved:
+            return []
+        task_outputs = self._append_task_nodes(
+            graph,
+            plan,
+            evaluation,
+            root_node_id=root_node_id,
+            prefix=prefix,
+        )
+        tasks = [
+            task
+            for task in plan.task_proposals
+            if task.task_id in task_outputs and intent_id in task.intent_ids
+        ]
+        answer = graph.require_node("system:answer_generation")
+        old_terminal = str(
+            graph.metadata.get("branch_terminal_nodes", {}).get(intent_id) or ""
+        )
+        clarification = next(
+            (task_outputs[task.task_id] for task in tasks if task.capability == "clarification"),
+            "",
+        )
+        if clarification:
+            verifier = graph.get_node(f"system:verify:{intent_id}")
+            if verifier is not None and verifier.status == "pending":
+                verifier.status = "skipped"
+                verifier.metadata["skipped_reason"] = "intent_replanned_to_clarification"
+            new_terminal = clarification
+        else:
+            evidence_outputs = self._leaf_evidence_outputs(tasks, task_outputs)
+            verifier = graph.get_node(f"system:verify:{intent_id}")
+            if verifier is not None and evidence_outputs:
+                verifier.depends_on = _unique([*verifier.depends_on, *evidence_outputs])
+                verifier.input_refs = [
+                    value for value in verifier.input_refs if value not in evidence_outputs
+                ]
+                verifier.metadata["revision_root_node_id"] = root_node_id
+                verifier.metadata["evidence_node_ids"] = list(verifier.depends_on)
+                new_terminal = verifier.node_id
+                if any(task.capability == "multi_product_bundle" for task in tasks):
+                    optimizer_id = f"system:optimize:{intent_id}"
+                    optimizer = graph.get_node(optimizer_id)
+                    if optimizer is None:
+                        optimizer = self._fixed_node(
+                            graph,
+                            capability="bundle_optimization",
+                            node_id=optimizer_id,
+                            depends_on=[verifier.node_id],
+                            intent_ids=[intent_id],
+                        )
+                    new_terminal = optimizer.node_id
+            else:
+                new_terminal = old_terminal or root_node_id
+
+        if old_terminal:
+            answer.depends_on = [
+                new_terminal if value == old_terminal else value
+                for value in answer.depends_on
             ]
-            optional_input_ids = [
-                proposal_node_ids[dependency_id]
-                for dependency_id in proposal.optional_context_from
-                if dependency_id in proposal_node_ids
-                and dependency_id not in dependency_ids
+        elif new_terminal not in answer.depends_on:
+            answer.depends_on.append(new_terminal)
+        answer.depends_on = _unique(answer.depends_on)
+        graph.metadata.setdefault("branch_terminal_nodes", {})[intent_id] = new_terminal
+        graph.metadata.setdefault("intent_revisions", []).append(
+            {
+                "intent_id": intent_id,
+                "root_node_id": root_node_id,
+                "task_node_ids": list(task_outputs.values()),
+                "terminal_node_id": new_terminal,
+            }
+        )
+        graph.refresh_terminal_nodes()
+        graph.terminal_node_ids = ["system:memory_distillation"]
+        graph.validate_graph()
+        return list(task_outputs.values())
+
+    def _append_task_nodes(
+        self,
+        graph: TaskGraph,
+        plan: IntentPlanV3,
+        evaluation: PolicyEvaluation,
+        *,
+        root_node_id: str,
+        prefix: str,
+    ) -> dict[str, str]:
+        approved_tasks = [
+            task for task in plan.task_proposals if task.task_id in evaluation.selections
+        ]
+        node_ids = {
+            task.task_id: f"{prefix}:{task.task_id}" for task in approved_tasks
+        }
+        for task in approved_tasks:
+            registration = self.registry.require(evaluation.selections[task.task_id])
+            hard_dependencies = [
+                node_ids[dependency_id]
+                for dependency_id in task.depends_on
+                if dependency_id in node_ids
             ]
-            if not dependency_ids:
-                if refine_policy_node_id and proposal.capability != "profile_preference":
-                    dependency_ids = [refine_policy_node_id]
-                else:
-                    dependency_ids = [policy_node.node_id]
-            elif policy_node.node_id not in dependency_ids:
-                dependency_ids.append(policy_node.node_id)
-            registration = self.registry.require(selected_agent_id)
-            context_request = next(
-                (
-                    request
-                    for request in plan.context_requests
-                    if proposal.capability == "profile_preference"
-                    and request.context_type == "long_term_profile"
-                ),
-                None,
-            )
+            hard_dependencies = _unique([*hard_dependencies, root_node_id])
+            optional_inputs = [
+                node_ids[dependency_id]
+                for dependency_id in task.optional_context_from
+                if dependency_id in node_ids and node_ids[dependency_id] not in hard_dependencies
+            ]
             graph.add_node(
                 TaskGraphNode(
-                    node_id=proposal_node_ids[proposal.proposal_id],
-                    task_id=f"{resolved_turn_id}:{proposal.proposal_id}",
-                    agent_id=selected_agent_id,
-                    capability=proposal.capability,
-                    intent_ids=list(proposal.intent_ids),
-                    depends_on=dependency_ids,
-                    input_refs=optional_input_ids,
-                    # Ranking-only profile context may improve ordering but can
-                    # never block the user's core product task when unavailable.
-                    required=proposal.proposal_id in evaluation.core_proposal_ids,
+                    node_id=node_ids[task.task_id],
+                    task_id=f"{graph.turn_id}:{prefix}:{task.task_id}",
+                    agent_id=registration.manifest.agent_id,
+                    capability=task.capability,
+                    intent_ids=list(task.intent_ids),
+                    depends_on=hard_dependencies,
+                    input_refs=optional_inputs,
+                    required=task.task_id in evaluation.required_task_ids,
                     max_attempts=registration.manifest.max_attempts,
                     metadata={
-                        "proposal_id": proposal.proposal_id,
-                        "reason": proposal.reason,
+                        "planner_task_id": task.task_id,
+                        "objective": task.objective,
+                        "reason": task.reason,
+                        "parameters": task.parameters.model_dump(),
                         "allowed_tools": list(registration.manifest.allowed_tools),
-                        "research_requests": [
-                            request.model_dump()
-                            for request in plan.research_requests
-                            if request.request_id in evaluation.approved_research_request_ids
-                            and request.consumer_capability == proposal.capability
-                            and request.intent_id in proposal.intent_ids
-                        ],
-                        "approved_research_request_ids": [
-                            request.request_id
-                            for request in plan.research_requests
-                            if request.request_id in evaluation.approved_research_request_ids
-                            and request.consumer_capability == proposal.capability
-                            and request.intent_id in proposal.intent_ids
-                        ],
-                        "effective_core": proposal.proposal_id in evaluation.core_proposal_ids,
-                        **(
-                            {
-                                "query": context_request.query,
-                                "usage": context_request.usage,
-                                "context_request_id": context_request.request_id,
-                            }
-                            if context_request is not None
-                            else {}
-                        ),
+                        "supervisor_approved": True,
                     },
                 )
             )
 
-        if refine_node_id:
-            profile_node_ids = [proposal_node_ids[proposal.proposal_id] for proposal in profile_proposals]
-            self._fixed_node(
-                graph,
-                capability="intent_understanding",
-                node_id=refine_node_id,
-                depends_on=[policy_node.node_id],
-                input_refs=profile_node_ids,
-                attempt=2,
-                metadata={"reason": "Long-term profile was explicitly requested for intent refinement."},
-            )
-            self._fixed_node(
-                graph,
-                capability="policy_gate",
-                node_id=refine_policy_node_id,
-                depends_on=[refine_node_id],
-                metadata={
-                    "phase": "profile_refinement_policy_approval",
-                    "implementation": "deterministic_code",
-                },
-            )
-
-        proposal_nodes = [
-            graph.require_node(proposal_node_ids[proposal_id])
-            for proposal_id in proposal_node_ids
-        ]
-        if refine_policy_node_id:
-            for node in proposal_nodes:
-                if node.capability == "profile_preference":
-                    continue
-                node.depends_on = _unique([*node.depends_on, refine_policy_node_id])
-        profile_node_ids = [
-            node.node_id for node in proposal_nodes if node.capability == "profile_preference"
-        ]
-        ranking_profile_requested = any(
-            request.context_type == "long_term_profile" and request.usage == "ranking_only"
-            for request in plan.context_requests
-        )
-        if ranking_profile_requested and profile_node_ids:
-            for node in proposal_nodes:
-                if node.capability not in {"single_product_recommendation", "multi_product_bundle"}:
-                    continue
-                if refine_policy_node_id and refine_policy_node_id in node.depends_on:
-                    continue
-                node.input_refs = _unique([*node.input_refs, *profile_node_ids])
-
-        # A bundle has an explicit dispatch node, one isolated retrieval node per
-        # slot, and a merge node. This keeps parallel slot work visible in the
-        # execution graph without allowing a slot to see its siblings' inputs.
-        bundle_dispatch_ids: set[str] = set()
-        bundle_merge_ids: set[str] = set()
-        for bundle_node in [node for node in proposal_nodes if node.capability == "multi_product_bundle"]:
-            bundle_dispatch_ids.add(bundle_node.node_id)
+        task_outputs = dict(node_ids)
+        for task in approved_tasks:
+            if task.capability != "multi_product_bundle":
+                continue
+            dispatch = graph.require_node(node_ids[task.task_id])
+            intent = self._intent_for_task(plan, task)
+            needs = self._selected_needs(intent, task) if intent is not None else []
             slot_node_ids: list[str] = []
-            for slot in plan.need_slots:
-                slot_node_id = f"{bundle_node.node_id}:slot:{slot.slot_id}"
-                self._fixed_node(
+            required_slot_ids: list[str] = []
+            optional_slot_ids: list[str] = []
+            for need in needs:
+                slot_node_id = f"{dispatch.node_id}:slot:{need.need_id}"
+                slot = self._need_payload(intent, need)
+                slot_node = self._fixed_node(
                     graph,
                     capability="slot_product_retrieval",
                     node_id=slot_node_id,
-                    depends_on=[bundle_node.node_id],
-                    required=slot.need_type == "required",
+                    depends_on=[dispatch.node_id],
+                    intent_ids=list(task.intent_ids),
+                    required=need.priority == "required",
                     metadata={
                         "phase": "slot_retrieval",
-                        "parent_bundle_node_id": bundle_node.node_id,
-                        "slot": slot.model_dump(),
+                        "parent_bundle_node_id": dispatch.node_id,
+                        "planner_task_id": task.task_id,
+                        "slot": slot,
                     },
                 )
-                slot_node_ids.append(slot_node_id)
-            merge_node_id = f"{bundle_node.node_id}:merge"
-            required_slot_ids = [
-                node_id
-                for node_id, slot in zip(slot_node_ids, plan.need_slots)
-                if slot.need_type == "required"
-            ]
-            optional_slot_ids = [
-                node_id
-                for node_id, slot in zip(slot_node_ids, plan.need_slots)
-                if slot.need_type == "optional"
-            ]
-            merge_dependencies = required_slot_ids or [bundle_node.node_id]
-            merge_node = self._fixed_node(
+                slot_node_ids.append(slot_node.node_id)
+                (required_slot_ids if need.priority == "required" else optional_slot_ids).append(
+                    slot_node.node_id
+                )
+            merge_node_id = f"{dispatch.node_id}:merge"
+            merge = self._fixed_node(
                 graph,
                 capability="multi_product_bundle",
                 node_id=merge_node_id,
-                depends_on=merge_dependencies,
+                depends_on=required_slot_ids or [dispatch.node_id],
                 input_refs=optional_slot_ids,
-                required=bundle_node.required,
+                intent_ids=list(task.intent_ids),
+                required=dispatch.required,
                 metadata={
                     "phase": "merge_slot_evidence",
-                    "dispatch_node_id": bundle_node.node_id,
+                    "dispatch_node_id": dispatch.node_id,
                     "slot_node_ids": slot_node_ids,
+                    "planner_task_id": task.task_id,
                 },
             )
-            bundle_merge_ids.add(merge_node.node_id)
-
-            # Downstream proposals consume the merged bundle evidence, never the
-            # coordinator's pre-retrieval dispatch output.
+            task_outputs[task.task_id] = merge.node_id
             for node in graph.nodes:
-                if node.node_id in bundle_dispatch_ids or node.node_id in bundle_merge_ids or node.node_id in slot_node_ids:
+                if node.node_id in {dispatch.node_id, merge.node_id, *slot_node_ids}:
                     continue
-                if bundle_node.node_id not in node.depends_on:
-                    if bundle_node.node_id not in node.input_refs:
-                        continue
-                    node.input_refs = [
-                        merge_node_id if dependency_id == bundle_node.node_id else dependency_id
-                        for dependency_id in node.input_refs
-                    ]
-                else:
-                    node.depends_on = [
-                        merge_node_id if dependency_id == bundle_node.node_id else dependency_id
-                        for dependency_id in node.depends_on
-                    ]
+                node.depends_on = [
+                    merge.node_id if value == dispatch.node_id else value
+                    for value in node.depends_on
+                ]
+                node.input_refs = [
+                    merge.node_id if value == dispatch.node_id else value
+                    for value in node.input_refs
+                ]
+        return task_outputs
 
-        if plan.execution_mode == "clarify":
-            clarification_nodes = [node for node in proposal_nodes if node.capability == "clarification"]
-            clarification_dependency = [node.node_id for node in clarification_nodes]
-            memory_node = self._fixed_node(
-                graph,
-                capability="memory_distillation",
-                node_id="system:memory_distillation",
-                depends_on=clarification_dependency,
-                asynchronous=True,
-                required=False,
-                metadata={"trigger": "clarification_emitted"},
-            )
-            graph.terminal_node_ids = [memory_node.node_id]
-            graph.validate_graph()
-            return graph
+    def _append_branch_boundaries(
+        self,
+        graph: TaskGraph,
+        plan: IntentPlanV3,
+        evaluation: PolicyEvaluation,
+        task_outputs: dict[str, str],
+    ) -> None:
+        branch_terminals: dict[str, str] = {}
+        profile_nodes: list[str] = []
+        for task in plan.task_proposals:
+            if task.task_id in task_outputs and task.capability == "profile_preference":
+                profile_nodes.append(task_outputs[task.task_id])
 
-        evidence_node_ids = []
-        optional_evidence_node_ids = []
-        for node in graph.nodes:
-            if node.node_id in bundle_dispatch_ids:
-                continue
-            if node.node_id in bundle_merge_ids:
-                (evidence_node_ids if node.required else optional_evidence_node_ids).append(node.node_id)
-                continue
-            if node.capability == "slot_product_retrieval":
-                # The merge node is the single evidence boundary for a bundle.
-                continue
-            definition = self.catalog.get(node.capability)
-            if definition and definition.evidence_producing:
-                (evidence_node_ids if node.required else optional_evidence_node_ids).append(node.node_id)
-        final_dependency_ids: list[str]
-        if evidence_node_ids:
-            verifier_node = self._fixed_node(
-                graph,
-                capability="evidence_verification",
-                node_id="system:evidence_verification",
-                depends_on=_unique(evidence_node_ids),
-                input_refs=_unique(optional_evidence_node_ids + profile_node_ids),
-                metadata={
-                    "evidence_node_ids": evidence_node_ids,
-                    "optional_evidence_node_ids": optional_evidence_node_ids,
-                },
+        for intent in plan.intents:
+            tasks = [
+                task
+                for task in plan.task_proposals
+                if task.task_id in task_outputs and intent.intent_id in task.intent_ids
+            ]
+            clarification = next(
+                (task_outputs[task.task_id] for task in tasks if task.capability == "clarification"),
+                "",
             )
-            final_dependency_ids = [verifier_node.node_id]
-            if plan.execution_mode == "multi_product":
-                optimizer_node = self._fixed_node(
+            if clarification:
+                branch_terminals[intent.intent_id] = clarification
+                continue
+            evidence_outputs = self._leaf_evidence_outputs(tasks, task_outputs)
+            context_only = self._is_context_only_recommendation(intent)
+            if evidence_outputs or context_only:
+                verifier = self._fixed_node(
                     graph,
-                    capability="bundle_optimization",
-                    node_id="system:bundle_optimization",
-                    depends_on=[verifier_node.node_id],
+                    capability="evidence_verification",
+                    node_id=f"system:verify:{intent.intent_id}",
+                    depends_on=evidence_outputs or ["system:policy_gate"],
+                    input_refs=[
+                        node_id
+                        for node_id in profile_nodes
+                        if node_id not in evidence_outputs
+                    ],
+                    intent_ids=[intent.intent_id],
+                    metadata={
+                        "evidence_node_ids": evidence_outputs,
+                        "intent_goal": intent.goal,
+                        "candidate_source": intent.recommendation_policy.candidate_source,
+                        "reference_policy": intent.recommendation_policy.reference_policy,
+                        "requested_count": intent.recommendation_policy.requested_count,
+                        "count_mode": intent.recommendation_policy.count_mode,
+                    },
                 )
-                final_dependency_ids = [optimizer_node.node_id]
-        else:
-            final_dependency_ids = [node.node_id for node in proposal_nodes] or [policy_node.node_id]
+                terminal = verifier.node_id
+                if any(task.capability == "multi_product_bundle" for task in tasks):
+                    optimizer = self._fixed_node(
+                        graph,
+                        capability="bundle_optimization",
+                        node_id=f"system:optimize:{intent.intent_id}",
+                        depends_on=[verifier.node_id],
+                        intent_ids=[intent.intent_id],
+                    )
+                    terminal = optimizer.node_id
+                branch_terminals[intent.intent_id] = terminal
+                continue
+            non_profile = [
+                task_outputs[task.task_id]
+                for task in tasks
+                if task.capability != "profile_preference"
+            ]
+            branch_terminals[intent.intent_id] = (
+                non_profile[-1] if non_profile else "system:policy_gate"
+            )
 
-        answer_node = self._fixed_node(
+        answer = self._fixed_node(
             graph,
             capability="answer_generation",
             node_id="system:answer_generation",
-            depends_on=final_dependency_ids,
-            input_refs=profile_node_ids,
+            depends_on=_unique(list(branch_terminals.values())),
+            input_refs=[
+                node_id
+                for node_id in profile_nodes
+                if node_id not in branch_terminals.values()
+            ],
+            intent_ids=[intent.intent_id for intent in plan.intents],
+            dependency_policy="all_terminal",
+            metadata={
+                "intent_order": [intent.intent_id for intent in plan.intents],
+                "branch_terminal_nodes": dict(branch_terminals),
+                "uncovered_required_intent_ids": list(
+                    evaluation.uncovered_required_intent_ids
+                ),
+            },
         )
-        memory_node = self._fixed_node(
+        self._fixed_node(
             graph,
             capability="memory_distillation",
             node_id="system:memory_distillation",
-            depends_on=[answer_node.node_id],
+            depends_on=[answer.node_id],
+            intent_ids=[intent.intent_id for intent in plan.intents],
             asynchronous=True,
             required=False,
             metadata={"trigger": "answer_emitted"},
         )
-        graph.terminal_node_ids = [memory_node.node_id]
-        graph.validate_graph()
-        return graph
+        graph.metadata["branch_terminal_nodes"] = branch_terminals
+
+    def _leaf_evidence_outputs(
+        self,
+        tasks: list[AgentTaskProposal],
+        task_outputs: dict[str, str],
+    ) -> list[str]:
+        task_ids = {task.task_id for task in tasks}
+        depended_on = {
+            dependency_id
+            for task in tasks
+            for dependency_id in task.depends_on
+            if dependency_id in task_ids
+        }
+        leaves = [
+            task
+            for task in tasks
+            if task.task_id not in depended_on
+            and (definition := self.catalog.get(task.capability)) is not None
+            and definition.evidence_producing
+        ]
+        return _unique([task_outputs[task.task_id] for task in leaves])
+
+    def _is_context_only_recommendation(self, intent: IntentItem) -> bool:
+        return bool(
+            intent.intent_type == "product_recommendation"
+            and intent.recommendation_policy.candidate_source == "context_only"
+            and intent.referenced_product_ids
+        )
 
     def schedule_repair(
         self,
@@ -388,105 +459,156 @@ class SupervisorPlanCompiler:
         failed_nodes = [graph.require_node(node_id) for node_id in _unique(failed_node_ids)]
         if not failed_nodes:
             raise SupervisorCompilationError(["repair requires at least one failed node"])
-        invalid_statuses = [node.node_id for node in failed_nodes if node.status not in {"failed", "timeout"}]
-        if invalid_statuses:
+        invalid = [node.node_id for node in failed_nodes if node.status not in {"failed", "timeout"}]
+        if invalid:
             raise SupervisorCompilationError(
-                [f"repair targets must be failed or timeout nodes: {invalid_statuses}"]
+                [f"repair targets must be failed or timeout nodes: {invalid}"]
             )
         exhausted = [node.node_id for node in failed_nodes if node.attempt >= node.max_attempts]
         if exhausted:
             raise SupervisorCompilationError([f"repair attempts exhausted for nodes: {exhausted}"])
 
         history = graph.metadata.setdefault("repair_history", [])
-        repair_attempt = len(history) + 1
-        repair_registration = self._require_fixed_registration("repair", graph.metadata.get("execution_mode", ""))
-        repair_node_id = f"runtime:repair:{repair_attempt}"
+        repair_cycle = len(history) + 1
+        repair_registration = self._require_fixed_registration("repair")
+        repair_node_id = f"runtime:repair:{repair_cycle}"
+        replacements = {
+            node.node_id: f"runtime:retry:{node.node_id}:{node.attempt + 1}"
+            for node in failed_nodes
+        }
+        repair_node = TaskGraphNode(
+            node_id=repair_node_id,
+            task_id=f"{graph.turn_id}:repair:{repair_cycle}",
+            agent_id=repair_registration.manifest.agent_id,
+            capability="repair",
+            intent_ids=_unique(
+                [intent_id for node in failed_nodes for intent_id in node.intent_ids]
+            ),
+            depends_on=[node.node_id for node in failed_nodes],
+            dependency_policy="all_terminal",
+            max_attempts=repair_registration.manifest.max_attempts,
+            metadata={
+                "reason": reason,
+                "repair_cycle": repair_cycle,
+                "failed_node_ids": [node.node_id for node in failed_nodes],
+            },
+        )
+        graph.add_node(repair_node)
 
-        retry_nodes: list[TaskGraphNode] = []
-        replacements: dict[str, str] = {}
-        for failed_node in failed_nodes:
-            retry_node_id = f"runtime:retry:{failed_node.node_id}:{failed_node.attempt + 1}"
-            replacements[failed_node.node_id] = retry_node_id
-        for failed_node in failed_nodes:
-            retry_node_id = replacements[failed_node.node_id]
-            failed_node.metadata = {
-                **failed_node.metadata,
-                "superseded_by": retry_node_id,
-                "repair_cycle": repair_attempt,
+        retries: list[TaskGraphNode] = []
+        for failed in failed_nodes:
+            retry_id = replacements[failed.node_id]
+            failed.metadata = {
+                **failed.metadata,
+                "superseded_by": retry_id,
+                "repair_cycle": repair_cycle,
             }
-            retry_dependencies = [repair_node_id]
-            for dependency_id in failed_node.depends_on:
-                replacement = replacements.get(dependency_id, dependency_id)
-                if replacement != retry_node_id and replacement not in retry_dependencies:
-                    retry_dependencies.append(replacement)
-            retry_nodes.append(
-                failed_node.model_copy(
+            retries.append(
+                failed.model_copy(
                     update={
-                        "node_id": retry_node_id,
-                        "task_id": f"{graph.turn_id}:{retry_node_id}",
-                        "depends_on": retry_dependencies,
-                        "input_refs": [
-                            replacements.get(dependency_id, dependency_id)
-                            for dependency_id in failed_node.input_refs
-                            if replacements.get(dependency_id, dependency_id) != retry_node_id
-                        ],
+                        "node_id": retry_id,
+                        "task_id": f"{graph.turn_id}:{retry_id}",
+                        "depends_on": _unique(
+                            [
+                                repair_node_id,
+                                *[
+                                    replacements.get(value, value)
+                                    for value in failed.depends_on
+                                    if replacements.get(value, value) != retry_id
+                                ],
+                            ]
+                        ),
+                        "input_refs": _unique(
+                            [replacements.get(value, value) for value in failed.input_refs]
+                        ),
                         "dependency_policy": "all_succeeded",
                         "status": "pending",
-                        "attempt": failed_node.attempt + 1,
+                        "attempt": failed.attempt + 1,
                         "metadata": {
-                            **failed_node.metadata,
-                            "retry_of": failed_node.node_id,
+                            **failed.metadata,
+                            "retry_of": failed.node_id,
                             "repair_reason": reason,
-                            "repair_cycle": repair_attempt,
+                            "repair_cycle": repair_cycle,
                         },
                     }
                 )
             )
 
-        existing_nodes = list(graph.nodes)
-        for node in existing_nodes:
-            if node.status != "pending" or node.node_id in replacements:
+        for node in graph.nodes:
+            if (
+                node.status != "pending"
+                or node.node_id in replacements
+                or node.node_id == repair_node_id
+            ):
                 continue
-            updated_dependencies: list[str] = []
-            for dependency_id in node.depends_on:
-                replacement = replacements.get(dependency_id, dependency_id)
-                if replacement not in updated_dependencies:
-                    updated_dependencies.append(replacement)
-            node.depends_on = updated_dependencies
+            node.depends_on = _unique(
+                [replacements.get(value, value) for value in node.depends_on]
+            )
             node.input_refs = _unique(
-                [replacements.get(dependency_id, dependency_id) for dependency_id in node.input_refs]
+                [replacements.get(value, value) for value in node.input_refs]
             )
-
-        graph.add_node(
-            TaskGraphNode(
-                node_id=repair_node_id,
-                task_id=f"{graph.turn_id}:repair:{repair_attempt}",
-                agent_id=repair_registration.manifest.agent_id,
-                capability="repair",
-                depends_on=[node.node_id for node in failed_nodes],
-                dependency_policy="all_terminal",
-                attempt=1,
-                max_attempts=repair_registration.manifest.max_attempts,
-                metadata={
-                    "reason": reason,
-                    "repair_cycle": repair_attempt,
-                    "failed_node_ids": [node.node_id for node in failed_nodes],
-                },
-            )
-        )
-        for retry_node in retry_nodes:
-            graph.add_node(retry_node)
+        for retry in retries:
+            graph.add_node(retry)
         history.append(
             {
-                "attempt": repair_attempt,
+                "cycle": repair_cycle,
                 "reason": reason,
+                "intent_ids": repair_node.intent_ids,
                 "failed_node_ids": [node.node_id for node in failed_nodes],
-                "retry_node_ids": [node.node_id for node in retry_nodes],
+                "retry_node_ids": [node.node_id for node in retries],
             }
         )
         graph.refresh_terminal_nodes()
         graph.validate_graph()
-        return [node.node_id for node in retry_nodes]
+        return [node.node_id for node in retries]
+
+    def _need_payload(self, intent: IntentItem, need: IntentProductNeed) -> dict[str, Any]:
+        constraints = [*intent.constraints, *need.constraints]
+        hard = [
+            f"{item.name}={item.value}" for item in constraints if item.strength == "hard"
+        ]
+        soft = [
+            f"{item.name}={item.value}" for item in constraints if item.strength == "soft"
+        ]
+        query = " ".join(
+            dict.fromkeys(
+                value
+                for value in [need.product_type, need.goal, *hard, *soft]
+                if str(value).strip()
+            )
+        )
+        return {
+            "slot_id": need.need_id,
+            "intent_id": intent.intent_id,
+            "need_type": need.priority,
+            "goal": need.goal,
+            "product_type": need.product_type,
+            "query": query or intent.resolved_query,
+            "hard_constraints": hard,
+            "soft_constraints": soft,
+            "exclude_terms": list(need.exclusions),
+            "min_candidates": 1,
+        }
+
+    def _selected_needs(
+        self,
+        intent: IntentItem,
+        task: AgentTaskProposal,
+    ) -> list[IntentProductNeed]:
+        selected = set(task.parameters.product_need_ids)
+        return [
+            need
+            for need in intent.product_needs
+            if not selected or need.need_id in selected
+        ]
+
+    def _intent_for_task(
+        self,
+        plan: IntentPlanV3,
+        task: AgentTaskProposal,
+    ) -> IntentItem | None:
+        selected = set(task.intent_ids)
+        return next((intent for intent in plan.intents if intent.intent_id in selected), None)
 
     def _fixed_node(
         self,
@@ -496,18 +618,21 @@ class SupervisorPlanCompiler:
         node_id: str,
         depends_on: list[str],
         input_refs: list[str] | None = None,
+        intent_ids: list[str] | None = None,
         status: str = "pending",
         attempt: int = 1,
         asynchronous: bool = False,
         required: bool = True,
+        dependency_policy: str = "all_succeeded",
         metadata: dict | None = None,
     ) -> TaskGraphNode:
-        registration = self._require_fixed_registration(capability, graph.metadata.get("execution_mode", ""))
+        registration = self._require_fixed_registration(capability)
         node = TaskGraphNode(
             node_id=node_id,
             task_id=f"{graph.turn_id}:{node_id}",
             agent_id=registration.manifest.agent_id,
             capability=capability,
+            intent_ids=intent_ids or [],
             depends_on=depends_on,
             input_refs=input_refs or [],
             status=status,  # type: ignore[arg-type]
@@ -515,16 +640,17 @@ class SupervisorPlanCompiler:
             max_attempts=max(attempt, registration.manifest.max_attempts),
             asynchronous=asynchronous,
             required=required,
+            dependency_policy=dependency_policy,  # type: ignore[arg-type]
             metadata=metadata or {},
         )
         graph.add_node(node)
         return node
 
-    def _require_fixed_registration(self, capability: str, execution_mode: str):
-        registration = self.registry.select_for_capability(capability, execution_mode=execution_mode)
+    def _require_fixed_registration(self, capability: str):
+        registration = self.registry.select_for_capability(capability)
         if registration is None:
             raise SupervisorCompilationError(
-                [f"no enabled Supervisor Agent provides capability={capability} for mode={execution_mode}"]
+                [f"no enabled Supervisor Agent provides capability={capability}"]
             )
         return registration
 

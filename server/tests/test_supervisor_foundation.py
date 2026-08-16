@@ -1,1030 +1,768 @@
 import asyncio
+from collections import defaultdict
 
 import pytest
 
-from app.domain.agents import AgentExecutionContext, AgentResult, BusinessAgentServices, ExecutionReport
-from app.domain.supervisor.agent_registry import AgentRegistry, build_foundation_agent_registry
-from app.domain.supervisor.capability_catalog import build_default_capability_catalog
+from app.domain.agents import (
+    AgentExecutionContext,
+    AgentExecutor,
+    AgentResult,
+    BusinessAgentHandlers,
+    BusinessAgentServices,
+)
+from app.domain.supervisor.agent_registry import build_foundation_agent_registry
+from app.domain.supervisor.flow import SupervisorFlow
 from app.domain.supervisor.policy_gate import SupervisorPolicyGate
 from app.domain.supervisor.prompts import build_default_prompt_registry
-from app.domain.supervisor.supervisor import (
-    SupervisorPlanCompiler,
-    SupervisorPolicyRejectedError,
+from app.domain.supervisor.supervisor import SupervisorPlanCompiler
+from app.domain.supervisor.task_graph import TaskGraph, TaskGraphNode
+from app.domain.supervisor.validators import (
+    IntentPlanContractError,
+    validate_intent_plan_contract,
 )
-from app.domain.supervisor.flow import SupervisorFlow
-from app.domain.supervisor.validators import IntentPlanContractError, validate_intent_plan_contract
-from app.schemas import (
-    AgentTaskProposal,
-    ClarificationProposal,
-    ContextRequest,
-    IntentConstraint,
-    IntentConstraintSet,
-    IntentItem,
-    IntentPlan,
-    IntentQueryRewrite,
-    IntentRouteBasis,
-    ResearchRequest,
-    RewriteNeedSlot,
-)
-from app.domain.agents.contracts import EvidenceRef
-from app.harness.span_recorder import SpanRecorder
 from app.harness.tool_registry import ToolRegistry
+from app.schemas import (
+    AgentTaskParameters,
+    AgentTaskProposal,
+    IntentConstraint,
+    IntentItem,
+    IntentPlanV3,
+    IntentProductNeed,
+    IntentRouteBasis,
+    RecommendationPolicy,
+    ReflectionResult,
+    RepairHint,
+)
 
 
-def test_compound_intent_compiles_to_parallel_and_dependent_agent_graph() -> None:
-    plan = _compound_plan()
+def make_intent(
+    intent_id: str,
+    goal: str,
+    *,
+    intent_type: str = "product_recommendation",
+    priority: str = "required",
+    target_clarity: str = "explicit_product",
+    external_need: str = "none",
+    trigger_text: str = "",
+    product_family: str = "商品",
+    needs: list[IntentProductNeed] | None = None,
+    references: list[str] | None = None,
+) -> IntentItem:
+    return IntentItem(
+        intent_id=intent_id,
+        intent_type=intent_type,
+        priority=priority,
+        goal=goal,
+        resolved_query=goal,
+        product_needs=needs or [],
+        referenced_product_ids=references or [],
+        route_basis=IntentRouteBasis(
+            target_clarity=target_clarity,
+            external_information_need=external_need,
+            trigger_text=trigger_text,
+            product_family=product_family,
+            reason="测试路由依据",
+        ),
+    )
+
+
+def make_task(
+    task_id: str,
+    capability: str,
+    intent_id: str,
+    *,
+    depends_on: list[str] | None = None,
+    optional_context_from: list[str] | None = None,
+    parameters: AgentTaskParameters | None = None,
+) -> AgentTaskProposal:
+    return AgentTaskProposal(
+        task_id=task_id,
+        capability=capability,
+        intent_ids=[intent_id],
+        objective=f"执行 {intent_id} 的 {capability}",
+        reason="用户目标需要该能力",
+        depends_on=depends_on or [],
+        optional_context_from=optional_context_from or [],
+        parameters=parameters or AgentTaskParameters(),
+    )
+
+
+def single_plan(*, intent_id: str = "i1", task_id: str = "t1") -> IntentPlanV3:
+    intent = make_intent(intent_id, "推荐150元以内适合油皮通勤的防晒霜", product_family="防晒霜")
+    intent.constraints.append(
+        IntentConstraint(
+            name="budget_max",
+            value=150,
+            strength="hard",
+            source="current_query",
+        )
+    )
+    return IntentPlanV3(
+        original_query=intent.goal,
+        normalized_query=intent.goal,
+        summary="单商品推荐",
+        intents=[intent],
+        task_proposals=[
+            make_task(task_id, "single_product_recommendation", intent_id)
+        ],
+    )
+
+
+def two_independent_recommendations() -> IntentPlanV3:
+    intents = [
+        make_intent("i_skin", "推荐敏感肌面霜", product_family="面霜"),
+        make_intent("i_audio", "推荐通勤降噪耳机", product_family="耳机"),
+    ]
+    return IntentPlanV3(
+        original_query="推荐敏感肌面霜；再推荐通勤降噪耳机",
+        normalized_query="推荐敏感肌面霜；再推荐通勤降噪耳机",
+        summary="两个独立推荐任务",
+        intents=intents,
+        task_proposals=[
+            make_task("t_skin", "single_product_recommendation", "i_skin"),
+            make_task("t_audio", "single_product_recommendation", "i_audio"),
+        ],
+    )
+
+
+def bundle_plan() -> IntentPlanV3:
+    needs = [
+        IntentProductNeed(
+            need_id="n_hat",
+            goal="海边遮阳帽",
+            product_type="遮阳帽",
+        ),
+        IntentProductNeed(
+            need_id="n_top",
+            goal="海边透气上装",
+            product_type="短袖上衣",
+        ),
+        IntentProductNeed(
+            need_id="n_shoes",
+            goal="海边轻便鞋",
+            product_type="凉鞋",
+        ),
+    ]
+    intent = make_intent(
+        "i_outfit",
+        "下周去海边从头到脚搭配一套",
+        product_family="海边穿搭",
+        needs=needs,
+    )
+    return IntentPlanV3(
+        original_query=intent.goal,
+        normalized_query=intent.goal,
+        summary="海边多商品搭配",
+        intents=[intent],
+        task_proposals=[
+            make_task(
+                "t_outfit",
+                "multi_product_bundle",
+                "i_outfit",
+                parameters=AgentTaskParameters(
+                    product_need_ids=[item.need_id for item in needs]
+                ),
+            )
+        ],
+    )
+
+
+def three_independent_plan() -> IntentPlanV3:
+    intents = [
+        make_intent(
+            "i_skin",
+            "为敏感肌判断适合买什么商品",
+            target_clarity="vague_effect_or_use",
+            external_need="knowledge_bridge",
+            trigger_text="敏感肌",
+            product_family="",
+        ),
+        make_intent(
+            "i_throat",
+            "为喉咙不舒服判断适合买什么商品",
+            target_clarity="vague_effect_or_use",
+            external_need="knowledge_bridge",
+            trigger_text="喉咙不舒服",
+            product_family="",
+        ),
+        bundle_plan().intents[0],
+    ]
+    tasks = [
+        make_task(
+            "t_skin_knowledge",
+            "knowledge_research",
+            "i_skin",
+            parameters=AgentTaskParameters(
+                query="敏感肌适用商品类型",
+                trigger_type="knowledge_bridge",
+                trigger_text="敏感肌",
+            ),
+        ),
+        make_task(
+            "t_throat_knowledge",
+            "knowledge_research",
+            "i_throat",
+            parameters=AgentTaskParameters(
+                query="喉咙不舒服可购买商品类型",
+                trigger_type="knowledge_bridge",
+                trigger_text="喉咙不舒服",
+            ),
+        ),
+        bundle_plan().task_proposals[0],
+    ]
+    return IntentPlanV3(
+        original_query="敏感肌买什么；喉咙不舒服买什么；海边从头到脚搭一套",
+        normalized_query="敏感肌买什么；喉咙不舒服买什么；海边从头到脚搭一套",
+        summary="三个独立意图",
+        intents=intents,
+        task_proposals=tasks,
+    )
+
+
+def test_compiles_each_intent_to_an_independent_branch() -> None:
+    plan = three_independent_plan()
 
     validate_intent_plan_contract(plan)
-    graph = SupervisorPlanCompiler().compile(plan, turn_id="turn_compound")
+    graph = SupervisorPlanCompiler().compile(plan, turn_id="turn_three")
 
-    assert graph.topological_order()[0] == "system:intent_understanding"
-    policy = graph.require_node("system:policy_gate")
-    profile = graph.require_node("proposal:p_profile")
-    recommendation = graph.require_node("proposal:p_single")
-    comparison = graph.require_node("proposal:p_compare")
-    knowledge = graph.require_node("proposal:p_knowledge")
-    verifier = graph.require_node("system:evidence_verification")
+    assert graph.metadata["intent_order"] == ["i_skin", "i_throat", "i_outfit"]
+    assert graph.require_node("proposal:t_skin_knowledge").depends_on == ["system:policy_gate"]
+    assert graph.require_node("proposal:t_throat_knowledge").depends_on == ["system:policy_gate"]
+    assert graph.require_node("proposal:t_outfit").depends_on == ["system:policy_gate"]
+    assert graph.require_node("proposal:t_skin_knowledge").agent_id == "product_knowledge_agent"
+    assert graph.require_node("proposal:t_throat_knowledge").agent_id == "product_knowledge_agent"
+    assert graph.require_node("proposal:t_skin_knowledge").node_id != graph.require_node(
+        "proposal:t_throat_knowledge"
+    ).node_id
     answer = graph.require_node("system:answer_generation")
-    memory = graph.require_node("system:memory_distillation")
-
-    assert policy.depends_on == ["system:intent_understanding"]
-    assert policy.agent_id == "supervisor_policy_gate"
-    assert policy.metadata["implementation"] == "deterministic_code"
-    assert profile.depends_on == ["system:policy_gate"]
-    assert profile.required is False
-    assert recommendation.depends_on == ["system:policy_gate"]
-    assert recommendation.input_refs == ["proposal:p_profile"]
-    assert comparison.depends_on == ["proposal:p_single", "system:policy_gate"]
-    assert comparison.input_refs == ["proposal:p_commerce"]
-    assert knowledge.depends_on == ["proposal:p_single", "system:policy_gate"]
-    assert verifier.depends_on == ["proposal:p_single"]
-    assert set(verifier.input_refs) == {
-        "proposal:p_profile",
-        "proposal:p_compare",
-        "proposal:p_knowledge",
-        "proposal:p_commerce",
+    assert answer.dependency_policy == "all_terminal"
+    assert answer.metadata["intent_order"] == ["i_skin", "i_throat", "i_outfit"]
+    assert set(graph.metadata["branch_terminal_nodes"]) == {
+        "i_skin",
+        "i_throat",
+        "i_outfit",
     }
-    assert answer.depends_on == ["system:evidence_verification"]
-    assert answer.input_refs == ["proposal:p_profile"]
-    assert memory.depends_on == ["system:answer_generation"]
-    assert memory.asynchronous is True
-    assert "system:repair" not in {node.node_id for node in graph.nodes}
 
 
-def test_ranking_only_profile_failure_does_not_block_product_recommendation() -> None:
-    graph = SupervisorPlanCompiler().compile(_compound_plan(), turn_id="turn_optional_profile")
-    profile = graph.require_node("proposal:p_profile")
-    recommendation = graph.require_node("proposal:p_single")
+def test_same_capability_tasks_are_not_merged() -> None:
+    plan = three_independent_plan()
+    graph = SupervisorPlanCompiler().compile(plan, turn_id="turn_same_capability")
 
-    profile.status = "skipped"
+    knowledge_nodes = [
+        node for node in graph.nodes if node.capability == "knowledge_research"
+    ]
 
-    assert profile.required is False
-    assert recommendation in graph.ready_nodes()
+    assert [node.node_id for node in knowledge_nodes] == [
+        "proposal:t_skin_knowledge",
+        "proposal:t_throat_knowledge",
+    ]
+    assert [node.intent_ids for node in knowledge_nodes] == [["i_skin"], ["i_throat"]]
 
 
-def test_supervisor_trace_aggregates_tool_calls_from_execution_report() -> None:
+def test_multi_product_task_expands_to_parallel_slots_merge_verifier_and_optimizer() -> None:
+    graph = SupervisorPlanCompiler().compile(bundle_plan(), turn_id="turn_bundle")
+
+    dispatch = graph.require_node("proposal:t_outfit")
+    slots = [
+        graph.require_node(f"proposal:t_outfit:slot:{need_id}")
+        for need_id in ("n_hat", "n_top", "n_shoes")
+    ]
+    merge = graph.require_node("proposal:t_outfit:merge")
+    verifier = graph.require_node("system:verify:i_outfit")
+    optimizer = graph.require_node("system:optimize:i_outfit")
+
+    assert all(node.depends_on == [dispatch.node_id] for node in slots)
+    assert merge.depends_on == [node.node_id for node in slots]
+    assert verifier.depends_on == [merge.node_id]
+    assert optimizer.depends_on == [verifier.node_id]
+    assert graph.metadata["branch_terminal_nodes"]["i_outfit"] == optimizer.node_id
+
+
+def test_context_only_recommendation_compiles_directly_to_verifier() -> None:
+    intent = make_intent(
+        "i_context",
+        "从上一轮商品里选两个含芦荟的",
+        target_clarity="context_product",
+        product_family="面部补水商品",
+        references=["p1", "p2", "p3"],
+    )
+    intent.recommendation_policy = RecommendationPolicy(
+        candidate_source="context_only",
+        reference_policy="eligible",
+        requested_count=2,
+        count_mode="exact",
+    )
+    plan = IntentPlanV3(
+        original_query=intent.goal,
+        normalized_query=intent.goal,
+        intents=[intent],
+        task_proposals=[],
+    )
+
+    compiler = SupervisorPlanCompiler()
+    evaluation = compiler.evaluate(plan)
+    graph = compiler.compile_evaluated(
+        plan,
+        evaluation=evaluation,
+        turn_id="turn_context_only",
+    )
+
+    assert evaluation.approved is True
+    assert evaluation.intent_statuses[0].status == "ready"
+    verifier = graph.require_node("system:verify:i_context")
+    assert verifier.depends_on == ["system:policy_gate"]
+    assert verifier.metadata["candidate_source"] == "context_only"
+    assert graph.metadata["branch_terminal_nodes"]["i_context"] == verifier.node_id
+
+
+def test_invalid_route_rejects_only_its_intent_when_another_required_branch_is_valid() -> None:
+    valid = make_intent("i_valid", "推荐防晒", product_family="防晒霜")
+    invalid = make_intent("i_invalid", "推荐耳机", product_family="耳机")
+    plan = IntentPlanV3(
+        original_query="推荐防晒和耳机",
+        normalized_query="推荐防晒和耳机",
+        intents=[valid, invalid],
+        task_proposals=[
+            make_task("t_valid", "single_product_recommendation", "i_valid"),
+            make_task(
+                "t_invalid",
+                "knowledge_research",
+                "i_invalid",
+                parameters=AgentTaskParameters(query="耳机"),
+            ),
+        ],
+    )
+
+    evaluation = SupervisorPlanCompiler().evaluate(plan)
+    graph = SupervisorPlanCompiler().compile_evaluated(
+        plan,
+        evaluation=evaluation,
+        turn_id="turn_partial_policy",
+    )
+
+    assert evaluation.approved is True
+    assert evaluation.selections == {
+        "t_valid": "single_product_recommendation_agent"
+    }
+    assert evaluation.uncovered_required_intent_ids == ["i_invalid"]
+    assert graph.get_node("proposal:t_valid") is not None
+    assert graph.get_node("proposal:t_invalid") is None
+    assert graph.metadata["intent_statuses"]["i_invalid"]["status"] == "unsupported"
+
+
+def test_hard_dependency_rejection_does_not_remove_independent_sibling() -> None:
+    intents = [
+        make_intent("i_valid", "推荐防晒", product_family="防晒霜"),
+        make_intent("i_bad", "解释不存在的研究路由", product_family="耳机"),
+        make_intent(
+            "i_compare",
+            "对比研究结果",
+            intent_type="product_comparison",
+            target_clarity="context_product",
+            references=["p1", "p2"],
+        ),
+    ]
+    plan = IntentPlanV3(
+        original_query="混合请求",
+        normalized_query="混合请求",
+        intents=intents,
+        task_proposals=[
+            make_task("t_valid", "single_product_recommendation", "i_valid"),
+            make_task(
+                "t_bad",
+                "knowledge_research",
+                "i_bad",
+                parameters=AgentTaskParameters(query="耳机"),
+            ),
+            make_task(
+                "t_descendant",
+                "comparison",
+                "i_compare",
+                depends_on=["t_bad"],
+                parameters=AgentTaskParameters(referenced_product_ids=["p1", "p2"]),
+            ),
+        ],
+    )
+
+    evaluation = SupervisorPlanCompiler().evaluate(plan)
+
+    assert evaluation.approved is True
+    assert set(evaluation.selections) == {"t_valid"}
+    decisions = {item.subject_id: item for item in evaluation.decisions}
+    assert decisions["t_bad"].decision == "reject_route_policy"
+    assert decisions["t_descendant"].decision == "reject_hard_dependency"
+
+
+def test_contract_rejects_cross_intent_task_coalescing() -> None:
+    plan = two_independent_recommendations()
+    plan.task_proposals[0].intent_ids = ["i_skin", "i_audio"]
+    plan.task_proposals = [plan.task_proposals[0]]
+
+    with pytest.raises(IntentPlanContractError, match="exactly one intent"):
+        validate_intent_plan_contract(plan)
+
+
+def test_registry_and_prompts_keep_agent_tools_inside_the_expert_boundary() -> None:
+    registry = build_foundation_agent_registry()
+    prompts = build_default_prompt_registry()
+
+    assert registry.select_for_capability("single_product_recommendation").manifest.allowed_tools == (
+        "product_search",
+        "image_search",
+        "image_understanding",
+    )
+    assert registry.select_for_capability("multi_product_bundle").manifest.allowed_tools == (
+        "image_understanding",
+    )
+    assert registry.select_for_capability("slot_product_retrieval").manifest.allowed_tools == (
+        "product_search",
+    )
+    assert registry.select_for_capability("comparison").manifest.allowed_tools == (
+        "product_detail",
+    )
+    assert registry.select_for_capability("knowledge_research").manifest.agent_id == (
+        "product_knowledge_agent"
+    )
+    assert registry.select_for_capability("knowledge_research").manifest.allowed_tools == (
+        "product_detail",
+        "web_search",
+    )
+    assert registry.select_for_capability("evidence_verification").manifest.allowed_tools == (
+        "product_detail",
+    )
+    assert "不得调用网页搜索或平台搜索" in prompts.require(
+        "comparison_agent"
+    ).system_template
+    assert "product_detail" in prompts.require(
+        "product_knowledge_agent"
+    ).system_template
+
+
+def test_executor_starts_independent_ready_tasks_concurrently() -> None:
+    graph = TaskGraph(
+        graph_id="parallel",
+        turn_id="parallel",
+        nodes=[
+            TaskGraphNode(
+                node_id="n1",
+                task_id="parallel:n1",
+                agent_id="product_knowledge_agent",
+                capability="knowledge_research",
+                intent_ids=["i1"],
+            ),
+            TaskGraphNode(
+                node_id="n2",
+                task_id="parallel:n2",
+                agent_id="product_knowledge_agent",
+                capability="knowledge_research",
+                intent_ids=["i2"],
+            ),
+        ],
+        entry_node_ids=["n1", "n2"],
+        terminal_node_ids=["n1", "n2"],
+    )
+    both_started = asyncio.Event()
+    started: set[str] = set()
+
+    async def handler(context: AgentExecutionContext) -> AgentResult:
+        started.add(context.node.node_id)
+        if len(started) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=0.5)
+        return AgentResult.success({"node_id": context.node.node_id})
+
+    executor = AgentExecutor(
+        agent_registry=build_foundation_agent_registry(),
+        tool_registry=ToolRegistry(),
+        handlers={"knowledge_research": handler},
+    )
+    context = AgentExecutionContext(
+        node=graph.nodes[0],
+        graph=graph,
+        query="两个独立知识任务",
+        user_id="u1",
+        session_id="s1",
+        turn_id="parallel",
+        intent_plan=IntentPlanV3(),
+    )
+
+    report = asyncio.run(executor.execute(graph, base_context=context))
+
+    assert started == {"n1", "n2"}
+    assert report.completed is True
+    assert all(node.status == "succeeded" for node in graph.nodes)
+
+
+class OrderedAnswerGenerator:
+    async def stream_direct_text(self, query: str, *args, **kwargs):
+        yield f"<{query}>"
+
+
+def test_answer_generator_emits_intents_in_original_order() -> None:
+    intents = [
+        make_intent(
+            "i1",
+            "第一个问题",
+            intent_type="social_chat",
+            target_clarity="not_applicable",
+            product_family="",
+        ),
+        make_intent(
+            "i2",
+            "第二个问题",
+            intent_type="social_chat",
+            target_clarity="not_applicable",
+            product_family="",
+        ),
+        make_intent(
+            "i3",
+            "第三个问题",
+            intent_type="social_chat",
+            target_clarity="not_applicable",
+            product_family="",
+        ),
+    ]
+    plan = IntentPlanV3(
+        original_query="三个问题",
+        normalized_query="三个问题",
+        intents=intents,
+        task_proposals=[],
+    )
+    graph = SupervisorPlanCompiler().compile(plan, turn_id="answer_order")
+    answer = graph.require_node("system:answer_generation")
+    context = AgentExecutionContext(
+        node=answer,
+        graph=graph,
+        query=plan.original_query,
+        user_id="u1",
+        session_id="s1",
+        turn_id="answer_order",
+        intent_plan=plan,
+        artifacts={"intent_plan": plan},
+        services=BusinessAgentServices(answer_generator=OrderedAnswerGenerator()),
+    )
+
+    result = asyncio.run(
+        BusinessAgentHandlers(context.services).answer_generation(context)
+    )
+
+    text = result.artifacts["answer_text"]
+    assert text.index("### 1. 第一个问题") < text.index("<第一个问题>")
+    assert text.index("<第一个问题>") < text.index("### 2. 第二个问题")
+    assert text.index("<第二个问题>") < text.index("### 3. 第三个问题")
+    assert text.endswith("<第三个问题>")
+
+
+def test_quality_repair_retries_only_the_failed_intent_branch() -> None:
+    plan = two_independent_recommendations()
     flow = SupervisorFlow(
         services=BusinessAgentServices(),
         tool_registry=ToolRegistry(),
         span_recorder=None,
         budget_manager=None,
     )
-    plan = _compound_plan()
-    graph = flow.compiler.compile(plan, turn_id="turn_tool_trace")
-    recommendation = graph.require_node("proposal:p_single")
-    report = ExecutionReport(graph=graph)
-    report.results[recommendation.node_id] = AgentResult.success(
-        {"candidate_count": 3},
-        tool_calls=[
-            {
-                "tool": "product_search",
-                "operation": "single_initial",
-                "agent_id": recommendation.agent_id,
-                "task_id": recommendation.task_id,
-                "attempt": 1,
-                "status": "succeeded",
-            }
-        ],
-    )
+    retrieval_calls: dict[str, int] = defaultdict(int)
+    verifier_calls: dict[str, int] = defaultdict(int)
 
-    trace = flow._trace(graph, plan, report, "recommend", None)
+    async def retrieval(context: AgentExecutionContext) -> AgentResult:
+        intent_id = context.node.intent_ids[0]
+        retrieval_calls[intent_id] += 1
+        product_id = f"p_{intent_id}_{retrieval_calls[intent_id]}"
+        return AgentResult.success(
+            {"candidate_ids": [product_id], "candidate_count": 1},
+            artifacts={"single_evidence": {"product_id": product_id}},
+        )
 
-    assert trace["task"]["tool_call_count"] == 1
-    assert trace["trace_schema_version"] == "v2"
-    assert trace["run_id"] == ""
-    assert trace["tool_calls"] == [
+    async def verifier(context: AgentExecutionContext) -> AgentResult:
+        intent_id = context.node.intent_ids[0]
+        verifier_calls[intent_id] += 1
+        repairable = intent_id == "i_skin" and verifier_calls[intent_id] == 1
+        reflection = ReflectionResult(
+            has_passed_products=not repairable,
+            passed_product_ids=[] if repairable else [f"p_{intent_id}_1"],
+            fallback_plan="no_product" if repairable else "none",
+            repair_hint=RepairHint(
+                repairable=repairable,
+                target_slot_ids=["single"] if repairable else [],
+                reason="首轮候选不匹配" if repairable else "",
+            ),
+        )
+        return AgentResult.success(
+            {"repairable": repairable},
+            artifacts={"reflection": reflection},
+        )
+
+    async def success(context: AgentExecutionContext) -> AgentResult:
+        return AgentResult.success({"capability": context.node.capability})
+
+    async def answer(context: AgentExecutionContext) -> AgentResult:
+        return AgentResult.success(
+            {"route": "multi_intent"},
+            artifacts={
+                "answer_text": "完成",
+                "answer_tokens": ["完成"],
+                "answer_cards": [],
+                "answer_product_ids": [],
+                "answer_route": "multi_intent",
+                "answer_branches": [],
+            },
+        )
+
+    flow.executor.handlers.update(
         {
-            "call_id": f"{recommendation.task_id}:tool:1",
-            "node_id": recommendation.node_id,
-            "capability": recommendation.capability,
-            "tool": "product_search",
-            "operation": "single_initial",
-            "agent_id": recommendation.agent_id,
-            "task_id": recommendation.task_id,
-            "attempt": 1,
-            "status": "succeeded",
-        }
-    ]
-
-
-def test_clarification_is_a_terminal_business_branch_without_answer_generator() -> None:
-    plan = IntentPlan(
-        original_query="推荐点东西",
-        normalized_query="推荐点东西",
-        primary_intent="product_recommendation",
-        intents=[IntentItem(intent_id="i1", intent_type="product_recommendation", goal="获得商品推荐")],
-        execution_mode="clarify",
-        clarification=ClarificationProposal(
-            required=True,
-            blocking=True,
-            missing_fields=["商品目标"],
-            question_goal="确认用户想购买的商品类型",
-            reason="没有可执行商品目标",
-        ),
-        agent_proposals=[
-            AgentTaskProposal(
-                proposal_id="p_clarify",
-                capability="clarification",
-                intent_ids=["i1"],
-                reason="需要补齐商品目标",
-            )
-        ],
-        plan_type="clarify",
-    )
-
-    graph = SupervisorPlanCompiler().compile(plan, turn_id="turn_clarify")
-
-    node_ids = {node.node_id for node in graph.nodes}
-    assert "proposal:p_clarify" in node_ids
-    assert "system:answer_generation" not in node_ids
-    assert graph.require_node("proposal:p_clarify").depends_on == ["system:policy_gate"]
-    assert graph.require_node("system:memory_distillation").depends_on == ["proposal:p_clarify"]
-
-
-def test_planner_cannot_propose_supervisor_managed_capabilities() -> None:
-    plan = _single_product_plan()
-    plan.agent_proposals.append(
-        AgentTaskProposal(
-            proposal_id="p_repair",
-            capability="repair",
-            intent_ids=["i1"],
-            reason="Planner tries to force repair",
-        )
-    )
-
-    with pytest.raises(IntentPlanContractError, match="Supervisor-managed capability repair"):
-        validate_intent_plan_contract(plan)
-
-
-def test_long_term_profile_cannot_create_hard_constraints() -> None:
-    plan = _single_product_plan()
-    plan.constraints.items.append(
-        IntentConstraint(
-            name="brand",
-            value="某品牌",
-            strength="hard",
-            source="long_term_profile",
-        )
-    )
-
-    with pytest.raises(IntentPlanContractError, match="long_term_profile constraints must be soft"):
-        validate_intent_plan_contract(plan)
-
-
-def test_policy_rejects_required_proposal_without_enabled_agent() -> None:
-    catalog = build_default_capability_catalog()
-    registry = AgentRegistry(catalog)
-
-    evaluation = SupervisorPolicyGate(registry, catalog).evaluate(_single_product_plan())
-
-    assert evaluation.approved is False
-    assert evaluation.decisions[0].approved is False
-    assert "No enabled Agent" in evaluation.decisions[0].reason
-
-    with pytest.raises(SupervisorPolicyRejectedError) as error:
-        SupervisorPlanCompiler(registry=registry, catalog=catalog).compile(
-            _single_product_plan(),
-            turn_id="turn_policy_rejected",
-        )
-    assert error.value.errors == evaluation.errors
-
-
-def test_runtime_repair_only_rewires_failed_node_dependents() -> None:
-    compiler = SupervisorPlanCompiler()
-    graph = compiler.compile(_single_product_plan(), turn_id="turn_repair")
-    retrieval = graph.require_node("proposal:p_single")
-    retrieval.status = "failed"
-
-    retry_node_ids = compiler.schedule_repair(
-        graph,
-        [retrieval.node_id],
-        reason="candidate evidence did not satisfy the product goal",
-    )
-
-    assert retry_node_ids == ["runtime:retry:proposal:p_single:2"]
-    repair = graph.require_node("runtime:repair:1")
-    retry = graph.require_node(retry_node_ids[0])
-    verifier = graph.require_node("system:evidence_verification")
-    assert repair.depends_on == ["proposal:p_single"]
-    assert repair.dependency_policy == "all_terminal"
-    assert repair in graph.ready_nodes()
-    assert retry.depends_on == ["runtime:repair:1", "system:policy_gate"]
-    assert retry.attempt == 2
-    assert retry.task_id == "turn_repair:runtime:retry:proposal:p_single:2"
-    assert verifier.depends_on == [retry.node_id]
-    old_handoff = next(
-        item
-        for item in graph.handoffs
-        if item.from_node_id == "proposal:p_single"
-        and item.to_node_id == verifier.node_id
-        and item.required
-    )
-    retry_handoff = next(
-        item
-        for item in graph.handoffs
-        if item.from_node_id == retry.node_id
-        and item.to_node_id == verifier.node_id
-        and item.required
-    )
-    assert old_handoff.status == "superseded"
-    assert retry_handoff.status == "planned"
-
-
-def test_task_graph_preserves_retry_dependencies_and_separates_repair_cycle_from_attempt() -> None:
-    compiler = SupervisorPlanCompiler()
-    graph = compiler.compile(_compound_plan(), turn_id="turn_repair_dependencies")
-    retrieval = graph.require_node("proposal:p_single")
-    retrieval.status = "failed"
-    comparison = graph.require_node("proposal:p_compare")
-    comparison.status = "failed"
-
-    retry_ids = compiler.schedule_repair(
-        graph,
-        [retrieval.node_id, comparison.node_id],
-        reason="both evidence-producing branches failed",
-    )
-
-    repair = graph.require_node("runtime:repair:1")
-    retry_retrieval = graph.require_node("runtime:retry:proposal:p_single:2")
-    retry_comparison = graph.require_node("runtime:retry:proposal:p_compare:2")
-    assert retry_ids == [retry_retrieval.node_id, retry_comparison.node_id]
-    assert repair.attempt == 1
-    assert repair.metadata["repair_cycle"] == 1
-    assert retry_retrieval.task_id != retrieval.task_id
-    assert retry_comparison.task_id != comparison.task_id
-    assert retry_retrieval.task_id != retry_comparison.task_id
-    assert "runtime:retry:proposal:p_single:2" in retry_comparison.depends_on
-    assert "runtime:repair:1" in retry_retrieval.depends_on
-
-
-def test_task_graph_marks_failed_dependency_as_blocked() -> None:
-    compiler = SupervisorPlanCompiler()
-    graph = compiler.compile(_single_product_plan(), turn_id="turn_blocked")
-    retrieval = graph.require_node("proposal:p_single")
-    retrieval.status = "failed"
-
-    assert [node.node_id for node in graph.blocked_nodes()] == ["system:evidence_verification"]
-    assert graph.mark_blocked_nodes() == ["system:evidence_verification"]
-    assert graph.require_node("system:evidence_verification").status == "skipped"
-
-
-def test_agent_registry_separates_business_agents_from_atomic_tools() -> None:
-    registry = build_foundation_agent_registry()
-
-    single = registry.select_for_capability("single_product_recommendation", execution_mode="single_product")
-    assert single is not None
-    assert single.manifest.agent_id == "single_product_recommendation_agent"
-    assert set(single.manifest.allowed_tools) == {
-        "product_search",
-        "image_search",
-        "image_understanding",
-        "product_detail",
-    }
-    assert registry.select_for_capability("single_product_recommendation", execution_mode="multi_product") is None
-    policy = registry.select_for_capability("policy_gate", execution_mode="single_product")
-    assert policy is not None
-    assert policy.manifest.allowed_tools == ()
-    assert policy.manifest.supervisor_managed is True
-
-
-def test_profile_intent_refinement_requires_a_second_policy_gate() -> None:
-    plan = _compound_plan()
-    plan.context_requests[0] = plan.context_requests[0].model_copy(
-        update={"usage": "intent_refinement"}
-    )
-
-    graph = SupervisorPlanCompiler().compile(plan, turn_id="turn_refine_policy")
-
-    profile = graph.require_node("proposal:p_profile")
-    refinement = graph.require_node("system:intent_refinement")
-    refined_policy = graph.require_node("system:policy_gate:refinement")
-    assert profile.depends_on == ["system:policy_gate"]
-    assert refinement.depends_on == ["system:policy_gate"]
-    assert refinement.input_refs == [profile.node_id]
-    assert refined_policy.depends_on == [refinement.node_id]
-    assert refined_policy.capability == "policy_gate"
-    for node_id in (
-        "proposal:p_single",
-        "proposal:p_compare",
-        "proposal:p_knowledge",
-        "proposal:p_commerce",
-    ):
-        assert refined_policy.node_id in graph.require_node(node_id).depends_on
-
-
-def test_prompt_registry_builds_all_foundation_prompts() -> None:
-    prompts = build_default_prompt_registry()
-
-    assert prompts.require("evidence_verifier_agent").output_contract["type"] == "EvidenceVerificationResult"
-    assert prompts.require("slot_retrieval_agent").output_contract["type"] == "SlotRetrievalEvidence"
-    assert prompts.require("bundle_optimizer").output_contract["type"] == "BundleOptimizationResult"
-    assert len(prompts.describe()) == 14
-
-
-def test_multi_product_compiles_parallel_slot_retrieval_and_merge_boundary() -> None:
-    graph = SupervisorPlanCompiler().compile(_multi_product_plan(), turn_id="turn_bundle")
-
-    dispatch = graph.require_node("proposal:p_multi")
-    slot_a = graph.require_node("proposal:p_multi:slot:s1")
-    slot_b = graph.require_node("proposal:p_multi:slot:s2")
-    merge = graph.require_node("proposal:p_multi:merge")
-    verifier = graph.require_node("system:evidence_verification")
-
-    assert slot_a.agent_id == "slot_retrieval_agent"
-    assert slot_b.agent_id == "slot_retrieval_agent"
-    assert slot_a.depends_on == [dispatch.node_id]
-    assert slot_b.depends_on == [dispatch.node_id]
-    assert set(merge.depends_on) == {slot_a.node_id, slot_b.node_id}
-    assert verifier.depends_on == [merge.node_id]
-    assert merge.metadata["phase"] == "merge_slot_evidence"
-
-
-def test_required_commerce_research_is_covered_by_explicit_tool_allowlist() -> None:
-    plan = _single_product_plan()
-    plan.original_query = "推荐油皮防晒，并看看小红书评价"
-    plan.normalized_query = plan.original_query
-    plan.intents[0] = plan.intents[0].model_copy(
-        update={
-            "route_basis": IntentRouteBasis(
-                target_clarity="explicit_product",
-                local_catalog_status="sufficient",
-                external_information_need="explicit_platform",
-                trigger_text="小红书",
-                product_family="防晒霜",
-                reason="用户明确要求平台评价。",
-            )
+            "single_product_recommendation": retrieval,
+            "evidence_verification": verifier,
+            "repair": success,
+            "answer_generation": answer,
+            "memory_distillation": success,
         }
     )
-    plan.research_requests = [
-        ResearchRequest(
-            request_id="r_xhs",
-            intent_id="i1",
-            mode="social_content",
-            consumer_capability="commerce_research",
-            trigger_type="explicit_platform_request",
-            trigger_text="小红书",
-            platforms=["xiaohongshu"],
-            query="油皮防晒真实使用评价",
-            reason="用户明确要求查看小红书评价",
-            required=True,
-        )
-    ]
-    plan.agent_proposals.append(
-        AgentTaskProposal(
-            proposal_id="p_commerce",
-            capability="commerce_research",
-            intent_ids=["i1"],
-            reason="查询获批平台的外部评价",
-        )
+
+    events = asyncio.run(_collect_flow(flow, plan))
+
+    assert retrieval_calls == {"i_skin": 2, "i_audio": 1}
+    assert verifier_calls == {"i_skin": 2, "i_audio": 1}
+    assert any(
+        item.get("supervisor_decision") == "branch_quality_repair_scheduled"
+        for item in events
     )
-
-    evaluation = SupervisorPolicyGate(build_foundation_agent_registry()).evaluate(plan)
-
-    assert evaluation.approved is True
-    research_decision = next(item for item in evaluation.decisions if item.subject_id == "r_xhs")
-    assert research_decision.selected_agent_id == "commerce_research_agent"
-    assert research_decision.details["required_tool"] == "commerce_search"
+    history = flow.last_result.graph.metadata["repair_history"]
+    assert len(history) == 1
+    assert history[0]["kind"] == "evidence_quality"
+    assert history[0]["intent_id"] == "i_skin"
+    assert flow.last_result.report.failed_node_ids == []
 
 
-def test_commerce_research_rejects_platforms_outside_project_allowlist() -> None:
-    plan = _single_product_plan()
-    plan.research_requests = [
-        ResearchRequest(
-            request_id="r_other",
-            intent_id="i1",
-            mode="marketplace",
-            consumer_capability="commerce_research",
-            trigger_type="explicit_platform_request",
-            trigger_text="京东",
-            platforms=["jd"],
-            query="防晒",
-            reason="测试不受支持的平台",
-        )
-    ]
+class RevisionPlanner:
+    def __init__(self, revised_plan: IntentPlanV3) -> None:
+        self.revised_plan = revised_plan
+        self.calls: list[tuple[str, dict]] = []
 
-    with pytest.raises(IntentPlanContractError, match="unsupported commerce platforms"):
-        validate_intent_plan_contract(plan)
+    async def plan(self, query: str, context: dict) -> IntentPlanV3:
+        self.calls.append((query, context))
+        return self.revised_plan
 
 
-def test_knowledge_follow_up_is_supervisor_approved_from_item_level_evidence() -> None:
-    plan = _knowledge_bridge_plan()
-    gate = SupervisorPolicyGate(build_foundation_agent_registry())
-    evidence = EvidenceRef(
-        evidence_id="web:0",
-        source_type="web_search",
-        source_id="https://example.test/aloe",
-        claim="芦荟胶选购资料",
-        summary="资料明确提到芦荟胶这一商品概念。",
+def test_knowledge_bridge_replans_only_its_own_intent() -> None:
+    bridge = make_intent(
+        "i_bridge",
+        "敏感肌适合买什么",
+        target_clarity="vague_effect_or_use",
+        external_need="knowledge_bridge",
+        trigger_text="敏感肌",
+        product_family="",
     )
-
-    decision = gate.approve_knowledge_follow_up(
-        plan,
-        knowledge_artifact={
-            "candidate_concepts": ["芦荟胶", "消炎"],
-            "concept_proposals": [
-                {
-                    "concept": "芦荟胶",
-                    "concept_type": "product_type",
-                    "supporting_evidence_ids": ["web:0"],
-                },
-                {
-                    "concept": "消炎",
-                    "concept_type": "efficacy",
-                    "supporting_evidence_ids": [],
-                },
-            ],
-            "risks": ["不能将知识资料表述为医疗结论"],
-        },
-        evidence_refs=[evidence],
-    )
-
-    assert decision.approved is True
-    assert decision.decision == "approve_knowledge_to_retrieval"
-    assert decision.approved_concepts == ["芦荟胶"]
-    assert decision.supporting_evidence_ids == ["web:0"]
-    assert decision.approved_query == "芦荟胶"
-    assert "消炎" not in decision.approved_query
-    assert decision.verification_goal == "想要消炎的东西"
-    assert decision.rejected_concepts[0]["concept"] == "消炎"
-    assert decision.risk_flags
-
-
-def test_knowledge_follow_up_rejects_untraceable_concepts() -> None:
-    plan = _knowledge_bridge_plan()
-    gate = SupervisorPolicyGate(build_foundation_agent_registry())
-
-    decision = gate.approve_knowledge_follow_up(
-        plan,
-        knowledge_artifact={
-            "candidate_concepts": ["芦荟胶"],
-            "concept_proposals": [
-                {
-                    "concept": "芦荟胶",
-                    "concept_type": "product_type",
-                    "supporting_evidence_ids": ["web:missing"],
-                }
-            ],
-        },
-        evidence_refs=[],
-    )
-
-    assert decision.approved is False
-    assert decision.decision == "reject_knowledge_to_retrieval"
-    assert decision.approved_query == ""
-    assert "不存在" in decision.rejected_concepts[0]["reason"]
-
-
-def test_knowledge_only_route_never_turns_into_product_retrieval() -> None:
-    plan = _knowledge_bridge_plan(knowledge_only=True)
-    gate = SupervisorPolicyGate(build_foundation_agent_registry())
-
-    decision = gate.approve_knowledge_follow_up(
-        plan,
-        knowledge_artifact={
-            "candidate_concepts": ["防晒霜"],
-            "concept_proposals": [
-                {
-                    "concept": "防晒霜",
-                    "concept_type": "product_type",
-                    "supporting_evidence_ids": ["web:0"],
-                }
-            ],
-        },
-        evidence_refs=[
-            EvidenceRef(
-                evidence_id="web:0",
-                source_type="web_search",
-                source_id="https://example.test/sunscreen",
-            )
+    regular = make_intent("i_regular", "推荐通勤耳机", product_family="耳机")
+    initial = IntentPlanV3(
+        original_query="敏感肌适合买什么；推荐通勤耳机",
+        normalized_query="敏感肌适合买什么；推荐通勤耳机",
+        intents=[bridge, regular],
+        task_proposals=[
+            make_task(
+                "t_bridge",
+                "knowledge_research",
+                "i_bridge",
+                parameters=AgentTaskParameters(
+                    query="敏感肌适用商品类型",
+                    trigger_type="knowledge_bridge",
+                    trigger_text="敏感肌",
+                ),
+            ),
+            make_task("t_regular", "single_product_recommendation", "i_regular"),
         ],
     )
-
-    assert decision.approved is False
-    assert decision.decision == "not_applicable"
-
-
-def test_knowledge_follow_up_rejects_efficacy_even_when_evidence_mentions_it() -> None:
-    decision = SupervisorPolicyGate(build_foundation_agent_registry()).approve_knowledge_follow_up(
-        _knowledge_bridge_plan(),
-        knowledge_artifact={
-            "candidate_concepts": ["消炎"],
-            "concept_proposals": [
-                {
-                    "concept": "消炎",
-                    "concept_type": "efficacy",
-                    "supporting_evidence_ids": ["web:0"],
-                }
-            ],
-        },
-        evidence_refs=[
-            EvidenceRef(
-                evidence_id="web:0",
-                source_type="web_search",
-                source_id="https://example.test/efficacy",
-                claim="消炎相关资料",
-                summary="网页讨论了消炎功效，但没有给出可购买商品类别。",
-            )
+    revised_intent = make_intent(
+        "i_bridge",
+        bridge.goal,
+        target_clarity="explicit_product",
+        product_family="敏感肌面霜",
+    )
+    revised = IntentPlanV3(
+        original_query=bridge.goal,
+        normalized_query="推荐敏感肌面霜",
+        intents=[revised_intent],
+        task_proposals=[
+            make_task("t_bridge_recommend", "single_product_recommendation", "i_bridge")
         ],
     )
-
-    assert decision.approved is False
-    assert decision.approved_query == ""
-    assert decision.rejected_concepts[0]["concept_type"] == "efficacy"
-    assert "不是可直接检索的商品品类" in decision.rejected_concepts[0]["reason"]
-
-
-def test_knowledge_flow_materializes_policy_and_retrieval_lineage() -> None:
-    async def scenario() -> None:
-        recorder = _memory_span_recorder("turn_knowledge_flow")
-        intent_span = recorder.start_span(
-            "intent_planning",
-            agent_id="intent_understanding_agent",
-            task_id="turn_knowledge_flow:intent_understanding",
-            span_type="agent",
-        )
-        intent_payload = recorder.finish_span(intent_span)
-        flow = SupervisorFlow(
-            services=BusinessAgentServices(),
-            tool_registry=ToolRegistry(),
-            span_recorder=recorder,
-            budget_manager=None,
-        )
-        calls: list[str] = []
-
-        async def knowledge(context):
-            calls.append("knowledge")
-            evidence = EvidenceRef(
-                evidence_id="web:0",
-                source_type="web_search",
-                source_id="https://example.test/aloe",
-                claim="芦荟胶选购资料",
-                summary="资料明确提到芦荟胶这一商品类别。",
-            )
-            artifact = {
-                "candidate_concepts": ["芦荟胶", "消炎"],
-                "concept_proposals": [
-                    {
-                        "concept": "芦荟胶",
-                        "concept_type": "product_type",
-                        "supporting_evidence_ids": ["web:0"],
-                    },
-                    {
-                        "concept": "消炎",
-                        "concept_type": "efficacy",
-                        "supporting_evidence_ids": ["web:0"],
-                    },
-                ],
-                "risks": ["功效目标只能由后续证据校验"],
-            }
-            return AgentResult.success(
-                {"concept_count": 2},
-                evidence=[evidence],
-                artifacts={"knowledge_research": artifact},
-            )
-
-        async def retrieval(context):
-            calls.append("retrieval")
-            assert context.node.metadata["query_override"] == "芦荟胶"
-            assert context.artifact("knowledge_retrieval_plan").vector_query == "芦荟胶"
-            return AgentResult.success(
-                {"query": "芦荟胶"},
-                evidence=[
-                    EvidenceRef(
-                        evidence_id="product:p_aloe",
-                        source_type="local_product_catalog",
-                        source_id="p_aloe",
-                        product_id="p_aloe",
-                        claim="芦荟胶",
-                        verified=True,
-                    )
-                ],
-            )
-
-        async def verifier(context):
-            calls.append("verifier")
-            reflection = ReflectionResult(
-                has_passed_products=False,
-                reason="测试证据边界已执行。",
-                fallback_plan="direct_answer",
-            )
-            return AgentResult.success(
-                {"status": "verified"},
-                artifacts={"reflection": reflection},
-            )
-
-        async def answer(context):
-            calls.append("answer")
-            return AgentResult.success(
-                {"route": "direct_answer"},
-                artifacts={
-                    "answer_text": "已完成受控知识转检索。",
-                    "answer_tokens": ["已完成受控知识转检索。"],
-                    "answer_product_ids": [],
-                    "answer_route": "direct_answer",
-                },
-            )
-
-        async def memory(context):
-            calls.append("memory")
-            return AgentResult.success({"scheduled": True})
-
-        flow.executor.handlers.update(
-            {
-                "knowledge_research": knowledge,
-                "single_product_recommendation": retrieval,
-                "evidence_verification": verifier,
-                "answer_generation": answer,
-                "memory_distillation": memory,
-            }
-        )
-        events = []
-        async for event in flow.run(
-            query="想要消炎的东西",
-            user_id="u1",
-            session_id="s1",
-            turn_id="turn_knowledge_flow",
-            intent_plan=_knowledge_bridge_plan(),
-            intent_span_key=intent_payload["span_key"],
-        ):
-            events.append(event)
-
-        result = flow.last_result
-        assert result is not None
-        graph = result.graph
-        policy = graph.require_node("runtime:policy_gate:knowledge_follow_up")
-        retrieval_node = graph.require_node("runtime:knowledge_recommendation")
-        assert policy.depends_on == ["proposal:p_knowledge"]
-        assert policy.metadata["approved"] is True
-        assert policy.metadata["approved_query"] == "芦荟胶"
-        assert retrieval_node.depends_on == [policy.node_id]
-        assert graph.all_terminal()
-        assert calls == ["knowledge", "retrieval", "verifier", "answer", "memory"]
-        assert any(event.get("type") == "timing_update" for event in events)
-
-        spans_by_task = {span["task_id"]: span for span in recorder.spans}
-        knowledge_span = spans_by_task["turn_knowledge_flow:p_knowledge"]
-        dynamic_policy_span = spans_by_task["turn_knowledge_flow:policy_gate:knowledge_follow_up"]
-        retrieval_span = spans_by_task["turn_knowledge_flow:knowledge_recommendation"]
-        policy_handoff_span = next(
-            span
-            for span in recorder.spans
-            if span["span_type"] == "handoff"
-            and span["input_summary"].get("from_node_id") == policy.node_id
-            and span["input_summary"].get("to_node_id") == retrieval_node.node_id
-        )
-        assert dynamic_policy_span["span_type"] == "policy"
-        assert dynamic_policy_span["parent_span_key"] == knowledge_span["span_key"]
-        assert policy_handoff_span["parent_span_key"] == dynamic_policy_span["span_key"]
-        assert retrieval_span["parent_span_key"] == policy_handoff_span["span_key"]
-
-    asyncio.run(scenario())
-
-
-def test_knowledge_follow_up_policy_is_idempotent_and_records_final_rejection() -> None:
-    recorder = _memory_span_recorder("turn_knowledge_policy")
+    planner = RevisionPlanner(revised)
     flow = SupervisorFlow(
-        services=BusinessAgentServices(),
+        services=BusinessAgentServices(intent_planner=planner),
         tool_registry=ToolRegistry(),
-        span_recorder=recorder,
+        span_recorder=None,
         budget_manager=None,
     )
-    plan = _knowledge_bridge_plan()
-    graph = flow.compiler.compile(plan, turn_id="turn_knowledge_policy")
-    knowledge_node = graph.require_node("proposal:p_knowledge")
-    knowledge_node.status = "succeeded"
-    context = AgentExecutionContext(
-        node=knowledge_node,
-        graph=graph,
-        query=plan.original_query,
-        user_id="u1",
-        session_id="s1",
-        turn_id=graph.turn_id,
-        intent_plan=plan,
-        artifacts={
-            "intent_plan": plan,
-            "knowledge_research": {
-                "concept_proposals": [
-                    {
-                        "concept": "芦荟胶",
-                        "concept_type": "product_type",
-                        "supporting_evidence_ids": ["web:0"],
-                    }
-                ]
+    retrieval_calls: list[str] = []
+
+    async def knowledge(context: AgentExecutionContext) -> AgentResult:
+        return AgentResult.success(
+            {"available": True},
+            artifacts={
+                "knowledge_research": {"candidate_concepts": ["敏感肌面霜"]}
             },
-            f"evidence:{knowledge_node.node_id}": [
-                EvidenceRef(
-                    evidence_id="web:0",
-                    source_type="web_search",
-                    source_id="https://example.test/aloe",
-                    claim="芦荟胶选购资料",
-                    summary="资料明确提到芦荟胶这一商品类别。",
-                )
-            ],
-        },
-    )
-    # Remove the verifier to force a deterministic materialization rejection.
-    graph.nodes = [node for node in graph.nodes if node.capability != "evidence_verification"]
-    answer = graph.get_node("system:answer_generation")
-    if answer is not None:
-        answer.depends_on = [knowledge_node.node_id]
-    graph.refresh_terminal_nodes()
+        )
 
-    result = flow._knowledge_follow_up_decision(graph, context)
+    async def retrieval(context: AgentExecutionContext) -> AgentResult:
+        retrieval_calls.append(context.node.intent_ids[0])
+        return AgentResult.success(
+            {"candidate_ids": [], "candidate_count": 0},
+            artifacts={"single_evidence": {}},
+        )
 
-    assert result is not None
-    decision, span = result
-    assert decision.approved is False
-    assert decision.decision == "reject_knowledge_to_retrieval"
-    policy = graph.require_node("runtime:policy_gate:knowledge_follow_up")
-    assert policy.metadata["approved"] is False
-    assert policy.metadata["decision"] == "reject_knowledge_to_retrieval"
-    assert span is not None
-    assert span["output_summary"]["approved"] is False
-    assert span["termination_reason"] == "policy_rejected"
-    assert flow._knowledge_follow_up_decision(graph, context) is None
-    assert len(
-        [node for node in graph.nodes if node.node_id == "runtime:policy_gate:knowledge_follow_up"]
-    ) == 1
-    assert len(
-        [item for item in recorder.spans if item["task_id"] == "turn_knowledge_policy:policy_gate:knowledge_follow_up"]
-    ) == 1
+    async def verifier(context: AgentExecutionContext) -> AgentResult:
+        reflection = ReflectionResult(
+            has_passed_products=False,
+            fallback_plan="no_product",
+        )
+        return AgentResult.success({}, artifacts={"reflection": reflection})
 
+    async def answer(context: AgentExecutionContext) -> AgentResult:
+        return AgentResult.success(
+            {"route": "multi_intent"},
+            artifacts={
+                "answer_text": "完成",
+                "answer_tokens": ["完成"],
+                "answer_cards": [],
+                "answer_product_ids": [],
+                "answer_route": "multi_intent",
+                "answer_branches": [],
+            },
+        )
 
-def _knowledge_bridge_plan(*, knowledge_only: bool = False) -> IntentPlan:
-    intent_type = "shopping_knowledge" if knowledge_only else "product_recommendation"
-    return IntentPlan(
-        original_query="想要消炎的东西",
-        normalized_query="根据资料寻找适合的商品概念",
-        primary_intent=intent_type,
-        intents=[
-            IntentItem(
-                intent_id="i1",
-                intent_type=intent_type,
-                goal="解释并判断可购买的商品概念",
-                route_basis=IntentRouteBasis(
-                    target_clarity="vague_effect_or_use",
-                    local_catalog_status="insufficient",
-                    external_information_need="knowledge_bridge",
-                    trigger_text="消炎",
-                    product_family="",
-                    reason="当前只有功效目标，商品族不明确。",
-                ),
-            )
-        ],
-        execution_mode="context_evidence",
-        research_requests=[
-            ResearchRequest(
-                request_id="r_web",
-                intent_id="i1",
-                mode="web_general",
-                consumer_capability="knowledge_research",
-                trigger_type="knowledge_bridge",
-                trigger_text="消炎",
-                query="消炎相关的可购买商品概念",
-                local_catalog_gap="当前商品目录没有明确对应的可购买商品族。",
-                reason="用户目标模糊，需要外部知识桥接",
-            )
-        ],
-        agent_proposals=[
-            AgentTaskProposal(
-                proposal_id="p_knowledge",
-                capability="knowledge_research",
-                intent_ids=["i1"],
-                reason="先研究商品概念",
-            )
-        ],
-        plan_type="single_retrieval",
+    async def success(context: AgentExecutionContext) -> AgentResult:
+        return AgentResult.success({})
+
+    flow.executor.handlers.update(
+        {
+            "knowledge_research": knowledge,
+            "single_product_recommendation": retrieval,
+            "evidence_verification": verifier,
+            "answer_generation": answer,
+            "memory_distillation": success,
+        }
     )
 
+    asyncio.run(_collect_flow(flow, initial))
 
-def _single_product_plan() -> IntentPlan:
-    return IntentPlan(
-        original_query="150以内适合油皮通勤的防晒",
-        normalized_query="推荐150元以内适合油皮通勤的防晒霜",
-        primary_intent="product_recommendation",
-        intents=[
-            IntentItem(
-                intent_id="i1",
-                intent_type="product_recommendation",
-                goal="推荐适合油皮通勤的防晒霜",
-                query_rewrite=IntentQueryRewrite(
-                    semantic_query="适合油皮夏天通勤且清爽的防晒霜",
-                    keyword_query="防晒霜 油皮 清爽 通勤 150元以内",
-                ),
-            )
-        ],
-        execution_mode="single_product",
-        constraints=IntentConstraintSet(budget_max=150, budget_scope="per_item"),
-        agent_proposals=[
-            AgentTaskProposal(
-                proposal_id="p_single",
-                capability="single_product_recommendation",
-                intent_ids=["i1"],
-                reason="只有一个商品目标",
-            )
-        ],
-        plan_type="single_retrieval",
-        vector_query="适合油皮夏天通勤且清爽的防晒霜",
-        keyword_query="防晒霜 油皮 清爽 通勤 150元以内",
-        budget_max=150,
-        budget_scope="per_item",
-    )
+    assert len(planner.calls) == 1
+    assert planner.calls[0][0] == bridge.resolved_query
+    assert planner.calls[0][1]["intent_revision"]["intent_id"] == "i_bridge"
+    assert retrieval_calls.count("i_regular") == 1
+    assert retrieval_calls.count("i_bridge") == 1
+    revisions = flow.last_result.graph.metadata["intent_revisions"]
+    assert len(revisions) == 1
+    assert revisions[0]["intent_id"] == "i_bridge"
+    assert flow.last_result.graph.metadata["intent_order"] == ["i_bridge", "i_regular"]
 
 
-def _compound_plan() -> IntentPlan:
-    return IntentPlan(
-        original_query="按我平时偏好推荐一款150以内的油皮通勤防晒，再和刚才那款对比，解释为什么不闷并看看小红书评价",
-        normalized_query="按长期偏好推荐150元以内油皮通勤防晒，与上一款对比并解释清爽依据，补充小红书评价",
-        primary_intent="product_recommendation",
-        intents=[
-            IntentItem(
-                intent_id="i1",
-                intent_type="product_recommendation",
-                goal="推荐油皮通勤防晒",
-                query_rewrite=IntentQueryRewrite(
-                    semantic_query="适合油皮夏天通勤且清爽不闷的防晒霜",
-                    keyword_query="防晒霜 油皮 清爽 通勤 150元以内",
-                ),
-                route_basis=IntentRouteBasis(
-                    target_clarity="explicit_product",
-                    local_catalog_status="sufficient",
-                    external_information_need="none",
-                    product_family="防晒霜",
-                    reason="当前请求已经明确商品目标。",
-                ),
-            ),
-            IntentItem(
-                intent_id="i2",
-                intent_type="product_comparison",
-                goal="将新推荐与上一轮防晒进行对比",
-                depends_on=["i1"],
-                referenced_product_ids=["p_recent_001"],
-                route_basis=IntentRouteBasis(
-                    target_clarity="context_product",
-                    local_catalog_status="sufficient",
-                    external_information_need="explicit_platform",
-                    trigger_text="小红书",
-                    product_family="防晒霜",
-                    reason="用户明确要求查看小红书评价。",
-                ),
-            ),
-            IntentItem(
-                intent_id="i3",
-                intent_type="shopping_knowledge",
-                goal="解释防晒清爽不闷的证据依据",
-                depends_on=["i1"],
-            ),
-        ],
-        execution_mode="single_product",
-        constraints=IntentConstraintSet(
-            budget_max=150,
-            budget_scope="per_item",
-            items=[
-                IntentConstraint(name="skin_type", value="油皮", strength="hard"),
-                IntentConstraint(name="texture", value="清爽不闷", strength="soft"),
-            ],
-        ),
-        context_requests=[
-            ContextRequest(
-                request_id="ctx_profile",
-                usage="ranking_only",
-                query="防晒和肤感偏好",
-                reason="用户明确要求按照平时偏好推荐",
-            )
-        ],
-        research_requests=[
-            ResearchRequest(
-                request_id="r_xhs",
-                intent_id="i2",
-                mode="social_content",
-                consumer_capability="commerce_research",
-                trigger_type="explicit_platform_request",
-                trigger_text="小红书",
-                platforms=["xiaohongshu"],
-                query="两款防晒的真实使用评价",
-                reason="用户明确要求查看小红书评价",
-            )
-        ],
-        agent_proposals=[
-            AgentTaskProposal(
-                proposal_id="p_profile",
-                capability="profile_preference",
-                intent_ids=["i1"],
-                reason="需要个性化排序",
-            ),
-            AgentTaskProposal(
-                proposal_id="p_single",
-                capability="single_product_recommendation",
-                intent_ids=["i1"],
-                reason="只有一个新商品目标",
-            ),
-            AgentTaskProposal(
-                proposal_id="p_compare",
-                capability="comparison",
-                intent_ids=["i2"],
-                reason="用户要求对比",
-                depends_on=["p_single"],
-                optional_context_from=["p_commerce"],
-            ),
-            AgentTaskProposal(
-                proposal_id="p_knowledge",
-                capability="knowledge_research",
-                intent_ids=["i3"],
-                reason="用户要求解释肤感原理",
-                depends_on=["p_single"],
-            ),
-            AgentTaskProposal(
-                proposal_id="p_commerce",
-                capability="commerce_research",
-                intent_ids=["i2"],
-                reason="用户明确要求查看小红书评价。",
-            ),
-        ],
-        need_slots=[
-            RewriteNeedSlot(
-                slot_id="s1",
-                intent_id="i1",
-                goal="油皮通勤防晒",
-                product_type="防晒霜",
-                query="油皮通勤防晒霜",
-                semantic_query="适合油皮夏天通勤且清爽不闷的防晒霜",
-                keyword_query="防晒霜 油皮 清爽 通勤 150元以内",
-            )
-        ],
-        referenced_product_ids=["p_recent_001"],
-        plan_type="single_retrieval",
-    )
-
-
-def _multi_product_plan() -> IntentPlan:
-    return IntentPlan(
-        original_query="帮我配一套通勤穿搭",
-        normalized_query="帮我配一套通勤穿搭",
-        primary_intent="product_recommendation",
-        intents=[
-            IntentItem(
-                intent_id="i1",
-                intent_type="product_recommendation",
-                goal="完成通勤穿搭组合",
-            )
-        ],
-        execution_mode="multi_product",
-        need_slots=[
-            RewriteNeedSlot(
-                slot_id="s1",
-                intent_id="i1",
-                goal="通勤上装",
-                product_type="通勤上装",
-                query="通勤上装",
-            ),
-            RewriteNeedSlot(
-                slot_id="s2",
-                intent_id="i1",
-                goal="通勤下装",
-                product_type="通勤下装",
-                query="通勤下装",
-            ),
-        ],
-        agent_proposals=[
-            AgentTaskProposal(
-                proposal_id="p_multi",
-                capability="multi_product_bundle",
-                intent_ids=["i1"],
-                reason="用户要求配齐一套穿搭",
-            )
-        ],
-        plan_type="multi_retrieval",
-    )
-
-
-def _memory_span_recorder(turn_id: str) -> SpanRecorder:
-    recorder = SpanRecorder()
-    recorder._persist_run = lambda: None  # type: ignore[method-assign]
-    recorder._persist_span = lambda *args, **kwargs: None  # type: ignore[method-assign]
-    recorder.start_run(
-        user_id="u1",
-        session_id="s1",
-        turn_id=turn_id,
-        query_summary="test",
-    )
-    return recorder
+async def _collect_flow(flow: SupervisorFlow, plan: IntentPlanV3) -> list[dict]:
+    return [
+        event
+        async for event in flow.run(
+            query=plan.original_query,
+            user_id="u1",
+            session_id="s1",
+            turn_id="turn_flow",
+            intent_plan=plan,
+        )
+    ]

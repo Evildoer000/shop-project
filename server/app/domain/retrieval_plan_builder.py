@@ -124,6 +124,12 @@ class RetrievalPlanBuilder:
             ),
         )
         plan.retrieval_strategy = self._retrieval_strategy(plan)
+        requested_count = intent_plan.recommendation_policy.requested_count
+        if requested_count is not None:
+            plan.retrieval_strategy.final_top_k = max(
+                plan.retrieval_strategy.final_top_k,
+                requested_count,
+            )
         plan.filters = self._filters(plan)
         return plan
 

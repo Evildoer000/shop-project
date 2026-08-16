@@ -1,0 +1,48 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.4.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+        exclude: docs/badges
+      - id: check-added-large-files
+        args: ['--maxkb=5000'] # allow up to 5MB
+        exclude: examples
+      - id: check-json
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+      - id: check-toml
+
+  - repo: local
+    hooks:
+      - id: sql_formatter
+        name: SQL formatter
+        language: python
+        entry: sql-formatter --max-line-length=120
+        files: \.sql$
+        additional_dependencies: [sql-formatter]
+
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.6.1
+    hooks:
+      - id: nbstripout
+
+  - repo: https://github.com/psf/black
+    rev: 23.3.0
+    hooks:
+      - id: black
+        language_version: python3
+
+  - repo: https://github.com/charliermarsh/ruff-pre-commit
+    rev: v0.0.267
+    hooks:
+      - id: ruff
+        args: ["--line-length=160", "--fix"]
+
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.4.0
+    hooks:
+    -   id: detect-secrets
+        exclude: '.*\.dvc$'

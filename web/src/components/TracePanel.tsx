@@ -232,7 +232,7 @@ function agentLabel(agentId: string) {
     slot_retrieval_agent: "槽位检索 Agent",
     commerce_research_agent: "平台研究 Agent",
     comparison_agent: "商品对比 Agent",
-    knowledge_research_agent: "知识研究 Agent",
+    product_knowledge_agent: "商品信息与知识补充 Agent",
     evidence_verifier_agent: "证据校验 Agent",
     repair_agent: "修复 Agent",
     bundle_optimizer: "组合优化 Agent",

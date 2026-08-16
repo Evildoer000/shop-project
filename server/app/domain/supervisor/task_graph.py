@@ -69,7 +69,7 @@ class TaskGraphNode(BaseModel):
 
 
 class TaskGraph(BaseModel):
-    schema_version: str = "2.0"
+    schema_version: str = "3.0"
     graph_id: str
     turn_id: str
     nodes: list[TaskGraphNode] = Field(default_factory=list)
@@ -209,15 +209,37 @@ class TaskGraph(BaseModel):
                 result.append(node)
         return result
 
-    def mark_blocked_nodes(self) -> list[str]:
+    def mark_blocked_nodes(
+        self,
+        *,
+        exclude_capabilities: set[str] | None = None,
+    ) -> list[str]:
         """Mark failed-dependent pending nodes as skipped and preserve the reason."""
-        blocked = self.blocked_nodes()
+        excluded = exclude_capabilities or set()
+        blocked = [
+            node for node in self.blocked_nodes() if node.capability not in excluded
+        ]
         for node in blocked:
             node.status = "skipped"
             node.metadata = {**node.metadata, "skipped_reason": "dependency_failed"}
         if blocked:
             self.sync_handoffs()
         return [node.node_id for node in blocked]
+
+    def ancestor_node_ids(self, node_id: str) -> list[str]:
+        """Return this node's transitive inputs in deterministic topological order."""
+        target = self.require_node(node_id)
+        selected: set[str] = set()
+
+        def collect(current: TaskGraphNode) -> None:
+            for dependency_id in self._scheduling_dependencies(current):
+                if dependency_id in selected:
+                    continue
+                selected.add(dependency_id)
+                collect(self.require_node(dependency_id))
+
+        collect(target)
+        return [item for item in self.topological_order() if item in selected]
 
     def all_terminal(self, *, include_asynchronous: bool = True) -> bool:
         nodes = [

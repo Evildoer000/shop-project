@@ -56,6 +56,7 @@ from app.schemas import (
     DecisionTrace,
     ImageAttributes,
     IntentPlan,
+    IntentPlanV3,
     MULTI_NEED_PRODUCT_CARD_LIMIT,
     ProductCard,
     QueryPlan,
@@ -79,6 +80,8 @@ CLIENT_TRACE_DROP_KEYS = {
     "normalized_query",
     "message",
 }
+
+MAX_POLICY_REPLAN_ATTEMPTS = 1
 
 
 class EcommerceOrchestrator:
@@ -219,11 +222,12 @@ class EcommerceOrchestrator:
             repair_agent=self.repair_agent,
             answer_generator=self.answer_generator,
             product_repository=self.product_repository,
+            product_detail_tool=self.product_detail_tool,
             commerce_search=self.commerce_search_tool,
             commerce_product_detail=self.commerce_product_detail_tool,
             commerce_reviews=self.commerce_reviews_tool,
             web_search=self.web_search_tool,
-            knowledge_llm=LlmClient(component="KnowledgeResearchAgent"),
+            knowledge_llm=LlmClient(component="ProductKnowledgeAgent"),
             comparison_llm=LlmClient(component="ComparisonAgent"),
             slot_runner=self._graph_slot_runner,
             memory_scheduler=self._schedule_graph_memory,
@@ -811,8 +815,9 @@ class EcommerceOrchestrator:
             session_id=request.session_id,
             metadata={"endpoint": "chat_stream", "runtime": "supervisor_graph"},
         )
-        intent_plan: IntentPlan | None = None
+        intent_plan: IntentPlanV3 | None = None
         planner_span = None
+        policy_replan_attempt = 0
         try:
             input_span = self.span_recorder.start_span(
                 "input_normalize",
@@ -979,33 +984,198 @@ class EcommerceOrchestrator:
                     yield event
                 return
 
-            self.decide_execution_path(task, intent_plan)
-            supervisor_stream = self.supervisor_flow.run(
-                query=planner_query,
-                user_id=request.user_id,
-                session_id=request.session_id,
-                turn_id=task.turn_id,
-                intent_plan=intent_plan,
-                conversation_context=conversation_context,
-                image_path=str(image_path) if image_path is not None else None,
-                intent_span_key=planner_payload.get("span_key"),
-                metadata={
-                    "request": request,
-                    "planner_context": planner_context,
-                    "profile_narrative": "",
-                    "run_id": self.span_recorder.run_id,
-                },
-            )
-            async with aclosing(supervisor_stream) as graph_stream:
-                async for event in graph_stream:
-                    event_type = str(event.get("type") or "")
-                    if event_type == "done":
-                        continue
-                    if event_type == "token":
-                        self.span_recorder.mark_first_token()
-                    if event_type in {"decision_trace", "trace"}:
-                        event = self._drop_client_trace_fields(event)
-                    yield event
+            # A rejected IntentPlan is a planning problem, not a runtime node
+            # failure. Give the same planner one structured correction attempt;
+            # never loop indefinitely on a plan that policy still rejects.
+            while True:
+                self.decide_execution_path(task, intent_plan)
+                supervisor_stream = self.supervisor_flow.run(
+                    query=planner_query,
+                    user_id=request.user_id,
+                    session_id=request.session_id,
+                    turn_id=task.turn_id,
+                    intent_plan=intent_plan,
+                    conversation_context=conversation_context,
+                    image_path=str(image_path) if image_path is not None else None,
+                    intent_span_key=planner_payload.get("span_key"),
+                    policy_attempt=policy_replan_attempt + 1,
+                    metadata={
+                        "request": request,
+                        "planner_context": planner_context,
+                        "profile_narrative": "",
+                        "run_id": self.span_recorder.run_id,
+                        "policy_replan_attempt": policy_replan_attempt,
+                    },
+                )
+                try:
+                    async with aclosing(supervisor_stream) as graph_stream:
+                        async for event in graph_stream:
+                            event_type = str(event.get("type") or "")
+                            if event_type == "done":
+                                continue
+                            if event_type == "token":
+                                self.span_recorder.mark_first_token()
+                            if event_type in {"decision_trace", "trace"}:
+                                event = self._drop_client_trace_fields(event)
+                            yield event
+                    break
+                except SupervisorPolicyRejectedError as exc:
+                    evaluation_model = getattr(exc, "evaluation", None)
+                    policy_evaluation = (
+                        evaluation_model.model_dump()
+                        if evaluation_model is not None
+                        else {"approved": False, "errors": list(exc.errors)}
+                    )
+                    policy_span_payload = getattr(exc, "policy_span_payload", None)
+                    if policy_span_payload is not None:
+                        yield self._timing_event(policy_span_payload)
+                    await trace_run.span(
+                        "supervisor_policy_gate",
+                        input_payload={"intent_plan": intent_plan.model_dump()},
+                        output_payload=policy_evaluation,
+                        metadata={
+                            "policy_attempt": policy_replan_attempt + 1,
+                            "approved": False,
+                        },
+                    )
+                    yield self._trace_event(
+                        "supervisor_policy_gate",
+                        "Supervisor 策略门拒绝了当前计划，中心调用者收到结构化拒绝原因。",
+                        policy_evaluation=policy_evaluation,
+                        policy_attempt=policy_replan_attempt + 1,
+                    )
+
+                    if (
+                        policy_replan_attempt >= MAX_POLICY_REPLAN_ATTEMPTS
+                        or not self.budget_manager.can_call_planner(task)
+                    ):
+                        raise
+
+                    policy_replan_attempt += 1
+                    previous_intent_plan = intent_plan
+                    replan_context = {
+                        **planner_context,
+                        "replan_attempt": policy_replan_attempt,
+                        "previous_intent_plan": previous_intent_plan.model_dump(),
+                        "policy_evaluation": policy_evaluation,
+                        "replan_instruction": (
+                            "请根据策略门的结构化拒绝原因生成一份完整替代计划；"
+                            "保留用户目标和硬约束，只修正被拒绝的路由、研究请求或依赖关系。"
+                        ),
+                    }
+                    planner_context = replan_context
+                    policy_parent_span_key = str(
+                        (policy_span_payload or {}).get("span_key")
+                        or planner_payload.get("span_key")
+                        or ""
+                    )
+                    self.budget_manager.record_planner_call(task)
+                    planner_span = self.span_recorder.start_span(
+                        "intent_planning",
+                        label="策略拒绝后的重新规划",
+                        agent="IntentUnderstandingAgent",
+                        parent_span_key=policy_parent_span_key or None,
+                        task_id=f"{task.turn_id}:intent_understanding:attempt:2",
+                        agent_id="intent_understanding_agent",
+                        span_type="agent",
+                        attempt=2,
+                        input_summary={
+                            "query_length": len(planner_query),
+                            "replan_attempt": policy_replan_attempt,
+                            "previous_intent_count": len(previous_intent_plan.intents),
+                            "previous_task_count": len(previous_intent_plan.task_proposals),
+                            "policy_error_count": len(policy_evaluation.get("errors") or []),
+                            "policy_decision_count": len(policy_evaluation.get("decisions") or []),
+                            "prompt_version": self.prompt_registry.require("intent_understanding_agent").version,
+                        },
+                    )
+                    intent_plan = None
+                    yield self._agent_update(
+                        stage="planner",
+                        title="重新规划执行路线",
+                        content_delta="原计划未通过策略检查，正在把拒绝原因交给意图理解 Agent 重新生成计划。",
+                        done=False,
+                    )
+                    with bind_llm_trace_context(
+                        run_id=self.span_recorder.run_id,
+                        parent_span_key=planner_span.span_key,
+                        task_id=f"{task.turn_id}:intent_understanding:attempt:2",
+                        agent_id="intent_understanding_agent",
+                        attempt=2,
+                        span_recorder=self.span_recorder,
+                    ):
+                        async for planner_event in self.intent_planner.stream_plan_with_summary(
+                            planner_query,
+                            planner_context,
+                        ):
+                            if getattr(planner_event, "kind", "") == "summary_delta":
+                                content = str(getattr(planner_event, "content", "") or "")
+                                if content:
+                                    yield self._agent_update(
+                                        stage="planner",
+                                        title="重新规划执行路线",
+                                        content_delta=content,
+                                        done=False,
+                                    )
+                            elif getattr(planner_event, "kind", "") == "plan":
+                                intent_plan = getattr(planner_event, "intent_plan", None)
+                    if intent_plan is None:
+                        raise StructuredLlmValidationError(
+                            "IntentUnderstandingAgent did not return a replacement IntentPlan.",
+                            errors=["missing IntentPlan after policy replan"],
+                            data=None,
+                            content="",
+                        )
+                    planner_payload = self._finish_span(
+                        planner_span,
+                        output_summary=intent_plan.model_dump(),
+                        metrics={
+                            **self._planner_rule_metrics(intent_plan),
+                            "replan_attempt": policy_replan_attempt,
+                            "policy_rejection_count": 1,
+                        },
+                    )
+                    planner_span = None
+                    self._update_planner_proposal(task, intent_plan)
+                    task.add_step(
+                        "intent_replanning",
+                        "succeeded",
+                        input_summary={
+                            "replan_attempt": policy_replan_attempt,
+                            "policy_evaluation": policy_evaluation,
+                        },
+                        output_summary=intent_plan.model_dump(),
+                    )
+                    self.decide_intent_plan(task, intent_plan)
+                    await trace_run.span(
+                        "intent_understanding",
+                        input_payload={
+                            "query": planner_query,
+                            "context": replan_context,
+                        },
+                        output_payload=intent_plan.model_dump(),
+                        metadata={
+                            "prompt_version": self.prompt_registry.require("intent_understanding_agent").version,
+                            "attempt": 2,
+                            "replanned_after_policy_rejection": True,
+                        },
+                        as_type="generation",
+                    )
+                    yield self._timing_event(planner_payload)
+                    yield self._agent_update(
+                        stage="planner",
+                        title="重新规划执行路线",
+                        content_delta="替代计划已生成，正在再次提交 Supervisor 策略门检查。",
+                        done=True,
+                    )
+                    yield self._trace_event(
+                        "intent_understanding_replan",
+                        "IntentUnderstandingAgent 已根据策略拒绝原因提交替代计划。",
+                        intent_plan=intent_plan.model_dump(),
+                        replan_attempt=policy_replan_attempt,
+                        previous_plan=previous_intent_plan.model_dump(),
+                    )
+                    continue
 
             result = self.supervisor_flow.last_result
             if result is None:
@@ -1044,7 +1214,7 @@ class EcommerceOrchestrator:
             )
             self.span_recorder.finish_run(
                 route=result.route,
-                plan_type=intent_plan.plan_type,
+                plan_type=self._plan_label(intent_plan),
                 product_ids=result.product_ids,
                 evaluation_summary=evaluation,
                 status=run_status,
@@ -1074,16 +1244,20 @@ class EcommerceOrchestrator:
                 yield event
         except SupervisorPolicyRejectedError as exc:
             logger.warning("Supervisor PolicyGate rejected request: %s", exc)
+            evaluation_model = getattr(exc, "evaluation", None)
+            policy_evaluation = (
+                evaluation_model.model_dump()
+                if evaluation_model is not None
+                else {"approved": False, "errors": list(exc.errors)}
+            )
             evaluation = {
-                "policy_gate": {
-                    "approved": False,
-                    "errors": list(exc.errors),
-                }
+                "policy_gate": policy_evaluation,
+                "replan_attempts": policy_replan_attempt,
             }
             if self.span_recorder.status == "running":
                 self.span_recorder.finish_run(
                     route="policy_rejected",
-                    plan_type=intent_plan.plan_type if intent_plan else "",
+                    plan_type=self._plan_label(intent_plan),
                     product_ids=[],
                     evaluation_summary=evaluation,
                     status="failed",
@@ -1113,7 +1287,7 @@ class EcommerceOrchestrator:
             if self.span_recorder.status == "running":
                 self.span_recorder.finish_run(
                     route="cancelled",
-                    plan_type=intent_plan.plan_type if intent_plan else "",
+                    plan_type=self._plan_label(intent_plan),
                     product_ids=[],
                     evaluation_summary={},
                     status="cancelled",
@@ -1125,7 +1299,7 @@ class EcommerceOrchestrator:
             if self.span_recorder.status == "running":
                 self.span_recorder.finish_run(
                     route="cancelled",
-                    plan_type=intent_plan.plan_type if intent_plan else "",
+                    plan_type=self._plan_label(intent_plan),
                     product_ids=[],
                     evaluation_summary={},
                     status="cancelled",
@@ -1147,7 +1321,7 @@ class EcommerceOrchestrator:
             if self.span_recorder.status == "running":
                 self.span_recorder.finish_run(
                     route="supervisor_failed",
-                    plan_type=intent_plan.plan_type if intent_plan else "",
+                    plan_type=self._plan_label(intent_plan),
                     product_ids=[],
                     evaluation_summary={},
                     status="failed",
@@ -1177,14 +1351,32 @@ class EcommerceOrchestrator:
         if not isinstance(request, ChatStreamRequest):
             return
         intent_plan = context.artifact("intent_plan")
-        if not isinstance(intent_plan, IntentPlan):
+        if not isinstance(intent_plan, (IntentPlan, IntentPlanV3)):
             intent_plan = context.intent_plan
-        reflection = context.artifact("reflection")
-        reflection_summary = (
-            self._reflection_summary(reflection)
-            if isinstance(reflection, ReflectionResult)
-            else {}
-        )
+        if not isinstance(intent_plan, (IntentPlan, IntentPlanV3)):
+            return
+        reflections: dict[str, Any] = {}
+        if isinstance(intent_plan, IntentPlanV3):
+            terminals = context.graph.metadata.get("branch_terminal_nodes", {})
+            for intent_id, terminal_id in terminals.items():
+                if context.graph.get_node(terminal_id) is None:
+                    continue
+                node_ids = [
+                    *context.graph.ancestor_node_ids(terminal_id),
+                    terminal_id,
+                ]
+                for node_id in reversed(node_ids):
+                    scoped = context.artifacts.get(f"artifacts:{node_id}")
+                    reflection = (
+                        scoped.get("reflection") if isinstance(scoped, dict) else None
+                    )
+                    if isinstance(reflection, ReflectionResult):
+                        reflections[str(intent_id)] = self._reflection_summary(reflection)
+                        break
+        else:
+            reflection = context.artifact("reflection")
+            if isinstance(reflection, ReflectionResult):
+                reflections["legacy"] = self._reflection_summary(reflection)
         route = str(context.artifact("answer_route") or "no_product")
         product_ids = list(context.artifact("answer_product_ids") or [])
         self._schedule_memory_update(
@@ -1196,60 +1388,110 @@ class EcommerceOrchestrator:
             intent_plan=intent_plan,
             decision_trace={
                 "route": route,
-                "retrieval_summary": reflection_summary,
+                "intent_order": (
+                    [intent.intent_id for intent in intent_plan.intents]
+                    if isinstance(intent_plan, IntentPlanV3)
+                    else []
+                ),
+                "answer_branches": context.artifact("answer_branches", []),
+                "reflections_by_intent": reflections,
             },
         )
 
-    def _supervisor_evaluation_summary(self, intent_plan: IntentPlan, result: Any) -> dict[str, Any]:
-        reflection = result.reflection if isinstance(result.reflection, ReflectionResult) else ReflectionResult(
-            has_passed_products=False,
-            reason="本轮未产生商品校验结果。",
+    def _supervisor_evaluation_summary(self, intent_plan: IntentPlanV3, result: Any) -> dict[str, Any]:
+        recalled_product_ids = {
+            str(product_id)
+            for agent_result in result.report.results.values()
+            if isinstance(agent_result.output, dict)
+            for product_id in agent_result.output.get("candidate_ids", [])
+            if product_id
+        }
+        recall_count = len(recalled_product_ids)
+        reflections = result.reflection if isinstance(result.reflection, dict) else {}
+        evidence_ids = {
+            product_id
+            for value in reflections.values()
+            if isinstance(value, dict)
+            for product_id in value.get("passed_product_ids", [])
+        }
+        rejected_count = sum(
+            len(value.get("rejected_products", []))
+            for value in reflections.values()
+            if isinstance(value, dict)
         )
-        single = result.report.artifacts.get("verified_evidence") or result.report.artifacts.get("single_evidence")
-        state = result.report.artifacts.get("verified_state") or result.report.artifacts.get("multi_state")
-        if state is not None:
-            recall_count = sum(len(items) for items in state.candidates_by_slot.values())
-        else:
-            recall_count = len(getattr(single, "ranked", []) or [])
-        corrective = self._corrective_rule_metrics(reflection, recall_count)
+        denominator = max(recall_count, len(evidence_ids) + rejected_count)
+        pass_rate = round(len(evidence_ids) / denominator, 4) if denominator else 0.0
         final_ids = set(result.product_ids or [])
-        evidence_ids = set(reflection.passed_product_ids or [])
         products_from_evidence = not final_ids or bool(evidence_ids) and final_ids.issubset(evidence_ids)
+        policy_statuses = result.graph.metadata.get("intent_statuses", {})
+        supported_count = sum(
+            1
+            for value in policy_statuses.values()
+            if value.get("status") != "unsupported"
+        )
+        product_need_count = sum(len(intent.product_needs) for intent in intent_plan.intents)
+        budget_constraint_count = sum(
+            1
+            for intent in intent_plan.intents
+            for item in intent.constraints
+            if "budget" in item.name.lower() or "预算" in item.name
+        )
         return {
             "checks": [
                 {
-                    "key": "plan_type",
-                    "label": "plan_type（计划类型）",
-                    "value": intent_plan.plan_type,
-                    "status": "passed" if intent_plan.plan_type in IntentPlanner.PLAN_TYPES else "warning",
-                    "description": "IntentUnderstandingAgent 输出的主执行计划类型。",
+                    "key": "intent_count",
+                    "label": "intent_count（独立意图数）",
+                    "value": len(intent_plan.intents),
+                    "status": "passed" if intent_plan.intents else "warning",
+                    "description": "本轮按可独立执行和回答的目标拆出的意图数量。",
                 },
                 {
-                    "key": "need_slot_count",
-                    "label": "need_slots（需求槽位数）",
-                    "value": len(intent_plan.need_slots),
-                    "status": "passed" if intent_plan.plan_type != "multi_retrieval" or len(intent_plan.need_slots) >= 2 else "warning",
-                    "description": "多商品组合应拆出至少两个独立槽位。",
+                    "key": "task_count",
+                    "label": "task_count（专家任务数）",
+                    "value": len(intent_plan.task_proposals),
+                    "status": "passed" if supported_count == len(intent_plan.intents) else "warning",
+                    "description": "每个意图可以拥有独立任务；相同 Agent 能力也不会合并。",
                 },
                 {
-                    "key": "budget_extracted",
-                    "label": "budget（预算识别）",
-                    "value": self._budget_value(intent_plan),
-                    "status": "passed" if intent_plan.budget_min is not None or intent_plan.budget_max is not None else "skipped",
-                    "description": "展示当前消息和会话上下文中的预算识别结果。",
+                    "key": "product_need_count",
+                    "label": "product_needs（业务商品需求数）",
+                    "value": product_need_count,
+                    "status": "passed" if product_need_count else "skipped",
+                    "description": "组合意图内部的业务商品需求；技术检索槽位由检索 Agent 自己生成。",
+                },
+                {
+                    "key": "budget_constraints",
+                    "label": "budget_constraints（预算约束数）",
+                    "value": budget_constraint_count,
+                    "status": "passed" if budget_constraint_count else "skipped",
+                    "description": "预算现在绑定到各自 intent，不再使用全局预算字段。",
                 },
                 {
                     "key": "recall_count",
                     "label": "recall_count（召回数量）",
                     "value": recall_count,
-                    "status": "passed" if recall_count > 0 else ("skipped" if intent_plan.plan_type in {"direct_answer", "clarify"} else "warning"),
+                    "status": (
+                        "passed"
+                        if recall_count > 0
+                        else "warning"
+                        if any(
+                            task.capability
+                            in {
+                                "single_product_recommendation",
+                                "multi_product_bundle",
+                                "slot_product_retrieval",
+                            }
+                            for task in intent_plan.task_proposals
+                        )
+                        else "skipped"
+                    ),
                     "description": "进入 EvidenceVerifier 前的本地商品候选数量。",
                 },
                 {
                     "key": "corrective_pass_rate",
                     "label": "corrective_pass_rate（证据校验通过率）",
-                    "value": corrective["corrective_pass_rate"],
-                    "status": "passed" if recall_count == 0 or corrective["corrective_pass_rate"] > 0 else "warning",
+                    "value": pass_rate,
+                    "status": "passed" if recall_count == 0 or pass_rate > 0 else "warning",
                     "description": "EvidenceVerifier 通过商品数除以候选商品数。",
                 },
                 {
@@ -1262,9 +1504,10 @@ class EcommerceOrchestrator:
             ],
             "raw": {
                 "recall_count": recall_count,
-                "passed_product_ids": list(reflection.passed_product_ids),
-                "rejected_count": len(reflection.rejected_products),
-                "fallback_plan": reflection.fallback_plan,
+                "recalled_product_ids": sorted(recalled_product_ids),
+                "passed_product_ids": sorted(evidence_ids),
+                "rejected_count": rejected_count,
+                "intent_statuses": policy_statuses,
                 "route": result.route,
             },
         }
@@ -2554,7 +2797,51 @@ class EcommerceOrchestrator:
         )
         return self._timing_event()
 
-    def _planner_rule_metrics(self, intent_plan: IntentPlan) -> dict[str, Any]:
+    def _planner_rule_metrics(
+        self,
+        intent_plan: IntentPlan | IntentPlanV3,
+    ) -> dict[str, Any]:
+        if isinstance(intent_plan, IntentPlanV3):
+            budget_constraints = [
+                item
+                for intent in intent_plan.intents
+                for item in intent.constraints
+                if item.name.strip().lower()
+                in {
+                    "budget",
+                    "budget_min",
+                    "budget_max",
+                    "budget_scope",
+                    "min_budget",
+                    "max_budget",
+                    "预算",
+                    "预算下限",
+                    "预算上限",
+                    "预算范围",
+                }
+            ]
+            return {
+                "schema_version": intent_plan.schema_version,
+                "intent_count": len(intent_plan.intents),
+                "required_intent_count": sum(
+                    1 for intent in intent_plan.intents if intent.priority == "required"
+                ),
+                "task_count": len(intent_plan.task_proposals),
+                "capabilities": [
+                    task.capability for task in intent_plan.task_proposals
+                ],
+                "product_need_count": sum(
+                    len(intent.product_needs) for intent in intent_plan.intents
+                ),
+                "budget_constraint_count": len(budget_constraints),
+                "referenced_product_count": len(
+                    {
+                        product_id
+                        for intent in intent_plan.intents
+                        for product_id in intent.referenced_product_ids
+                    }
+                ),
+            }
         return {
             "plan_type": intent_plan.plan_type,
             "plan_type_valid": intent_plan.plan_type
@@ -3054,7 +3341,23 @@ class EcommerceOrchestrator:
         )
         yield {"type": "done"}
 
-    def _update_planner_proposal(self, task: TurnTaskState, intent_plan: IntentPlan) -> None:
+    def _update_planner_proposal(
+        self,
+        task: TurnTaskState,
+        intent_plan: IntentPlan | IntentPlanV3,
+    ) -> None:
+        if isinstance(intent_plan, IntentPlanV3):
+            task.planner_proposal = {
+                "schema_version": intent_plan.schema_version,
+                "original_query": intent_plan.original_query,
+                "normalized_query": intent_plan.normalized_query,
+                "summary": intent_plan.summary,
+                "intents": [intent.model_dump() for intent in intent_plan.intents],
+                "task_proposals": [
+                    proposal.model_dump() for proposal in intent_plan.task_proposals
+                ],
+            }
+            return
         task.planner_proposal = {
             "original_query": intent_plan.original_query,
             "summary": intent_plan.summary,
@@ -3070,7 +3373,24 @@ class EcommerceOrchestrator:
             "plan_reason": intent_plan.plan_reason,
         }
 
-    def decide_intent_plan(self, task: TurnTaskState, intent_plan: IntentPlan) -> OrchestratorDecision:
+    def decide_intent_plan(
+        self,
+        task: TurnTaskState,
+        intent_plan: IntentPlan | IntentPlanV3,
+    ) -> OrchestratorDecision:
+        if isinstance(intent_plan, IntentPlanV3):
+            return task.add_decision(
+                OrchestratorDecision(
+                    decision="intent_plan",
+                    approved=True,
+                    selected=self._plan_label(intent_plan),
+                    reason=(
+                        intent_plan.summary
+                        or "IntentUnderstandingAgent produced a valid intent-scoped V3 task proposal."
+                    ),
+                    proposal_summary=task.planner_proposal,
+                )
+            )
         return task.add_decision(
             OrchestratorDecision(
                 decision="intent_plan",
@@ -3193,7 +3513,30 @@ class EcommerceOrchestrator:
             )
         )
 
-    def decide_execution_path(self, task: TurnTaskState, intent_plan: IntentPlan) -> OrchestratorDecision:
+    def decide_execution_path(
+        self,
+        task: TurnTaskState,
+        intent_plan: IntentPlan | IntentPlanV3,
+    ) -> OrchestratorDecision:
+        if isinstance(intent_plan, IntentPlanV3):
+            label = self._plan_label(intent_plan)
+            return task.add_decision(
+                OrchestratorDecision(
+                    decision="execution_path",
+                    selected=label,
+                    reason=(
+                        "Supervisor will evaluate and compile each intent-scoped task independently."
+                    ),
+                    proposal_summary={
+                        "schema_version": intent_plan.schema_version,
+                        "intent_count": len(intent_plan.intents),
+                        "task_count": len(intent_plan.task_proposals),
+                        "intent_order": [
+                            intent.intent_id for intent in intent_plan.intents
+                        ],
+                    },
+                )
+            )
         return task.add_decision(
             OrchestratorDecision(
                 decision="execution_path",
@@ -3202,6 +3545,21 @@ class EcommerceOrchestrator:
                 proposal_summary={"plan_type": intent_plan.plan_type},
             )
         )
+
+    def _plan_label(self, intent_plan: IntentPlanV3 | None) -> str:
+        """Return an observational label; V3 routing never branches on it."""
+        if intent_plan is None:
+            return ""
+        if len(intent_plan.intents) > 1:
+            return "multi_intent"
+        if intent_plan.task_proposals:
+            capabilities = list(
+                dict.fromkeys(task.capability for task in intent_plan.task_proposals)
+            )
+            return "+".join(capabilities)
+        if intent_plan.intents:
+            return intent_plan.intents[0].intent_type
+        return "empty_intent_plan"
 
     def decide_repair(self, task: TurnTaskState, trigger: str) -> OrchestratorDecision:
         repairable = trigger in {
@@ -3593,7 +3951,7 @@ class EcommerceOrchestrator:
         answer_text: str,
         route: str,
         product_ids: list[str],
-        intent_plan: IntentPlan,
+        intent_plan: IntentPlan | IntentPlanV3,
         decision_trace: dict[str, Any],
         evidence_bundle: EvidenceBundle | None = None,
     ) -> None:
@@ -3627,7 +3985,7 @@ class EcommerceOrchestrator:
         answer_text: str,
         route: str,
         product_ids: list[str],
-        intent_plan: IntentPlan,
+        intent_plan: IntentPlan | IntentPlanV3,
         decision_trace: dict[str, Any],
         evidence_bundle: EvidenceBundle | None = None,
     ) -> None:

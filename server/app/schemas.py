@@ -154,15 +154,8 @@ IntentType = Literal[
     "cart_action",
 ]
 
-ExecutionMode = Literal[
-    "direct",
-    "clarify",
-    "context_evidence",
-    "single_product",
-    "multi_product",
-]
-
 InputModality = Literal["text", "image", "audio"]
+IntentPriority = Literal["required", "optional"]
 
 AgentCapability = Literal[
     "intent_understanding",
@@ -183,11 +176,6 @@ AgentCapability = Literal[
 ]
 
 
-class IntentQueryRewrite(BaseModel):
-    semantic_query: str = ""
-    keyword_query: str = ""
-
-
 class IntentRouteBasis(BaseModel):
     """Planner-observed facts used by deterministic routing policy."""
 
@@ -197,7 +185,6 @@ class IntentRouteBasis(BaseModel):
         "context_product",
         "vague_effect_or_use",
     ] = "not_applicable"
-    local_catalog_status: Literal["sufficient", "insufficient", "unknown"] = "unknown"
     external_information_need: Literal[
         "none",
         "explicit_web",
@@ -208,16 +195,6 @@ class IntentRouteBasis(BaseModel):
     trigger_text: str = ""
     product_family: str = ""
     reason: str = ""
-
-
-class IntentItem(BaseModel):
-    intent_id: str
-    intent_type: IntentType
-    goal: str
-    depends_on: list[str] = Field(default_factory=list)
-    query_rewrite: IntentQueryRewrite = Field(default_factory=IntentQueryRewrite)
-    referenced_product_ids: list[str] = Field(default_factory=list)
-    route_basis: IntentRouteBasis = Field(default_factory=IntentRouteBasis)
 
 
 class IntentConstraint(BaseModel):
@@ -239,6 +216,64 @@ class IntentConstraintSet(BaseModel):
     budget_max: float | None = None
     budget_scope: Literal["per_item", "total", "unknown"] = "unknown"
     items: list[IntentConstraint] = Field(default_factory=list)
+
+
+class IntentUncertainty(BaseModel):
+    field: str
+    description: str
+    blocking: bool = False
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class IntentProductNeed(BaseModel):
+    """A business product need; retrieval-engine details are deliberately absent."""
+
+    need_id: str
+    priority: IntentPriority = "required"
+    goal: str
+    product_type: str = ""
+    constraints: list[IntentConstraint] = Field(default_factory=list)
+    exclusions: list[str] = Field(default_factory=list)
+
+
+class RecommendationPolicy(BaseModel):
+    """Intent-scoped rules for assembling and selecting recommendation candidates."""
+
+    candidate_source: Literal[
+        "context_only",
+        "context_plus_new",
+        "new_only",
+    ] = "new_only"
+    reference_policy: Literal[
+        "none",
+        "must_include",
+        "eligible",
+        "comparison_only",
+    ] = "none"
+    requested_count: int | None = Field(default=None, ge=1, le=50)
+    count_mode: Literal[
+        "exact",
+        "at_most",
+        "at_least",
+        "unknown",
+    ] = "unknown"
+    reason: str = ""
+
+
+class IntentItem(BaseModel):
+    intent_id: str
+    intent_type: IntentType
+    priority: IntentPriority = "required"
+    goal: str
+    resolved_query: str
+    constraints: list[IntentConstraint] = Field(default_factory=list)
+    referenced_product_ids: list[str] = Field(default_factory=list)
+    recommendation_policy: RecommendationPolicy = Field(
+        default_factory=RecommendationPolicy
+    )
+    product_needs: list[IntentProductNeed] = Field(default_factory=list)
+    uncertainties: list[IntentUncertainty] = Field(default_factory=list)
+    route_basis: IntentRouteBasis = Field(default_factory=IntentRouteBasis)
 
 
 class ContextRequest(BaseModel):
@@ -263,7 +298,7 @@ class ResearchRequest(BaseModel):
     request_id: str
     intent_id: str
     mode: Literal["web_general", "marketplace", "social_content"]
-    consumer_capability: Literal["knowledge_research", "comparison", "commerce_research"]
+    consumer_capability: Literal["knowledge_research", "commerce_research"]
     trigger_type: Literal[
         "explicit_web_request",
         "explicit_platform_request",
@@ -279,44 +314,61 @@ class ResearchRequest(BaseModel):
     required: bool = False
 
 
+class AgentTaskParameters(BaseModel):
+    """Typed business inputs passed to one proposed Agent task."""
+
+    query: str = ""
+    freshness: Literal["any", "recent", "realtime"] = "recent"
+    platforms: list[Literal["taobao", "douyin_ec", "xiaohongshu"]] = Field(default_factory=list)
+    trigger_type: Literal[
+        "none",
+        "explicit_web_request",
+        "explicit_platform_request",
+        "freshness_required",
+        "knowledge_bridge",
+    ] = "none"
+    trigger_text: str = ""
+    profile_usage: Literal[
+        "intent_refinement",
+        "ranking_only",
+        "answer_personalization",
+    ] = "ranking_only"
+    missing_fields: list[str] = Field(default_factory=list)
+    question_goal: str = ""
+    product_need_ids: list[str] = Field(default_factory=list)
+    referenced_product_ids: list[str] = Field(default_factory=list)
+    comparison_dimensions: list[str] = Field(default_factory=list)
+
+
 class AgentTaskProposal(BaseModel):
-    proposal_id: str
+    task_id: str
     capability: AgentCapability
     intent_ids: list[str] = Field(default_factory=list)
+    objective: str
     reason: str
-    # The Supervisor derives core/auxiliary status from the execution contract.
-    # Planner output may narrow a branch but cannot promote an auxiliary branch.
-    required: bool = False
     depends_on: list[str] = Field(default_factory=list)
     optional_context_from: list[str] = Field(default_factory=list)
-    expected_output_schema: str = ""
+    parameters: AgentTaskParameters = Field(default_factory=AgentTaskParameters)
 
 
-class IntentUncertainty(BaseModel):
-    field: str
-    description: str
-    blocking: bool = False
-    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+class IntentPlanV3(BaseModel):
+    """Planner proposal consumed by the Supervisor; no global route or retrieval plan."""
+
+    schema_version: Literal["3.0"] = "3.0"
+    original_query: str = Field(default="", exclude=True)
+    normalized_query: str = Field(default="", exclude=True)
+    summary: str = ""
+    intents: list[IntentItem] = Field(default_factory=list)
+    task_proposals: list[AgentTaskProposal] = Field(default_factory=list)
 
 
-class IntentPlan(BaseModel):
-    schema_version: str = "2.0"
+class RetrievalIntentPlan(BaseModel):
+    """Task-local projection built inside a retrieval Agent, never by the planner LLM."""
+
     original_query: str = ""
     normalized_query: str = ""
     summary: str = ""
-    primary_intent: IntentType = "product_recommendation"
-    intents: list[IntentItem] = Field(default_factory=list)
-    execution_mode: ExecutionMode = "single_product"
-    input_modalities: list[InputModality] = Field(default_factory=lambda: ["text"])
     constraints: IntentConstraintSet = Field(default_factory=IntentConstraintSet)
-    context_requests: list[ContextRequest] = Field(default_factory=list)
-    clarification: ClarificationProposal = Field(default_factory=ClarificationProposal)
-    research_requests: list[ResearchRequest] = Field(default_factory=list)
-    agent_proposals: list[AgentTaskProposal] = Field(default_factory=list)
-    uncertainties: list[IntentUncertainty] = Field(default_factory=list)
-
-    # Retrieval projection consumed by the current retrieval workers. The Supervisor
-    # will own this projection once the execution layer is connected.
     plan_type: PlanType = "single_retrieval"
     vector_query: str = ""
     keyword_query: str = ""
@@ -325,8 +377,16 @@ class IntentPlan(BaseModel):
     budget_scope: Literal["per_item", "total", "unknown"] = "unknown"
     need_slots: list[RewriteNeedSlot] = Field(default_factory=list)
     referenced_product_ids: list[str] = Field(default_factory=list)
+    recommendation_policy: RecommendationPolicy = Field(
+        default_factory=RecommendationPolicy
+    )
     profile_lookup: ProfileLookupProposal = Field(default_factory=ProfileLookupProposal)
     plan_reason: str = ""
+
+
+# Existing retrieval workers use this import name. It now explicitly points to
+# the task-local projection rather than the Supervisor's V3 planning contract.
+IntentPlan = RetrievalIntentPlan
 
 
 class ImageAttributes(BaseModel):
@@ -358,7 +418,17 @@ class ReflectionResult(BaseModel):
     has_passed_products: bool = True
     reason: str = ""
     used_llm: bool = False
+    verified_product_ids: list[str] = Field(default_factory=list)
     passed_product_ids: list[str] = Field(default_factory=list)
+    selected_product_ids: list[str] = Field(default_factory=list)
+    quantity_status: Literal[
+        "met",
+        "partial",
+        "unavailable",
+        "constraint_conflict",
+        "not_applicable",
+    ] = "not_applicable"
+    reference_decisions: list[dict] = Field(default_factory=list)
     rejected_products: list[dict] = Field(default_factory=list)
     slot_coverage: list[dict] = Field(default_factory=list)
     combo_summary: dict = Field(default_factory=dict)

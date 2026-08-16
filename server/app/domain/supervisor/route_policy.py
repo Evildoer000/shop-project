@@ -3,43 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import re
 
-from app.domain.retrieval_plan_builder import RetrievalPlanBuilder
-from app.schemas import AgentTaskProposal, IntentItem, IntentPlan, ResearchRequest
+from app.schemas import AgentTaskProposal, IntentItem, IntentPlanV3
 
 
-EXTERNAL_TRIGGER_TYPES = frozenset(
-    {
-        "explicit_web_request",
-        "explicit_platform_request",
-        "freshness_required",
-        "knowledge_bridge",
-    }
-)
-
-_WEB_SIGNALS = (
-    "联网",
-    "上网",
-    "网上",
-    "网络搜索",
-    "搜网页",
-    "查资料",
-    "查一下资料",
-    "搜索资料",
-    "找资料",
-)
-_FRESHNESS_SIGNALS = (
-    "最新",
-    "近期",
-    "最近",
-    "实时",
-    "今天",
-    "今日",
-    "本周",
-    "本月",
-    "今年",
-    "刚发布",
-    "新发布",
-)
 _PLATFORM_ALIASES = {
     "taobao": ("淘宝", "taobao"),
     "douyin_ec": ("抖音电商", "抖音商城", "抖音", "douyin"),
@@ -55,284 +21,179 @@ class RouteDecision:
 
 
 class RoutePolicy:
-    """Deterministic business routing rules applied after the LLM proposal."""
+    """Capability checks scoped to one intent task; no global execution mode."""
 
-    def evaluate_proposal(
+    def evaluate_task(
         self,
-        plan: IntentPlan,
-        proposal: AgentTaskProposal,
+        plan: IntentPlanV3,
+        task: AgentTaskProposal,
     ) -> RouteDecision:
-        intents = self._proposal_intents(plan, proposal)
-        intent_types = {intent.intent_type for intent in intents}
-        capability = proposal.capability
+        if len(task.intent_ids) != 1:
+            return RouteDecision(False, "Each task must belong to exactly one intent.")
+        intent = self._intent(plan, task.intent_ids[0])
+        if intent is None:
+            return RouteDecision(False, "Task references an unknown intent.")
 
-        if not intents and capability != "profile_preference":
-            return RouteDecision(False, "Proposal does not reference an approved business intent.")
+        capability = task.capability
         if capability == "profile_preference":
-            approved = any(request.context_type == "long_term_profile" for request in plan.context_requests)
             return RouteDecision(
-                approved,
-                "Long-term profile context was explicitly requested."
-                if approved
-                else "No long-term profile context request exists.",
+                bool(task.parameters.query.strip()),
+                "The task has an intent-scoped profile lookup goal."
+                if task.parameters.query.strip()
+                else "Profile lookup requires a task-specific query.",
             )
         if capability == "clarification":
-            approved = plan.execution_mode == "clarify" and plan.clarification.blocking
+            blocking = any(item.blocking for item in intent.uncertainties)
+            vague = (
+                intent.route_basis.target_clarity == "vague_effect_or_use"
+                and not intent.route_basis.product_family.strip()
+                and not intent.product_needs
+            )
+            approved = blocking or vague or bool(task.parameters.missing_fields)
             return RouteDecision(
                 approved,
-                "A blocking clarification is required."
+                "The intent has a blocking ambiguity."
                 if approved
-                else "Clarification is only allowed for a blocking clarify route.",
+                else "Clarification requires a blocking uncertainty or missing field.",
             )
         if capability == "single_product_recommendation":
-            approved = plan.execution_mode == "single_product" and "product_recommendation" in intent_types
+            needs = self._selected_needs(intent, task)
+            if intent.recommendation_policy.candidate_source == "context_only":
+                return RouteDecision(
+                    False,
+                    "Context-only recommendation must reuse referenced products without a new retrieval task.",
+                )
+            explicit_target = bool(
+                intent.route_basis.product_family.strip()
+                or needs
+                or intent.route_basis.target_clarity in {"explicit_product", "context_product"}
+            )
+            approved = intent.intent_type == "product_recommendation" and explicit_target and len(needs) <= 1
             return RouteDecision(
                 approved,
-                "The plan has one executable product target."
+                "The task owns one executable product target."
                 if approved
-                else "Single-product retrieval requires a single_product recommendation intent.",
+                else "Single-product recommendation requires one concrete recommendation target.",
+                {"product_need_count": len(needs)},
             )
         if capability == "multi_product_bundle":
-            approved = (
-                plan.execution_mode == "multi_product"
-                and "product_recommendation" in intent_types
-                and bool(plan.need_slots)
-            )
+            needs = self._selected_needs(intent, task)
+            approved = intent.intent_type == "product_recommendation" and len(needs) >= 2
             return RouteDecision(
                 approved,
-                "The plan has an executable multi-slot product target."
+                "The task owns an executable multi-product bundle."
                 if approved
-                else "Multi-product routing requires product slots and a recommendation intent.",
+                else "Multi-product bundle requires at least two product needs in one intent.",
+                {"product_need_count": len(needs)},
             )
         if capability == "comparison":
-            approved = "product_comparison" in intent_types
+            approved = intent.intent_type == "product_comparison"
             return RouteDecision(
                 approved,
-                "The referenced intent explicitly requests product comparison."
+                "The intent explicitly requests product comparison."
                 if approved
-                else "Comparison cannot be inferred without a product_comparison intent.",
+                else "Comparison requires a product_comparison intent.",
             )
         if capability == "knowledge_research":
-            approved = bool(intent_types.intersection({"product_qa", "shopping_knowledge"})) or (
-                self.is_knowledge_bridge_plan(plan)
-                and any(
-                    intent.route_basis.external_information_need == "knowledge_bridge"
-                    for intent in intents
-                )
-            )
-            return RouteDecision(
-                approved,
-                "The referenced intent requests product facts, shopping knowledge, or an approved knowledge bridge."
-                if approved
-                else "Knowledge research requires a product_qa or shopping_knowledge intent.",
-            )
+            return self._knowledge_decision(plan, intent, task)
         if capability == "commerce_research":
-            approved = any(
-                request.intent_id in proposal.intent_ids
-                and request.mode in {"marketplace", "social_content"}
-                for request in plan.research_requests
-            )
-            return RouteDecision(
-                approved,
-                "A matching marketplace or social-content request exists."
-                if approved
-                else "Commerce research requires an explicit platform research request.",
-            )
-        return RouteDecision(True, "No additional business routing restriction applies.")
+            return self._commerce_decision(plan, intent, task)
+        return RouteDecision(True, "No additional intent routing restriction applies.")
 
-    def evaluate_research_request(
+    def _knowledge_decision(
         self,
-        plan: IntentPlan,
-        request: ResearchRequest,
+        plan: IntentPlanV3,
+        intent: IntentItem,
+        task: AgentTaskProposal,
     ) -> RouteDecision:
-        intent = next((item for item in plan.intents if item.intent_id == request.intent_id), None)
-        if intent is None:
-            return RouteDecision(False, "Research request references an unknown intent.")
-        if request.trigger_type not in EXTERNAL_TRIGGER_TYPES:
-            return RouteDecision(False, "External research trigger_type is not allowlisted.")
-        if not self._trigger_is_grounded(plan, request.trigger_text):
+        external_need = intent.route_basis.external_information_need
+        supported_intent = intent.intent_type in {"product_qa", "shopping_knowledge"}
+        knowledge_bridge = (
+            external_need == "knowledge_bridge"
+            and intent.route_basis.target_clarity == "vague_effect_or_use"
+            and not intent.route_basis.product_family.strip()
+        )
+        explicit_research = external_need in {"explicit_web", "freshness_required"}
+        approved = supported_intent or knowledge_bridge or explicit_research
+        if not approved:
             return RouteDecision(
                 False,
-                "External research trigger_text is not a verbatim fragment of the current query.",
+                "Product knowledge enrichment is not grounded in this intent's knowledge or bridge requirement.",
             )
-
-        route_basis = intent.route_basis
-        expected_need = {
-            "explicit_web_request": "explicit_web",
-            "explicit_platform_request": "explicit_platform",
+        expected_trigger = {
+            "explicit_web": "explicit_web_request",
             "freshness_required": "freshness_required",
             "knowledge_bridge": "knowledge_bridge",
-        }[request.trigger_type]
-        if route_basis.external_information_need != expected_need:
+        }.get(external_need)
+        if expected_trigger and task.parameters.trigger_type != expected_trigger:
             return RouteDecision(
                 False,
-                "Intent route_basis does not support the proposed external research trigger.",
-                {
-                    "expected_external_information_need": expected_need,
-                    "actual_external_information_need": route_basis.external_information_need,
-                },
+                "Knowledge task trigger_type does not match the intent route basis.",
+                {"expected_trigger_type": expected_trigger},
             )
-
-        if request.trigger_type == "explicit_web_request":
-            if request.mode != "web_general" or not self._contains_any(plan.original_query, _WEB_SIGNALS):
-                return RouteDecision(False, "The current query does not explicitly request web research.")
-        elif request.trigger_type == "explicit_platform_request":
-            decision = self._evaluate_platform_trigger(plan, request)
-            if not decision.approved:
-                return decision
-        elif request.trigger_type == "freshness_required":
-            if request.mode != "web_general" or not self._contains_any(plan.original_query, _FRESHNESS_SIGNALS):
-                return RouteDecision(False, "The current query has no explicit freshness requirement.")
-        elif request.trigger_type == "knowledge_bridge":
-            decision = self._evaluate_knowledge_bridge(plan, intent, request)
-            if not decision.approved:
-                return decision
-
+        if not task.parameters.query.strip():
+            return RouteDecision(False, "Product knowledge enrichment requires a task-specific query.")
+        if task.parameters.trigger_text and task.parameters.trigger_type != "knowledge_bridge":
+            if not self._grounded(plan.original_query, task.parameters.trigger_text):
+                return RouteDecision(False, "Knowledge trigger_text is not grounded in the current query.")
         return RouteDecision(
             True,
-            "External research has a structured, query-grounded routing trigger.",
-            {
-                "trigger_type": request.trigger_type,
-                "trigger_text": request.trigger_text,
-                "mode": request.mode,
-                "platforms": list(request.platforms),
-            },
+            "The intent has an explicit knowledge requirement or a grounded knowledge bridge.",
+            {"trigger_type": task.parameters.trigger_type},
         )
 
-    def is_core_proposal(self, plan: IntentPlan, proposal: AgentTaskProposal) -> bool:
-        capability = proposal.capability
-        if plan.execution_mode == "clarify":
-            return capability == "clarification"
-        if plan.execution_mode == "single_product":
-            return capability == "single_product_recommendation"
-        if plan.execution_mode == "multi_product":
-            return capability == "multi_product_bundle"
-        if plan.execution_mode != "context_evidence":
-            return False
-
-        if capability == "comparison" and plan.primary_intent == "product_comparison":
-            return True
-        if capability == "knowledge_research" and plan.primary_intent in {"product_qa", "shopping_knowledge"}:
-            return True
-        if capability == "knowledge_research" and self.is_knowledge_bridge_plan(plan):
-            return True
-        return False
-
-    def core_proposal_ids(self, plan: IntentPlan) -> list[str]:
-        return [
-            proposal.proposal_id
-            for proposal in plan.agent_proposals
-            if self.is_core_proposal(plan, proposal)
-        ]
-
-    def is_core_research_request(self, plan: IntentPlan, request: ResearchRequest) -> bool:
-        return request.trigger_type == "knowledge_bridge" and self.is_knowledge_bridge_plan(plan)
-
-    def is_knowledge_bridge_plan(self, plan: IntentPlan) -> bool:
-        if (
-            plan.execution_mode != "context_evidence"
-            or self._referenced_product_ids(plan)
-            or self._explicit_product_family(plan.original_query)
-        ):
-            return False
-        return any(
-            intent.route_basis.target_clarity == "vague_effect_or_use"
-            and intent.route_basis.local_catalog_status == "insufficient"
-            and intent.route_basis.external_information_need == "knowledge_bridge"
-            and not intent.route_basis.product_family.strip()
-            for intent in plan.intents
-            if intent.intent_type in {"product_recommendation", "shopping_knowledge"}
-        )
-
-    def _evaluate_platform_trigger(
+    def _commerce_decision(
         self,
-        plan: IntentPlan,
-        request: ResearchRequest,
+        plan: IntentPlanV3,
+        intent: IntentItem,
+        task: AgentTaskProposal,
     ) -> RouteDecision:
-        if request.mode not in {"marketplace", "social_content"} or not request.platforms:
-            return RouteDecision(False, "Platform research requires marketplace/social mode and platforms.")
-        query = self._normalized(plan.original_query)
+        parameters = task.parameters
+        if intent.route_basis.external_information_need != "explicit_platform":
+            return RouteDecision(False, "Commerce research requires an explicit platform request.")
+        if parameters.trigger_type != "explicit_platform_request" or not parameters.platforms:
+            return RouteDecision(False, "Commerce research requires explicit platforms and trigger_type.")
+        if not parameters.query.strip():
+            return RouteDecision(False, "Commerce research requires a task-specific query.")
+        normalized_query = self._normalized(plan.original_query)
         ungrounded = [
             platform
-            for platform in request.platforms
-            if not any(self._normalized(alias) in query for alias in _PLATFORM_ALIASES.get(platform, ()))
+            for platform in parameters.platforms
+            if not any(
+                self._normalized(alias) in normalized_query
+                for alias in _PLATFORM_ALIASES.get(platform, ())
+            )
         ]
         if ungrounded:
             return RouteDecision(
                 False,
-                "One or more proposed platforms were not named in the current query.",
+                "One or more commerce platforms were not named by the user.",
                 {"ungrounded_platforms": ungrounded},
             )
-        return RouteDecision(True, "All requested platforms are grounded in the current query.")
+        return RouteDecision(
+            True,
+            "The user explicitly requested the selected commerce platforms.",
+            {"platforms": list(parameters.platforms)},
+        )
 
-    def _evaluate_knowledge_bridge(
+    def _selected_needs(
         self,
-        plan: IntentPlan,
         intent: IntentItem,
-        request: ResearchRequest,
-    ) -> RouteDecision:
-        basis = intent.route_basis
-        errors: list[str] = []
-        if request.mode != "web_general":
-            errors.append("knowledge bridge only supports web_general")
-        if plan.execution_mode != "context_evidence":
-            errors.append("execution_mode is not context_evidence")
-        if basis.target_clarity != "vague_effect_or_use":
-            errors.append("target is not marked vague_effect_or_use")
-        if basis.local_catalog_status != "insufficient":
-            errors.append("local catalog is not marked insufficient")
-        if basis.product_family.strip():
-            errors.append("a concrete product family is already available")
-        explicit_family = self._explicit_product_family(plan.original_query)
-        if explicit_family:
-            errors.append(f"current query already contains concrete product family: {explicit_family}")
-        if not request.local_catalog_gap.strip():
-            errors.append("local_catalog_gap is missing")
-        if errors:
-            return RouteDecision(
-                False,
-                "Knowledge bridge prerequisites are not satisfied.",
-                {"errors": errors},
-            )
-        return RouteDecision(True, "A vague goal requires an evidence-backed product-family bridge.")
+        task: AgentTaskProposal,
+    ) -> list:
+        selected = set(task.parameters.product_need_ids)
+        return [
+            need
+            for need in intent.product_needs
+            if not selected or need.need_id in selected
+        ]
 
-    def _proposal_intents(
-        self,
-        plan: IntentPlan,
-        proposal: AgentTaskProposal,
-    ) -> list[IntentItem]:
-        selected = set(proposal.intent_ids)
-        return [intent for intent in plan.intents if intent.intent_id in selected]
+    def _intent(self, plan: IntentPlanV3, intent_id: str) -> IntentItem | None:
+        return next((item for item in plan.intents if item.intent_id == intent_id), None)
 
-    def _referenced_product_ids(self, plan: IntentPlan) -> set[str]:
-        result = set(plan.referenced_product_ids)
-        for intent in plan.intents:
-            result.update(intent.referenced_product_ids)
-        return result
-
-    def _trigger_is_grounded(self, plan: IntentPlan, trigger_text: str) -> bool:
-        trigger = self._normalized(trigger_text)
-        if not trigger:
-            return False
-        return trigger in self._normalized(plan.original_query)
-
-    def _contains_any(self, value: str, signals: tuple[str, ...]) -> bool:
-        normalized = self._normalized(value)
-        return any(self._normalized(signal) in normalized for signal in signals)
-
-    def _explicit_product_family(self, value: str) -> str:
-        normalized = self._normalized(value)
-        matches: list[tuple[int, str]] = []
-        for category, keywords in RetrievalPlanBuilder.CATEGORY_KEYWORDS.items():
-            for term in (category, *keywords):
-                candidate = self._normalized(term)
-                if candidate and candidate in normalized:
-                    matches.append((len(candidate), category))
-        for category in RetrievalPlanBuilder.TOP_LEVEL_CATEGORIES:
-            candidate = self._normalized(category)
-            if candidate and candidate in normalized:
-                matches.append((len(candidate), category))
-        return max(matches, default=(0, ""))[1]
+    def _grounded(self, query: str, fragment: str) -> bool:
+        normalized = self._normalized(fragment)
+        return bool(normalized) and normalized in self._normalized(query)
 
     def _normalized(self, value: str) -> str:
         return re.sub(r"[\W_]+", "", str(value or "").lower(), flags=re.UNICODE)

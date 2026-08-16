@@ -1,5 +1,6 @@
 import asyncio
 from decimal import Decimal
+from types import SimpleNamespace
 
 from app.db.models import Product
 from app.domain.intent_planner import PlannerStreamEvent
@@ -7,15 +8,22 @@ from app.domain.image_retrieval_worker import ImageRetrievalEvidence
 from app.domain.need_slot_schemas import MultiNeedSelection, MultiNeedState, NeedSlot, SlotCandidate
 from app.domain.memory import ConversationContext, ConversationTurnView
 from app.domain.orchestrator import EcommerceOrchestrator
+from app.domain.supervisor.policy_gate import PolicyDecision, PolicyEvaluation
+from app.domain.supervisor.prompts import build_default_prompt_registry
+from app.domain.supervisor.supervisor import SupervisorPolicyRejectedError
 from app.domain.task_lifecycle import TurnTaskState
 from app.domain.input_processor import InputProcessor, NormalizedInput
 from app.domain.retrieval_plan_builder import RetrievalPlanBuilder
 from app.harness import BudgetManager, InMemoryEvidenceCache, TraceRecorder
 from app.harness.span_recorder import SpanRecorder
 from app.schemas import (
+    AgentTaskProposal,
     ChatStreamRequest,
     ImageAttributes,
+    IntentItem,
     IntentPlan,
+    IntentPlanV3,
+    IntentRouteBasis,
     MULTI_NEED_PRODUCT_CARD_LIMIT,
     ProductCard,
     QueryBudget,
@@ -211,6 +219,63 @@ class FakeLangfuseTracer:
         return FakeTraceRun()
 
 
+class FakeTrajectoryLogger:
+    def __init__(self) -> None:
+        self.payloads: list[dict] = []
+
+    def log(self, payload: dict) -> None:
+        self.payloads.append(payload)
+
+
+class SequencedIntentPlanner:
+    def __init__(self, plans: list[IntentPlanV3]) -> None:
+        self.plans = plans
+        self.contexts: list[dict] = []
+
+    async def stream_plan_with_summary(self, query: str, context: dict):
+        call_index = len(self.contexts)
+        self.contexts.append(context)
+        plan = self.plans[call_index]
+        yield PlannerStreamEvent(kind="summary_delta", content=plan.summary or "planning")
+        yield PlannerStreamEvent(kind="plan", intent_plan=plan)
+
+
+class SequencedSupervisorFlow:
+    def __init__(self, *, rejection_count: int) -> None:
+        self.rejection_count = rejection_count
+        self.calls: list[dict] = []
+        self.last_result = None
+        self.evaluation = PolicyEvaluation(
+            approved=False,
+            errors=["core proposals rejected: ['p2']"],
+            decisions=[
+                PolicyDecision(
+                    subject_id="p2",
+                    decision="reject_hard_dependency",
+                    approved=False,
+                    reason="A hard dependency was rejected by policy.",
+                    capability="single_product_recommendation",
+                    details={"unavailable_dependency_ids": ["p1"]},
+                )
+            ],
+        )
+
+    async def run(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) <= self.rejection_count:
+            raise SupervisorPolicyRejectedError(self.evaluation)
+        self.last_result = SimpleNamespace(
+            route="direct",
+            product_ids=[],
+            answer_text="done",
+            trace={"task_status": "succeeded"},
+            graph=SimpleNamespace(graph_id="graph_test", metadata={}),
+            report=SimpleNamespace(failed_node_ids=[], blocked_node_ids=[]),
+        )
+        yield {"type": "token", "content": "done"}
+        yield {"type": "done"}
+
+
 class FakeMemoryManager:
     def build_context(self, *args, **kwargs) -> ConversationContext:
         return ConversationContext()
@@ -333,6 +398,118 @@ class FakeProductRepository:
 
     def get_by_ids(self, product_ids: list[str]) -> list[Product]:
         return [self.products[product_id] for product_id in product_ids if product_id in self.products]
+
+
+def make_policy_replan_orchestrator(
+    *,
+    rejection_count: int,
+) -> tuple[EcommerceOrchestrator, SequencedIntentPlanner, SequencedSupervisorFlow]:
+    def plan(summary: str) -> IntentPlanV3:
+        return IntentPlanV3(
+            original_query="recommend sunscreen",
+            normalized_query="recommend sunscreen",
+            summary=summary,
+            intents=[
+                IntentItem(
+                    intent_id="i1",
+                    intent_type="product_recommendation",
+                    goal="recommend sunscreen",
+                    resolved_query="recommend sunscreen",
+                    route_basis=IntentRouteBasis(
+                        target_clarity="explicit_product",
+                        product_family="sunscreen",
+                    ),
+                )
+            ],
+            task_proposals=[
+                AgentTaskProposal(
+                    task_id="t1",
+                    capability="single_product_recommendation",
+                    intent_ids=["i1"],
+                    objective="recommend sunscreen",
+                    reason="one concrete product target",
+                )
+            ],
+        )
+
+    plans = [
+        plan("initial plan"),
+        plan("replacement plan"),
+    ]
+    planner = SequencedIntentPlanner(plans)
+    supervisor_flow = SequencedSupervisorFlow(rejection_count=rejection_count)
+    orchestrator = make_orchestrator()
+    orchestrator.multi_agent_runtime_enabled = True
+    orchestrator.input_processor = InputProcessor()
+    orchestrator.intent_planner = planner
+    orchestrator.memory_manager = FakeMemoryManager()
+    orchestrator.langfuse_tracer = FakeLangfuseTracer()
+    orchestrator.trajectory_logger = FakeTrajectoryLogger()
+    orchestrator.budget_manager = BudgetManager()
+    orchestrator.evidence_cache = InMemoryEvidenceCache()
+    orchestrator.trace_recorder = TraceRecorder()
+    orchestrator.prompt_registry = build_default_prompt_registry()
+    orchestrator.supervisor_flow = supervisor_flow
+    orchestrator._supervisor_evaluation_summary = lambda *_: {}  # type: ignore[method-assign]
+    return orchestrator, planner, supervisor_flow
+
+
+def test_supervisor_policy_rejection_replans_once_then_executes_replacement() -> None:
+    orchestrator, planner, supervisor_flow = make_policy_replan_orchestrator(rejection_count=1)
+
+    events = asyncio.run(
+        _collect(
+            orchestrator.stream(
+                ChatStreamRequest(
+                    user_id="u1",
+                    session_id="s1",
+                    message="recommend sunscreen",
+                )
+            )
+        )
+    )
+
+    assert len(planner.contexts) == 2
+    assert len(supervisor_flow.calls) == 2
+    assert supervisor_flow.calls[0]["policy_attempt"] == 1
+    assert supervisor_flow.calls[1]["policy_attempt"] == 2
+    assert planner.contexts[1]["replan_attempt"] == 1
+    assert planner.contexts[1]["previous_intent_plan"]["summary"] == "initial plan"
+    assert planner.contexts[1]["policy_evaluation"] == supervisor_flow.evaluation.model_dump()
+    assert [
+        span["attempt"]
+        for span in orchestrator.span_recorder.spans
+        if span["name"] == "intent_planning"
+    ] == [1, 2]
+    assert any(
+        event.get("type") == "agent_update" and event.get("title") == "重新规划执行路线"
+        for event in events
+    )
+    assert any(event.get("type") == "token" and event.get("content") == "done" for event in events)
+    assert events[-1]["type"] == "done"
+
+
+def test_supervisor_policy_rejection_stops_after_one_replan() -> None:
+    orchestrator, planner, supervisor_flow = make_policy_replan_orchestrator(rejection_count=2)
+
+    events = asyncio.run(
+        _collect(
+            orchestrator.stream(
+                ChatStreamRequest(
+                    user_id="u1",
+                    session_id="s1",
+                    message="recommend sunscreen",
+                )
+            )
+        )
+    )
+
+    assert len(planner.contexts) == 2
+    assert len(supervisor_flow.calls) == 2
+    assert orchestrator.span_recorder.status == "failed"
+    assert orchestrator.span_recorder.termination_reason == "policy_rejected"
+    assert orchestrator.span_recorder.evaluation_summary["replan_attempts"] == 1
+    assert events[-1]["type"] == "done"
 
 
 def test_stream_stops_with_failure_text_when_intent_planner_retry_exhausted() -> None:

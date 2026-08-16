@@ -86,7 +86,7 @@ def build_default_capability_catalog() -> CapabilityCatalog:
             name="multi_product_bundle",
             description="拆分并协调多个商品槽位，产出组合候选证据。",
             planner_proposable=True,
-            evidence_producing=False,
+            evidence_producing=True,
         ),
         CapabilityDefinition(
             name="slot_product_retrieval",
@@ -109,7 +109,7 @@ def build_default_capability_catalog() -> CapabilityCatalog:
         ),
         CapabilityDefinition(
             name="knowledge_research",
-            description="解释商品原理、成分、规格或选购知识，并保留来源。",
+            description="补充本地商品详情、商品原理、成分、规格或选购知识，并保留本地与网页来源。",
             planner_proposable=True,
             evidence_producing=True,
         ),

@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass, field
 from contextlib import aclosing
+from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator
 
 from app.domain.agents import (
@@ -15,14 +14,17 @@ from app.domain.agents import (
 )
 from app.domain.supervisor.agent_registry import AgentRegistry
 from app.domain.supervisor.prompts import PromptRegistry, build_default_prompt_registry
-from app.domain.supervisor.supervisor import SupervisorPlanCompiler
+from app.domain.supervisor.supervisor import (
+    SupervisorPlanCompiler,
+    SupervisorPolicyRejectedError,
+)
 from app.domain.supervisor.task_graph import TaskGraph, TaskGraphNode
-from app.schemas import AgentTaskProposal, IntentPlan, ReflectionResult
+from app.schemas import IntentPlanV3, ReflectionResult
 
 
 @dataclass
 class SupervisorFlowResult:
-    intent_plan: IntentPlan
+    intent_plan: IntentPlanV3
     graph: TaskGraph
     report: ExecutionReport
     route: str = "no_product"
@@ -35,7 +37,7 @@ class SupervisorFlowResult:
 
 
 class SupervisorFlow:
-    """Request-scoped Supervisor execution for the decoupled Agent graph."""
+    """Execute independent intent branches and aggregate them in source order."""
 
     def __init__(
         self,
@@ -64,10 +66,13 @@ class SupervisorFlow:
 
     async def _execute_policy_gate(self, context: AgentExecutionContext) -> AgentResult:
         plan = context.artifact("intent_plan", context.intent_plan)
-        if not isinstance(plan, IntentPlan):
+        if not isinstance(plan, IntentPlanV3):
+            revision_id = str(context.node.metadata.get("revision_intent_id") or "")
+            plan = context.artifact(f"intent_plan_revision:{revision_id}")
+        if not isinstance(plan, IntentPlanV3):
             return AgentResult.failure_result(
                 "missing_intent_plan",
-                "PolicyGate requires the latest IntentPlan artifact.",
+                "PolicyGate requires an IntentPlan V3 artifact.",
                 retryable=False,
                 termination_reason="policy_input_missing",
             )
@@ -75,20 +80,13 @@ class SupervisorFlow:
         if not evaluation.approved:
             return AgentResult.failure_result(
                 "policy_rejected",
-                "; ".join(evaluation.errors) or "PolicyGate rejected the refined plan.",
+                "; ".join(evaluation.errors) or "PolicyGate rejected the revised branch.",
                 retryable=False,
                 termination_reason="policy_rejected",
             )
-        context.graph.metadata.setdefault("supervisor_decisions", []).append(
-            {
-                "subject": context.node.node_id,
-                "decision": "approve_refined_plan",
-                **evaluation.model_dump(),
-            }
-        )
         return AgentResult.success(
             {"policy_evaluation": evaluation.model_dump()},
-            artifacts={"policy_evaluation:refinement": evaluation},
+            artifacts={"policy_evaluation": evaluation},
             termination_reason="policy_approved",
         )
 
@@ -99,24 +97,32 @@ class SupervisorFlow:
         user_id: str,
         session_id: str,
         turn_id: str,
-        intent_plan: IntentPlan,
+        intent_plan: IntentPlanV3,
         conversation_context: Any = None,
         query_plan: Any = None,
         image_attributes: Any = None,
         image_path: str | None = None,
         intent_span_key: str | None = None,
+        policy_attempt: int = 1,
         metadata: dict[str, Any] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         evaluation, policy_span_payload = self._evaluate_initial_policy(
             intent_plan,
             turn_id=turn_id,
             intent_span_key=intent_span_key,
+            attempt=policy_attempt,
         )
-        graph = self.compiler.compile_evaluated(
-            intent_plan,
-            evaluation=evaluation,
-            turn_id=turn_id,
-        )
+        try:
+            graph = self.compiler.compile_evaluated(
+                intent_plan,
+                evaluation=evaluation,
+                turn_id=turn_id,
+            )
+        except SupervisorPolicyRejectedError as exc:
+            exc.policy_span_payload = policy_span_payload
+            raise
+
+        graph.metadata["policy_attempt"] = max(1, int(policy_attempt or 1))
         artifacts: dict[str, Any] = {
             "intent_plan": intent_plan,
             "policy_evaluation": evaluation,
@@ -141,13 +147,14 @@ class SupervisorFlow:
                 "image_path": image_path,
             },
         )
-        completed_span_keys = {}
+        completed_span_keys: dict[str, str] = {}
         if intent_span_key:
             completed_span_keys["system:intent_understanding"] = intent_span_key
         policy_span_key = str((policy_span_payload or {}).get("span_key") or "")
         if policy_span_key:
             completed_span_keys["system:policy_gate"] = policy_span_key
         self.executor.begin_graph(completed_span_keys=completed_span_keys)
+        report = ExecutionReport(graph=graph, artifacts=artifacts)
         emitted_answer_output = False
 
         if policy_span_payload is not None:
@@ -160,209 +167,229 @@ class SupervisorFlow:
             "answer_generation",
             "memory_distillation",
         }
-        report = ExecutionReport(graph=graph, artifacts=artifacts)
-
-        # Execute all approved business work first. Runtime failures are repaired
-        # before a pending Verifier can be marked blocked by its dependency.
         self._reset_phase_report(report)
-        executor_stream = self.executor.execute_stream(
+        async for event in self._execute_phase(
             graph,
-            base_context=base_context,
-            report=report,
-            stop_before_capabilities=pre_verifier_stop,
-        )
-        async with aclosing(executor_stream) as phase_stream:
-            async for event in phase_stream:
-                translated = self._executor_event(event, graph, intent_plan)
-                if event.kind == "agent_output":
-                    emitted_answer_output = True
-                yield translated
+            base_context,
+            report,
+            intent_plan,
+            stop_before=pre_verifier_stop,
+        ):
+            if event.get("type") in {"token", "product_cards"}:
+                emitted_answer_output = True
+            yield event
 
-        runtime_repair_cycle = 0
-        while report.failed_node_ids and runtime_repair_cycle < 2:
+        # Runtime repair stays branch-local: each failed node gets its own Repair
+        # lineage, while unrelated ready roots continue to run.
+        runtime_cycle = 0
+        while report.failed_node_ids and runtime_cycle < 2:
             repairable = self._repairable_nodes(graph, report.failed_node_ids)
             if not repairable:
                 break
-            retry_ids = self.compiler.schedule_repair(
-                graph,
-                [node.node_id for node in repairable],
-                reason="Agent 执行失败，Supervisor 只重试失败节点。",
-            )
-            runtime_repair_cycle += 1
-            self._annotate_last_repair(
-                graph,
-                kind="runtime_failure",
-                cycle=runtime_repair_cycle,
-                retry_ids=retry_ids,
-            )
+            retry_ids: list[str] = []
+            for node in repairable:
+                retry_ids.extend(
+                    self.compiler.schedule_repair(
+                        graph,
+                        [node.node_id],
+                        reason="Agent 执行失败，只修复当前意图分支。",
+                    )
+                )
+            runtime_cycle += 1
             yield self._graph_snapshot_event(graph, intent_plan, "runtime_repair_scheduled")
             self._reset_phase_report(report)
-            executor_stream = self.executor.execute_stream(
+            async for event in self._execute_phase(
                 graph,
-                base_context=base_context,
-                report=report,
-                stop_before_capabilities=pre_verifier_stop,
-            )
-            async with aclosing(executor_stream) as phase_stream:
-                async for event in phase_stream:
-                    translated = self._executor_event(event, graph, intent_plan)
-                    if event.kind == "agent_output":
-                        emitted_answer_output = True
-                    yield translated
+                base_context,
+                report,
+                intent_plan,
+                stop_before=pre_verifier_stop,
+            ):
+                yield event
 
-        pre_verifier_failed = bool(report.failed_node_ids)
-        knowledge_decision = None
-        knowledge_policy_span = None
-        if not pre_verifier_failed:
-            knowledge_policy_result = self._knowledge_follow_up_decision(graph, base_context)
-            if knowledge_policy_result is not None:
-                knowledge_decision, knowledge_policy_span = knowledge_policy_result
-        if knowledge_decision is not None:
-            if knowledge_policy_span is not None:
-                yield self.executor.span_recorder.timing_event(knowledge_policy_span)
-            decision_payload = knowledge_decision.model_dump()
-            artifacts["knowledge_follow_up_decision"] = decision_payload
-            graph.metadata.setdefault("supervisor_decisions", []).append(
-                {
-                    "subject": "knowledge_follow_up",
-                    **decision_payload,
-                }
-            )
-            if knowledge_decision.approved:
-                knowledge_plan = self._knowledge_retrieval_plan(intent_plan, knowledge_decision)
-                artifacts["knowledge_retrieval_plan"] = knowledge_plan
-                artifacts["intent_plan"] = knowledge_plan
-                self._append_knowledge_follow_up(graph, knowledge_decision)
-                yield self._graph_snapshot_event(graph, intent_plan, "knowledge_follow_up_approved")
-            elif knowledge_decision.decision not in {"not_applicable", "already_planned"}:
-                yield self._graph_snapshot_event(graph, intent_plan, "knowledge_follow_up_rejected")
-
-        verifier_node = next(
-            (node for node in graph.nodes if node.capability == "evidence_verification" and node.status == "pending"),
-            None,
+        # A knowledge bridge is not converted into a product route by fixed
+        # Supervisor rules. The same IntentUnderstandingAgent revises only the
+        # intent whose evidence just returned.
+        revision_nodes = self._append_knowledge_revision_nodes(
+            graph,
+            intent_plan,
+            report,
         )
-        if verifier_node is not None and not pre_verifier_failed:
-            # Run Verifier alone so its structured repair decision is handled
-            # before BundleOptimizer or AnswerGenerator sees the evidence.
+        if revision_nodes:
+            yield self._graph_snapshot_event(graph, intent_plan, "intent_revision_scheduled")
             self._reset_phase_report(report)
-            executor_stream = self.executor.execute_stream(
+            async for event in self._execute_phase(
                 graph,
-                base_context=base_context,
-                report=report,
-                stop_before_capabilities={"bundle_optimization", "answer_generation", "memory_distillation"},
-            )
-            async with aclosing(executor_stream) as phase_stream:
-                async for event in phase_stream:
-                    translated = self._executor_event(event, graph, intent_plan)
-                    if event.kind == "agent_output":
-                        emitted_answer_output = True
-                    yield translated
+                base_context,
+                report,
+                intent_plan,
+                stop_before=pre_verifier_stop,
+            ):
+                yield event
 
-            quality_repair_cycle = 0
-            current_verifier = verifier_node
-            while not report.failed_node_ids and quality_repair_cycle < 2:
-                targets = self._quality_failure_targets(graph, artifacts)
-                if not targets:
-                    break
-                target_nodes = [graph.require_node(node_id) for node_id in targets]
-                for node in target_nodes:
-                    if node.status == "succeeded":
-                        node.status = "failed"
-                repairable = self._repairable_nodes(graph, targets)
+            appended_business_nodes: list[str] = []
+            for revision_node in revision_nodes:
+                intent_id = revision_node.intent_ids[0]
+                scoped = report.artifacts.get(f"artifacts:{revision_node.node_id}")
+                revised_plan = (
+                    scoped.get(f"intent_plan_revision:{intent_id}")
+                    if isinstance(scoped, dict)
+                    else None
+                )
+                if not isinstance(revised_plan, IntentPlanV3):
+                    graph.metadata.setdefault("intent_revision_errors", []).append(
+                        {"intent_id": intent_id, "reason": "revision_plan_missing"}
+                    )
+                    continue
+                revision_evaluation = self.compiler.evaluate(revised_plan)
+                policy_node = self._append_revision_policy_node(
+                    graph,
+                    revision_node,
+                    revision_evaluation,
+                )
+                if not revision_evaluation.approved:
+                    continue
+                appended_business_nodes.extend(
+                    self.compiler.append_revised_branch(
+                        graph,
+                        revised_plan,
+                        revision_evaluation,
+                        intent_id=intent_id,
+                        root_node_id=policy_node.node_id,
+                        prefix=f"revision:{intent_id}",
+                    )
+                )
+            if appended_business_nodes:
+                yield self._graph_snapshot_event(
+                    graph,
+                    intent_plan,
+                    "intent_revision_compiled",
+                )
+                self._reset_phase_report(report)
+                async for event in self._execute_phase(
+                    graph,
+                    base_context,
+                    report,
+                    intent_plan,
+                    stop_before=pre_verifier_stop,
+                ):
+                    yield event
+
+        # All intent verifiers can run concurrently. A failed verifier blocks
+        # only its branch terminal; AnswerGenerator waits for terminal status,
+        # not universal success.
+        self._reset_phase_report(report)
+        async for event in self._execute_phase(
+            graph,
+            base_context,
+            report,
+            intent_plan,
+            stop_before={"bundle_optimization", "answer_generation", "memory_distillation"},
+        ):
+            yield event
+
+        # A verifier can finish successfully while still reporting that its
+        # candidate evidence is repairable. Repair only the retrieval lineage
+        # for that intent, then attach a fresh verifier to the retried evidence.
+        quality_cycle = 0
+        while quality_cycle < 2:
+            repair_requests = self._quality_repair_requests(graph, report)
+            if not repair_requests:
+                break
+            scheduled = 0
+            for verifier, target_ids in repair_requests:
+                verifier.metadata["quality_repair_checked"] = True
+                for node_id in target_ids:
+                    target = graph.require_node(node_id)
+                    if target.status == "succeeded":
+                        target.status = "failed"
+                repairable = self._repairable_nodes(graph, target_ids)
                 if not repairable:
-                    break
+                    continue
                 retry_ids = self.compiler.schedule_repair(
                     graph,
                     [node.node_id for node in repairable],
-                    reason="EvidenceVerifier 标记候选证据不足或不匹配。",
+                    reason=(
+                        "EvidenceVerifier 标记当前意图的候选证据不足或不匹配，"
+                        "只重试该意图的检索节点。"
+                    ),
                 )
-                quality_repair_cycle += 1
+                repair_node_ids = {
+                    dependency_id
+                    for retry_id in retry_ids
+                    for dependency_id in graph.require_node(retry_id).depends_on
+                    if graph.require_node(dependency_id).capability == "repair"
+                }
+                for repair_node_id in repair_node_ids:
+                    repair_node = graph.require_node(repair_node_id)
+                    if verifier.node_id not in repair_node.input_refs:
+                        repair_node.input_refs.append(verifier.node_id)
                 next_verifier = self._append_verifier_retry(
                     graph,
-                    previous_verifier=current_verifier,
+                    previous_verifier=verifier,
                     retry_node_ids=retry_ids,
-                    cycle=quality_repair_cycle,
+                    cycle=quality_cycle + 1,
                 )
-                self._annotate_last_repair(
-                    graph,
-                    kind="evidence_quality",
-                    cycle=quality_repair_cycle,
-                    retry_ids=retry_ids,
-                    verifier_node_id=next_verifier.node_id,
-                )
-                yield self._graph_snapshot_event(graph, intent_plan, "repair_scheduled")
-                self._reset_phase_report(report)
-                executor_stream = self.executor.execute_stream(
-                    graph,
-                    base_context=base_context,
-                    report=report,
-                    stop_before_capabilities={"evidence_verification", "bundle_optimization", "answer_generation", "memory_distillation"},
-                )
-                async with aclosing(executor_stream) as phase_stream:
-                    async for event in phase_stream:
-                        translated = self._executor_event(event, graph, intent_plan)
-                        if event.kind == "agent_output":
-                            emitted_answer_output = True
-                        yield translated
-                if report.failed_node_ids:
-                    break
+                history = graph.metadata.get("repair_history", [])
+                if history:
+                    history[-1].update(
+                        {
+                            "kind": "evidence_quality",
+                            "intent_id": verifier.intent_ids[0]
+                            if verifier.intent_ids
+                            else "",
+                            "verifier_node_id": next_verifier.node_id,
+                        }
+                    )
+                scheduled += 1
+            if not scheduled:
+                break
 
-                # The retry evidence is complete. The new verifier has explicit
-                # dependencies on retry nodes, so this is a real second review.
-                self._reset_phase_report(report)
-                executor_stream = self.executor.execute_stream(
-                    graph,
-                    base_context=base_context,
-                    report=report,
-                    stop_before_capabilities={"bundle_optimization", "answer_generation", "memory_distillation"},
-                )
-                async with aclosing(executor_stream) as phase_stream:
-                    async for event in phase_stream:
-                        translated = self._executor_event(event, graph, intent_plan)
-                        if event.kind == "agent_output":
-                            emitted_answer_output = True
-                        yield translated
-                current_verifier = next_verifier
-
-        # Finish optimizer, answer and the lightweight memory scheduling node.
-        self._reset_phase_report(report)
-        executor_stream = self.executor.execute_stream(
-            graph,
-            base_context=base_context,
-            report=report,
-        )
-        async with aclosing(executor_stream) as phase_stream:
-            async for event in phase_stream:
-                translated = self._executor_event(event, graph, intent_plan)
-                if event.kind == "agent_output":
-                    emitted_answer_output = True
-                yield translated
-
-        # Required upstream failures must still terminate with an honest answer.
-        # A dedicated fallback node preserves the failed lineage instead of
-        # mutating and pretending the original answer path succeeded.
-        if self._needs_fallback_answer(graph):
-            artifacts["reflection"] = self._fallback_reflection(artifacts.get("reflection"))
-            fallback_answer = self._append_fallback_answer(graph)
-            yield self._graph_snapshot_event(graph, intent_plan, "fallback_answer_scheduled")
-            self._reset_phase_report(report)
-            executor_stream = self.executor.execute_stream(
+            quality_cycle += 1
+            yield self._graph_snapshot_event(
                 graph,
-                base_context=base_context,
-                report=report,
+                intent_plan,
+                "branch_quality_repair_scheduled",
             )
-            async with aclosing(executor_stream) as phase_stream:
-                async for event in phase_stream:
-                    translated = self._executor_event(event, graph, intent_plan)
-                    if event.kind == "agent_output":
-                        emitted_answer_output = True
-                    yield translated
-            if fallback_answer.status != "succeeded":
-                graph.metadata["termination_reason"] = "fallback_answer_failed"
+            self._reset_phase_report(report)
+            async for event in self._execute_phase(
+                graph,
+                base_context,
+                report,
+                intent_plan,
+                stop_before=pre_verifier_stop,
+            ):
+                yield event
+
+            self._reset_phase_report(report)
+            async for event in self._execute_phase(
+                graph,
+                base_context,
+                report,
+                intent_plan,
+                stop_before={
+                    "bundle_optimization",
+                    "answer_generation",
+                    "memory_distillation",
+                },
+            ):
+                yield event
+
+        self._reset_phase_report(report)
+        async for event in self._execute_phase(
+            graph,
+            base_context,
+            report,
+            intent_plan,
+        ):
+            if event.get("type") in {"token", "product_cards"}:
+                emitted_answer_output = True
+            yield event
 
         report.failed_node_ids = self._unresolved_failure_ids(graph)
         report.blocked_node_ids = [
-            node.node_id for node in graph.nodes
+            node.node_id
+            for node in graph.nodes
             if node.status == "skipped"
             and node.metadata.get("skipped_reason")
             in {"dependency_failed", "optional_branch_failed"}
@@ -370,24 +397,17 @@ class SupervisorFlow:
         ]
         report.completed = graph.all_terminal()
 
-        answer_result = next(
-            (result for node_id, result in reversed(list(report.results.items())) if graph.get_node(node_id) and graph.get_node(node_id).capability == "answer_generation"),
-            None,
-        )
-        if answer_result is None:
-            # A clarification graph has no AnswerGenerator node by design.
-            answer_result = next(
-                (result for node_id, result in reversed(list(report.results.items())) if graph.get_node(node_id) and graph.get_node(node_id).capability == "clarification"),
-                None,
-            )
+        answer_node = graph.get_node("system:answer_generation")
+        answer_result = report.results.get(answer_node.node_id) if answer_node is not None else None
+        answer_artifacts = answer_result.artifacts if answer_result is not None else {}
         output = answer_result.output if answer_result is not None else {}
-        answer_text = str(artifacts.get("answer_text") or output.get("question") or "")
-        answer_tokens = list(artifacts.get("answer_tokens") or ([answer_text] if answer_text else []))
-        cards = list(artifacts.get("answer_cards") or [])
-        product_ids = list(artifacts.get("answer_product_ids") or [])
-        route = str(artifacts.get("answer_route") or self._route_from_plan(intent_plan, output))
-        reflection = artifacts.get("reflection")
-        trace = self._trace(graph, intent_plan, report, route, reflection)
+        answer_text = str(answer_artifacts.get("answer_text") or "")
+        answer_tokens = list(answer_artifacts.get("answer_tokens") or [])
+        cards = list(answer_artifacts.get("answer_cards") or [])
+        product_ids = list(answer_artifacts.get("answer_product_ids") or [])
+        route = str(answer_artifacts.get("answer_route") or output.get("route") or "no_product")
+        reflections = self._branch_reflections(graph, report)
+        trace = self._trace(graph, intent_plan, report, route, reflections)
         self.last_result = SupervisorFlowResult(
             intent_plan=intent_plan,
             graph=graph,
@@ -397,7 +417,7 @@ class SupervisorFlow:
             answer_tokens=answer_tokens,
             cards=cards,
             product_ids=product_ids,
-            reflection=reflection,
+            reflection=reflections,
             trace=trace,
         )
         yield {"type": "decision_trace", "trace": trace}
@@ -408,49 +428,172 @@ class SupervisorFlow:
                 yield {"type": "token", "content": token}
         yield {"type": "done"}
 
-    def _reset_phase_report(self, report: ExecutionReport) -> None:
-        report.failed_node_ids = []
-        report.blocked_node_ids = []
-        report.completed = False
+    async def _execute_phase(
+        self,
+        graph: TaskGraph,
+        base_context: AgentExecutionContext,
+        report: ExecutionReport,
+        plan: IntentPlanV3,
+        *,
+        stop_before: set[str] | None = None,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        stream = self.executor.execute_stream(
+            graph,
+            base_context=base_context,
+            report=report,
+            stop_before_capabilities=stop_before,
+        )
+        async with aclosing(stream) as phase_stream:
+            async for event in phase_stream:
+                yield self._executor_event(event, graph, plan)
+
+    def _append_knowledge_revision_nodes(
+        self,
+        graph: TaskGraph,
+        plan: IntentPlanV3,
+        report: ExecutionReport,
+    ) -> list[TaskGraphNode]:
+        result: list[TaskGraphNode] = []
+        registration = self.compiler.registry.select_for_capability("intent_understanding")
+        if registration is None:
+            return result
+        for intent in plan.intents:
+            if intent.route_basis.external_information_need != "knowledge_bridge":
+                continue
+            knowledge_nodes = [
+                node
+                for node in graph.nodes
+                if node.capability == "knowledge_research"
+                and intent.intent_id in node.intent_ids
+                and node.status == "succeeded"
+            ]
+            if not knowledge_nodes:
+                continue
+            knowledge_node = knowledge_nodes[-1]
+            knowledge_artifacts = report.artifacts.get(
+                f"artifacts:{knowledge_node.node_id}",
+                {},
+            )
+            knowledge_result = (
+                knowledge_artifacts.get("knowledge_research")
+                if isinstance(knowledge_artifacts, dict)
+                else None
+            )
+            node_id = f"runtime:intent_revision:{intent.intent_id}:1"
+            if graph.get_node(node_id) is not None:
+                continue
+            node = TaskGraphNode(
+                node_id=node_id,
+                task_id=f"{graph.turn_id}:intent_revision:{intent.intent_id}:1",
+                agent_id=registration.manifest.agent_id,
+                capability="intent_understanding",
+                intent_ids=[intent.intent_id],
+                depends_on=[knowledge_node.node_id],
+                max_attempts=registration.manifest.max_attempts,
+                metadata={
+                    "phase": "intent_revision_after_knowledge",
+                    "intent_revision": {
+                        "intent_id": intent.intent_id,
+                        "target_intent": intent.model_dump(),
+                        "completed_capability": "knowledge_research",
+                        "knowledge_result": knowledge_result or {},
+                        "instruction": "只修订当前意图的后续任务，不得重建其它意图。",
+                    },
+                },
+            )
+            graph.add_node(node)
+            result.append(node)
+        if result:
+            graph.validate_graph()
+        return result
+
+    def _append_revision_policy_node(
+        self,
+        graph: TaskGraph,
+        revision_node: TaskGraphNode,
+        evaluation: Any,
+    ) -> TaskGraphNode:
+        intent_id = revision_node.intent_ids[0]
+        node = TaskGraphNode(
+            node_id=f"runtime:policy_gate:intent_revision:{intent_id}",
+            task_id=f"{graph.turn_id}:policy_gate:intent_revision:{intent_id}",
+            agent_id="supervisor_policy_gate",
+            capability="policy_gate",
+            intent_ids=[intent_id],
+            depends_on=[revision_node.node_id],
+            status="succeeded",
+            metadata={
+                "phase": "intent_revision_policy_approval",
+                "implementation": "deterministic_code",
+                "approved": evaluation.approved,
+                "evaluation": evaluation.model_dump(),
+            },
+        )
+        graph.add_node(node)
+        graph.metadata.setdefault("supervisor_decisions", []).append(
+            {
+                "subject": node.node_id,
+                "intent_id": intent_id,
+                **evaluation.model_dump(),
+            }
+        )
+        recorder = self.executor.span_recorder
+        if recorder is not None:
+            payload = recorder.record_completed_span(
+                "supervisor_policy_gate:intent_revision",
+                duration_ms=0,
+                label="单意图修订策略审批",
+                parent_span_key=self.executor.span_key_for_node(revision_node.node_id),
+                task_id=node.task_id,
+                agent_id=node.agent_id,
+                span_type="policy",
+                status="succeeded",
+                input_summary={"intent_id": intent_id},
+                output_summary=evaluation.model_dump(),
+                termination_reason=(
+                    "policy_approved" if evaluation.approved else "policy_rejected"
+                ),
+            )
+            self.executor.register_completed_node_span(
+                node.node_id,
+                str(payload.get("span_key") or ""),
+            )
+        graph.validate_graph()
+        return node
 
     def _evaluate_initial_policy(
         self,
-        plan: IntentPlan,
+        plan: IntentPlanV3,
         *,
         turn_id: str,
         intent_span_key: str | None,
+        attempt: int = 1,
     ) -> tuple[Any, dict[str, Any] | None]:
         recorder = self.executor.span_recorder
+        resolved_attempt = max(1, int(attempt or 1))
         span = None
         if recorder is not None:
             span = recorder.start_span(
                 "supervisor_policy_gate",
-                label="Supervisor 初始策略审批",
+                label=(
+                    "Supervisor 初始策略审批"
+                    if resolved_attempt == 1
+                    else "Supervisor 重规划策略审批"
+                ),
                 agent="SupervisorPolicyGate",
                 parent_span_key=intent_span_key,
-                task_id=f"{turn_id}:policy_gate",
+                task_id=f"{turn_id}:policy_gate:attempt:{resolved_attempt}",
                 agent_id="supervisor_policy_gate",
                 span_type="policy",
+                attempt=resolved_attempt,
                 input_summary={
+                    "intent_count": len(plan.intents),
+                    "task_count": len(plan.task_proposals),
                     "plan_schema_version": plan.schema_version,
-                    "execution_mode": plan.execution_mode,
-                    "proposal_count": len(plan.agent_proposals),
-                    "research_request_count": len(plan.research_requests),
                     "implementation": "deterministic_code",
                 },
             )
-        try:
-            evaluation = self.compiler.evaluate(plan)
-        except Exception as exc:
-            if span is not None:
-                recorder.finish_span(
-                    span,
-                    status="failed",
-                    error_type=type(exc).__name__,
-                    error_message=str(exc),
-                    termination_reason="policy_evaluation_error",
-                )
-            raise
+        evaluation = self.compiler.evaluate(plan)
         payload = None
         if span is not None:
             payload = recorder.finish_span(
@@ -461,7 +604,9 @@ class SupervisorFlow:
                     "approved": evaluation.approved,
                     "decision_count": len(evaluation.decisions),
                     "selected_agent_count": len(evaluation.selections),
-                    "error_count": len(evaluation.errors),
+                    "uncovered_intent_count": len(
+                        evaluation.uncovered_required_intent_ids
+                    ),
                 },
                 termination_reason=(
                     "policy_approved" if evaluation.approved else "policy_rejected"
@@ -469,39 +614,116 @@ class SupervisorFlow:
             )
         return evaluation, payload
 
-    def _repairable_nodes(self, graph: TaskGraph, node_ids: list[str]) -> list[TaskGraphNode]:
-        result: list[TaskGraphNode] = []
-        for node_id in self._unique(node_ids):
-            node = graph.get_node(node_id)
-            if node is None:
-                continue
-            if node.status not in {"failed", "timeout"}:
-                continue
-            if node.attempt >= node.max_attempts:
-                continue
-            result.append(node)
-        return result
-
-    def _annotate_last_repair(
+    def _repairable_nodes(
         self,
         graph: TaskGraph,
-        *,
-        kind: str,
-        cycle: int,
-        retry_ids: list[str],
-        verifier_node_id: str = "",
-    ) -> None:
-        history = graph.metadata.setdefault("repair_history", [])
-        if not history:
-            return
-        history[-1].update(
-            {
-                "kind": kind,
-                "flow_cycle": cycle,
-                "retry_node_ids": list(retry_ids),
-                **({"verifier_node_id": verifier_node_id} if verifier_node_id else {}),
+        node_ids: list[str],
+    ) -> list[TaskGraphNode]:
+        return [
+            node
+            for node_id in dict.fromkeys(node_ids)
+            if (node := graph.get_node(node_id)) is not None
+            and node.status in {"failed", "timeout"}
+            and node.attempt < node.max_attempts
+            and node.capability
+            not in {
+                "intent_understanding",
+                "policy_gate",
+                "answer_generation",
+                "memory_distillation",
             }
-        )
+        ]
+
+    def _quality_repair_requests(
+        self,
+        graph: TaskGraph,
+        report: ExecutionReport,
+    ) -> list[tuple[TaskGraphNode, list[str]]]:
+        requests: list[tuple[TaskGraphNode, list[str]]] = []
+        for verifier in graph.nodes:
+            if (
+                verifier.capability != "evidence_verification"
+                or verifier.status != "succeeded"
+                or verifier.metadata.get("superseded_by")
+                or verifier.metadata.get("quality_repair_checked")
+            ):
+                continue
+            scoped = report.artifacts.get(f"artifacts:{verifier.node_id}")
+            reflection = scoped.get("reflection") if isinstance(scoped, dict) else None
+            if (
+                not isinstance(reflection, ReflectionResult)
+                or not reflection.repair_hint.repairable
+            ):
+                verifier.metadata["quality_repair_checked"] = True
+                continue
+            targets = self._quality_failure_targets(
+                graph,
+                verifier,
+                reflection,
+            )
+            if targets:
+                requests.append((verifier, targets))
+            else:
+                verifier.metadata["quality_repair_checked"] = True
+        return requests
+
+    def _quality_failure_targets(
+        self,
+        graph: TaskGraph,
+        verifier: TaskGraphNode,
+        reflection: ReflectionResult,
+    ) -> list[str]:
+        intent_ids = set(verifier.intent_ids)
+        ancestors = set(graph.ancestor_node_ids(verifier.node_id))
+        hinted_slots = set(reflection.repair_hint.target_slot_ids)
+
+        single_nodes = [
+            node
+            for node in graph.nodes
+            if node.node_id in ancestors
+            and node.capability == "single_product_recommendation"
+            and node.status == "succeeded"
+            and not node.metadata.get("superseded_by")
+            and (not intent_ids or intent_ids.intersection(node.intent_ids))
+        ]
+        if single_nodes and (not hinted_slots or "single" in hinted_slots):
+            return [max(single_nodes, key=lambda item: item.attempt).node_id]
+
+        slots_by_id: dict[str, list[TaskGraphNode]] = {}
+        for node in graph.nodes:
+            if (
+                node.node_id not in ancestors
+                or node.capability != "slot_product_retrieval"
+                or node.status != "succeeded"
+                or node.metadata.get("superseded_by")
+                or intent_ids
+                and not intent_ids.intersection(node.intent_ids)
+            ):
+                continue
+            slot_id = str((node.metadata.get("slot") or {}).get("slot_id") or "")
+            if slot_id and (not hinted_slots or slot_id in hinted_slots):
+                slots_by_id.setdefault(slot_id, []).append(node)
+        selected_slots = [
+            max(nodes, key=lambda item: item.attempt)
+            for nodes in slots_by_id.values()
+        ]
+        if not selected_slots:
+            return []
+
+        targets = [node.node_id for node in selected_slots]
+        merge_nodes = [
+            node
+            for node in graph.nodes
+            if node.node_id in ancestors
+            and node.capability == "multi_product_bundle"
+            and node.metadata.get("phase") == "merge_slot_evidence"
+            and node.status == "succeeded"
+            and not node.metadata.get("superseded_by")
+            and (not intent_ids or intent_ids.intersection(node.intent_ids))
+        ]
+        if merge_nodes:
+            targets.append(max(merge_nodes, key=lambda item: item.attempt).node_id)
+        return list(dict.fromkeys(targets))
 
     def _append_verifier_retry(
         self,
@@ -512,8 +734,7 @@ class SupervisorFlow:
         cycle: int,
     ) -> TaskGraphNode:
         registration = self.compiler.registry.select_for_capability(
-            "evidence_verification",
-            execution_mode=str(graph.metadata.get("execution_mode") or ""),
+            "evidence_verification"
         )
         if registration is None:
             raise RuntimeError("EvidenceVerifierAgent is not registered")
@@ -521,106 +742,68 @@ class SupervisorFlow:
             str(graph.require_node(node_id).metadata.get("retry_of") or ""): node_id
             for node_id in retry_node_ids
         }
-        dependencies = self._unique(
-            [replacements.get(dependency_id, dependency_id) for dependency_id in previous_verifier.depends_on]
+        dependencies = list(
+            dict.fromkeys(
+                replacements.get(node_id, node_id)
+                for node_id in previous_verifier.depends_on
+            )
         )
-        optional_inputs = self._unique(
-            [replacements.get(dependency_id, dependency_id) for dependency_id in previous_verifier.input_refs]
-        )
+        optional_inputs = [
+            replacements.get(node_id, node_id)
+            for node_id in previous_verifier.input_refs
+        ]
+        intent_id = previous_verifier.intent_ids[0] if previous_verifier.intent_ids else "unknown"
         attempt = previous_verifier.attempt + 1
         node = TaskGraphNode(
-            node_id=f"runtime:evidence_verification:{cycle + 1}",
-            task_id=f"{graph.turn_id}:evidence_verification:{attempt}",
+            node_id=f"runtime:verify:{intent_id}:{attempt}",
+            task_id=f"{graph.turn_id}:verify:{intent_id}:{attempt}",
             agent_id=registration.manifest.agent_id,
             capability="evidence_verification",
+            intent_ids=list(previous_verifier.intent_ids),
             depends_on=dependencies,
-            input_refs=[item for item in optional_inputs if item not in dependencies],
+            input_refs=list(
+                dict.fromkeys(
+                    node_id
+                    for node_id in optional_inputs
+                    if node_id not in dependencies
+                )
+            ),
             attempt=attempt,
             max_attempts=max(attempt, registration.manifest.max_attempts),
             metadata={
+                **previous_verifier.metadata,
                 "phase": "evidence_reverification",
                 "previous_verifier_node_id": previous_verifier.node_id,
                 "retry_node_ids": list(retry_node_ids),
-                "allowed_tools": list(registration.manifest.allowed_tools),
+                "quality_repair_cycle": cycle,
+                "quality_repair_checked": False,
             },
         )
+        previous_verifier.metadata["superseded_by"] = node.node_id
         for downstream in graph.nodes:
-            if downstream.status != "pending" or previous_verifier.node_id not in downstream.depends_on:
+            if downstream.status != "pending" or downstream.capability == "repair":
                 continue
             downstream.depends_on = [
-                node.node_id if dependency_id == previous_verifier.node_id else dependency_id
-                for dependency_id in downstream.depends_on
+                node.node_id if value == previous_verifier.node_id else value
+                for value in downstream.depends_on
+            ]
+            downstream.input_refs = [
+                node.node_id if value == previous_verifier.node_id else value
+                for value in downstream.input_refs
             ]
         graph.add_node(node)
+        terminal_nodes = graph.metadata.setdefault("branch_terminal_nodes", {})
+        if terminal_nodes.get(intent_id) == previous_verifier.node_id:
+            terminal_nodes[intent_id] = node.node_id
         graph.refresh_terminal_nodes()
+        graph.terminal_node_ids = ["system:memory_distillation"]
         graph.validate_graph()
         return node
 
-    def _needs_fallback_answer(self, graph: TaskGraph) -> bool:
-        answer_nodes = [node for node in graph.nodes if node.capability == "answer_generation"]
-        return bool(answer_nodes) and not any(node.status == "succeeded" for node in answer_nodes)
-
-    def _append_fallback_answer(self, graph: TaskGraph) -> TaskGraphNode:
-        existing = graph.get_node("runtime:fallback_answer")
-        if existing is not None:
-            return existing
-        registration = self.compiler.registry.select_for_capability(
-            "answer_generation",
-            execution_mode=str(graph.metadata.get("execution_mode") or ""),
-        )
-        if registration is None:
-            raise RuntimeError("AnswerGenerator is not registered")
-        node = TaskGraphNode(
-            node_id="runtime:fallback_answer",
-            task_id=f"{graph.turn_id}:fallback_answer",
-            agent_id=registration.manifest.agent_id,
-            capability="answer_generation",
-            depends_on=[],
-            metadata={
-                "phase": "fallback_answer",
-                "reason": "Required upstream evidence path did not complete.",
-                "allowed_tools": list(registration.manifest.allowed_tools),
-            },
-        )
-        for answer_node in [item for item in graph.nodes if item.capability == "answer_generation"]:
-            answer_node.metadata = {**answer_node.metadata, "superseded_by": node.node_id}
-        for pending_node in graph.nodes:
-            if pending_node.status != "pending":
-                continue
-            pending_node.status = "skipped"
-            pending_node.metadata = {
-                **pending_node.metadata,
-                "skipped_reason": "fallback_path_selected",
-                "superseded_by": node.node_id,
-            }
-        graph.add_node(node)
-        for memory_node in [item for item in graph.nodes if item.capability == "memory_distillation"]:
-            if memory_node.status != "succeeded":
-                memory_node.status = "pending"
-                memory_node.depends_on = [node.node_id]
-                memory_node.metadata = {
-                    **memory_node.metadata,
-                    "fallback_answer_node_id": node.node_id,
-                }
-        graph.refresh_terminal_nodes()
-        graph.validate_graph()
-        return node
-
-    def _fallback_reflection(self, value: Any) -> ReflectionResult:
-        if isinstance(value, ReflectionResult):
-            return value.model_copy(
-                update={
-                    "has_passed_products": False,
-                    "passed_product_ids": [],
-                    "fallback_plan": "no_product",
-                    "reason": value.reason or "上游 Agent 执行失败，无法形成可靠商品证据。",
-                }
-            )
-        return ReflectionResult(
-            has_passed_products=False,
-            reason="上游 Agent 执行失败，无法形成可靠商品证据。",
-            fallback_plan="no_product",
-        )
+    def _reset_phase_report(self, report: ExecutionReport) -> None:
+        report.failed_node_ids = []
+        report.blocked_node_ids = []
+        report.completed = False
 
     def _unresolved_failure_ids(self, graph: TaskGraph) -> list[str]:
         unresolved: list[str] = []
@@ -628,8 +811,8 @@ class SupervisorFlow:
             if node.status not in {"failed", "timeout", "cancelled"}:
                 continue
             replacement_id = str(node.metadata.get("superseded_by") or "")
-            seen: set[str] = set()
             replacement = graph.get_node(replacement_id) if replacement_id else None
+            seen: set[str] = set()
             while replacement is not None and replacement.node_id not in seen:
                 seen.add(replacement.node_id)
                 next_id = str(replacement.metadata.get("superseded_by") or "")
@@ -640,30 +823,66 @@ class SupervisorFlow:
                 unresolved.append(node.node_id)
         return unresolved
 
-    def _executor_event(self, event: Any, graph: TaskGraph, plan: IntentPlan) -> dict[str, Any]:
+    def _branch_reflections(
+        self,
+        graph: TaskGraph,
+        report: ExecutionReport,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for intent_id, terminal_id in graph.metadata.get("branch_terminal_nodes", {}).items():
+            node_ids = [*graph.ancestor_node_ids(terminal_id), terminal_id]
+            for node_id in reversed(node_ids):
+                scoped = report.artifacts.get(f"artifacts:{node_id}")
+                reflection = scoped.get("reflection") if isinstance(scoped, dict) else None
+                if isinstance(reflection, ReflectionResult):
+                    result[intent_id] = reflection.model_dump()
+                    break
+        return result
+
+    def _executor_event(
+        self,
+        event: Any,
+        graph: TaskGraph,
+        plan: IntentPlanV3,
+    ) -> dict[str, Any]:
         payload = event.as_dict()
         if event.kind == "agent_output":
             client_event = payload.get("event")
             if isinstance(client_event, dict):
                 return client_event
-            return {"type": "trace", "stage": "agent_output", "content": "Agent emitted an invalid client event."}
+            return {
+                "type": "trace",
+                "stage": "agent_output",
+                "content": "Agent emitted an invalid client event.",
+            }
         if event.kind == "node_started":
+            node = graph.get_node(event.node_id)
+            goals = graph.metadata.get("intent_goals", {})
+            goal = "；".join(goals.get(item, item) for item in (node.intent_ids if node else []))
             return {
                 "type": "agent_update",
                 "stage": self._stage_for_capability(payload.get("capability", "")),
                 "title": f"{payload.get('agent_id', 'Agent')} 执行中",
-                "content_delta": f"正在执行 {payload.get('capability', '')}。",
+                "content_delta": (
+                    f"正在处理：{goal}。" if goal else f"正在执行 {payload.get('capability', '')}。"
+                ),
                 "done": False,
                 "run_id": getattr(self.executor.span_recorder, "run_id", ""),
                 "task_id": payload.get("task_id", ""),
                 "agent_id": payload.get("agent_id", ""),
+                "intent_ids": list(node.intent_ids) if node else [],
             }
         if event.kind == "node_finished":
             span = self._latest_span(payload.get("task_id", ""))
-            timing = self.executor.span_recorder.timing_event(span) if span is not None else {
-                "type": "timing_update",
-                "run_id": getattr(self.executor.span_recorder, "run_id", ""),
-            }
+            timing = (
+                self.executor.span_recorder.timing_event(span)
+                if span is not None
+                else {
+                    "type": "timing_update",
+                    "run_id": getattr(self.executor.span_recorder, "run_id", ""),
+                }
+            )
+            node = graph.get_node(event.node_id)
             return {
                 "type": "timing_update",
                 **timing,
@@ -674,14 +893,15 @@ class SupervisorFlow:
                     "capability": payload.get("capability", ""),
                     "status": payload.get("status", ""),
                     "attempt": payload.get("attempt", 1),
+                    "intent_ids": list(node.intent_ids) if node else [],
                 },
             }
         if event.kind == "node_blocked":
             return {
                 "type": "agent_update",
                 "stage": "supervisor",
-                "title": "Supervisor 路由",
-                "content_delta": f"节点 {event.node_id} 因依赖失败被跳过。",
+                "title": "分支依赖未完成",
+                "content_delta": f"节点 {event.node_id} 的硬依赖失败，仅跳过当前分支后续。",
                 "done": True,
             }
         if event.kind == "handoff_updated":
@@ -694,7 +914,7 @@ class SupervisorFlow:
             }
         return {
             "type": "decision_trace",
-            "trace": self._trace(graph, plan, None, "", None),
+            "trace": self._trace(graph, plan, None, "", {}),
             "executor_event": payload,
         }
 
@@ -705,253 +925,13 @@ class SupervisorFlow:
                 return span
         return spans[-1] if spans else None
 
-    def _knowledge_follow_up_decision(
-        self,
-        graph: TaskGraph,
-        context: AgentExecutionContext,
-    ) -> tuple[Any, dict[str, Any] | None] | None:
-        policy_node_id = "runtime:policy_gate:knowledge_follow_up"
-        if graph.get_node(policy_node_id) is not None:
-            return None
-        knowledge = context.artifact("knowledge_research")
-        if not isinstance(knowledge, dict):
-            return None
-        plan = context.artifact("intent_plan", context.intent_plan)
-        if not isinstance(plan, IntentPlan):
-            return None
-        knowledge_node = next((node for node in graph.nodes if node.capability == "knowledge_research"), None)
-        if knowledge_node is None:
-            return None
-        evidence = (
-            context.artifact(f"evidence:{knowledge_node.node_id}", [])
-        )
-        existing_product_path = any(
-            node.capability in {
-                "single_product_recommendation",
-                "multi_product_bundle",
-                "slot_product_retrieval",
-            }
-            for node in graph.nodes
-        )
-        recorder = self.executor.span_recorder
-        policy_span = None
-        if recorder is not None:
-            policy_span = recorder.start_span(
-                "supervisor_policy_gate:knowledge_follow_up",
-                label="Supervisor 知识转检索审批",
-                agent="SupervisorPolicyGate",
-                parent_span_key=self.executor.span_key_for_node(knowledge_node.node_id),
-                task_id=f"{graph.turn_id}:policy_gate:knowledge_follow_up",
-                agent_id="supervisor_policy_gate",
-                span_type="policy",
-                input_summary={
-                    "knowledge_node_id": knowledge_node.node_id,
-                    "candidate_count": len(knowledge.get("concept_proposals") or []),
-                    "evidence_count": len(evidence) if isinstance(evidence, list) else 0,
-                    "existing_product_path": existing_product_path,
-                    "implementation": "deterministic_code",
-                },
-            )
-        try:
-            decision = self.compiler.policy_gate.approve_knowledge_follow_up(
-                plan,
-                knowledge_artifact=knowledge,
-                evidence_refs=evidence if isinstance(evidence, list) else [],
-                existing_product_path=existing_product_path,
-            )
-        except Exception as exc:
-            if policy_span is not None:
-                recorder.finish_span(
-                    policy_span,
-                    status="failed",
-                    error_type=type(exc).__name__,
-                    error_message=str(exc),
-                    termination_reason="knowledge_policy_error",
-                )
-            raise
-
-        if decision.approved:
-            registration = self.compiler.registry.select_for_capability(
-                "single_product_recommendation",
-                execution_mode="single_product",
-            )
-            verifier = next(
-                (node for node in graph.nodes if node.capability == "evidence_verification"),
-                None,
-            )
-            recommendation_node = graph.get_node("runtime:knowledge_recommendation")
-            if recommendation_node is not None:
-                decision = decision.model_copy(
-                    update={
-                        "decision": "already_scheduled",
-                        "approved": False,
-                        "reason": "知识衍生商品检索节点已经存在，不重复调度。",
-                        "approved_query": "",
-                    }
-                )
-            elif registration is None or verifier is None:
-                decision = decision.model_copy(
-                    update={
-                        "decision": "reject_knowledge_to_retrieval",
-                        "approved": False,
-                        "reason": "Supervisor 无法创建完整的推荐与校验节点，停止追加检索。",
-                        "approved_query": "",
-                    }
-                )
-        decision_payload = decision.model_dump()
-        policy_node = TaskGraphNode(
-            node_id=policy_node_id,
-            task_id=f"{graph.turn_id}:policy_gate:knowledge_follow_up",
-            agent_id="supervisor_policy_gate",
-            capability="policy_gate",
-            depends_on=[knowledge_node.node_id],
-            status="succeeded",
-            metadata={
-                "phase": "knowledge_follow_up_policy_approval",
-                "implementation": "deterministic_code",
-                **decision_payload,
-            },
-        )
-        graph.add_node(policy_node)
-        policy_payload = None
-        if policy_span is not None:
-            policy_payload = recorder.finish_span(
-                policy_span,
-                status="succeeded",
-                output_summary=decision_payload,
-                metrics={
-                    "approved": decision.approved,
-                    "approved_concept_count": len(decision.approved_concepts),
-                    "rejected_concept_count": len(decision.rejected_concepts),
-                    "evidence_count": len(decision.supporting_evidence_ids),
-                },
-                termination_reason=(
-                    "policy_approved" if decision.approved else "policy_rejected"
-                ),
-            )
-            self.executor.register_completed_node_span(
-                policy_node_id,
-                str(policy_payload.get("span_key") or ""),
-            )
-        graph.validate_graph()
-        return decision, policy_payload
-
-    def _append_knowledge_follow_up(self, graph: TaskGraph, decision: Any) -> None:
-        registration = self.compiler.registry.select_for_capability(
-            "single_product_recommendation",
-            execution_mode="single_product",
-        )
-        verifier = next((node for node in graph.nodes if node.capability == "evidence_verification"), None)
-        knowledge_node = next((node for node in graph.nodes if node.capability == "knowledge_research"), None)
-        policy_node = graph.get_node("runtime:policy_gate:knowledge_follow_up")
-        if registration is None or verifier is None or knowledge_node is None or policy_node is None:
-            raise RuntimeError("Approved knowledge follow-up cannot be materialized")
-        node_id = "runtime:knowledge_recommendation"
-        graph.add_node(
-            TaskGraphNode(
-                node_id=node_id,
-                task_id=f"{graph.turn_id}:knowledge_recommendation",
-                agent_id=registration.manifest.agent_id,
-                capability="single_product_recommendation",
-                depends_on=[policy_node.node_id],
-                max_attempts=registration.manifest.max_attempts,
-                metadata={
-                    "reason": decision.reason,
-                    "query_override": decision.approved_query,
-                    "supervisor_approved": True,
-                    "approved_concepts": list(decision.approved_concepts),
-                    "supporting_evidence_ids": list(decision.supporting_evidence_ids),
-                    "risk_flags": list(decision.risk_flags),
-                    "verification_goal": decision.verification_goal,
-                    "intent_plan_artifact": "knowledge_retrieval_plan",
-                    "allowed_tools": list(registration.manifest.allowed_tools),
-                },
-            )
-        )
-        verifier.depends_on = [
-            node_id if dependency_id == knowledge_node.node_id else dependency_id
-            for dependency_id in verifier.depends_on
-        ]
-        # Preserve the source knowledge node as evidence lineage as well as the
-        # derived recommendation node.
-        if knowledge_node.node_id not in verifier.depends_on:
-            verifier.depends_on.append(knowledge_node.node_id)
-        if policy_node.node_id not in verifier.depends_on:
-            verifier.depends_on.append(policy_node.node_id)
-        if node_id not in verifier.depends_on:
-            verifier.depends_on.append(node_id)
-        graph.validate_graph()
-
-    def _knowledge_retrieval_plan(
-        self,
-        original: IntentPlan,
-        decision: Any,
-    ) -> IntentPlan:
-        query = str(decision.approved_query or original.normalized_query or original.original_query)
-        return original.model_copy(
-            update={
-                "normalized_query": query,
-                "execution_mode": "single_product",
-                "plan_type": "single_retrieval",
-                "vector_query": query,
-                "keyword_query": query,
-                "plan_reason": "KnowledgeResearchAgent 证据经 Supervisor 审批后形成商品检索概念。",
-            }
-        )
-
-    def _quality_failure_targets(self, graph: TaskGraph, artifacts: dict[str, Any]) -> list[str]:
-        reflection = artifacts.get("reflection")
-        if reflection is None or not getattr(reflection, "repair_hint", None) or not reflection.repair_hint.repairable:
-            return []
-        targets = set(reflection.repair_hint.target_slot_ids or [])
-        nodes: list[str] = []
-
-        single_nodes = [
-            node for node in graph.nodes
-            if node.capability == "single_product_recommendation" and node.status == "succeeded"
-        ]
-        if single_nodes and (not targets or "single" in targets):
-            nodes.append(max(single_nodes, key=lambda item: item.attempt).node_id)
-
-        selected_slots: list[TaskGraphNode] = []
-        by_slot: dict[str, list[TaskGraphNode]] = {}
-        for node in graph.nodes:
-            if node.capability != "slot_product_retrieval" or node.status != "succeeded":
-                continue
-            slot_id = str(node.metadata.get("slot", {}).get("slot_id") or "")
-            if slot_id and (not targets or slot_id in targets):
-                by_slot.setdefault(slot_id, []).append(node)
-        for candidates in by_slot.values():
-            selected_slots.append(max(candidates, key=lambda item: item.attempt))
-        nodes.extend(node.node_id for node in selected_slots)
-
-        # A quality retry for one or more slots must also rebuild the merged
-        # MultiNeedState; otherwise the next Verifier would review stale evidence.
-        if selected_slots:
-            merge_nodes = [
-                node for node in graph.nodes
-                if node.capability == "multi_product_bundle"
-                and node.metadata.get("phase") == "merge_slot_evidence"
-                and node.status == "succeeded"
-            ]
-            if merge_nodes:
-                nodes.append(max(merge_nodes, key=lambda item: item.attempt).node_id)
-        return self._unique(nodes)
-
-    def _route_from_plan(self, plan: IntentPlan, output: dict[str, Any]) -> str:
-        if plan.plan_type == "clarify":
-            return "clarify"
-        if plan.plan_type == "direct_answer":
-            return "direct_answer"
-        return str(output.get("route") or "no_product")
-
     def _trace(
         self,
         graph: TaskGraph,
-        plan: IntentPlan,
+        plan: IntentPlanV3,
         report: ExecutionReport | None,
         route: str,
-        reflection: Any,
+        reflections: Any,
     ) -> dict[str, Any]:
         nodes = [
             {
@@ -959,12 +939,14 @@ class SupervisorFlow:
                 "task_id": node.task_id,
                 "agent_id": node.agent_id,
                 "capability": node.capability,
+                "intent_ids": list(node.intent_ids),
                 "depends_on": list(node.depends_on),
                 "input_refs": list(node.input_refs),
                 "required": node.required,
                 "status": node.status,
                 "attempt": node.attempt,
                 "phase": node.metadata.get("phase", ""),
+                "objective": node.metadata.get("objective", ""),
                 "skipped_reason": node.metadata.get("skipped_reason", ""),
             }
             for node in graph.nodes
@@ -972,20 +954,18 @@ class SupervisorFlow:
         tool_calls = self._trace_tool_calls(graph, report)
         graph.sync_handoffs()
         handoffs = [item.model_dump() for item in sorted(graph.handoffs, key=lambda item: item.sequence)]
-        unresolved_failures = list(report.failed_node_ids) if report else []
+        unresolved = list(report.failed_node_ids) if report else []
         blocked = list(report.blocked_node_ids) if report else []
         pending = [node.node_id for node in graph.nodes if node.status in {"pending", "running"}]
         task_status = (
             "running"
             if pending
-            else "failed"
-            if unresolved_failures
             else "degraded"
-            if blocked
+            if unresolved or blocked
             else "succeeded"
         )
         return {
-            "trace_schema_version": "v2",
+            "trace_schema_version": "v3",
             "run_id": str(getattr(self.executor.span_recorder, "run_id", "") or ""),
             "route": route,
             "task_status": task_status,
@@ -993,8 +973,11 @@ class SupervisorFlow:
                 "graph_id": graph.graph_id,
                 "turn_id": graph.turn_id,
                 "schema_version": graph.schema_version,
-                "execution_mode": graph.metadata.get("execution_mode"),
+                "intent_order": graph.metadata.get("intent_order", []),
+                "intent_statuses": graph.metadata.get("intent_statuses", {}),
+                "branch_terminal_nodes": graph.metadata.get("branch_terminal_nodes", {}),
                 "repair_history": graph.metadata.get("repair_history", []),
+                "intent_revisions": graph.metadata.get("intent_revisions", []),
                 "supervisor_decisions": graph.metadata.get("supervisor_decisions", []),
                 "handoff_count": len(handoffs),
                 "tool_call_count": len(tool_calls),
@@ -1003,8 +986,8 @@ class SupervisorFlow:
             "agent_path": nodes,
             "tool_calls": tool_calls,
             "handoffs": handoffs,
-            "reflection": reflection.model_dump() if hasattr(reflection, "model_dump") else reflection or {},
-            "failed_node_ids": list(report.failed_node_ids) if report else [],
+            "reflections_by_intent": reflections or {},
+            "failed_node_ids": unresolved,
             "blocked_node_ids": blocked,
         }
 
@@ -1029,6 +1012,7 @@ class SupervisorFlow:
                         "call_id": f"{node.task_id}:tool:{index}",
                         "node_id": node.node_id,
                         "capability": node.capability,
+                        "intent_ids": list(node.intent_ids),
                     }
                 )
         return calls
@@ -1036,7 +1020,14 @@ class SupervisorFlow:
     def _stage_for_capability(self, capability: str) -> str:
         if capability in {"intent_understanding", "profile_preference", "clarification"}:
             return "planner"
-        if capability in {"single_product_recommendation", "multi_product_bundle", "slot_product_retrieval", "commerce_research", "knowledge_research", "comparison"}:
+        if capability in {
+            "single_product_recommendation",
+            "multi_product_bundle",
+            "slot_product_retrieval",
+            "commerce_research",
+            "knowledge_research",
+            "comparison",
+        }:
             return "retrieval"
         if capability in {"evidence_verification", "repair", "bundle_optimization"}:
             return "corrective"
@@ -1044,12 +1035,14 @@ class SupervisorFlow:
             return "answer"
         return "supervisor"
 
-    def _unique(self, values: list[str]) -> list[str]:
-        return list(dict.fromkeys(value for value in values if value))
-
-    def _graph_snapshot_event(self, graph: TaskGraph, plan: IntentPlan, reason: str) -> dict[str, Any]:
+    def _graph_snapshot_event(
+        self,
+        graph: TaskGraph,
+        plan: IntentPlanV3,
+        reason: str,
+    ) -> dict[str, Any]:
         return {
             "type": "decision_trace",
-            "trace": self._trace(graph, plan, None, "", None),
+            "trace": self._trace(graph, plan, None, "", {}),
             "supervisor_decision": reason,
         }

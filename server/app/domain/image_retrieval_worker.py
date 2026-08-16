@@ -82,6 +82,10 @@ class ImageRetrievalWorker:
             score_filtered_products=[candidate.product for candidate in search_result.candidates],
             hybrid_ranked_products=[candidate.product for candidate in search_result.candidates],
             ranked=ranked,
+            candidate_sources={
+                candidate.product_id: ["retrieved"]
+                for candidate in search_result.candidates
+            },
             rerank_query=query,
             tool_call_count=1,
             image_path=str(image_path),

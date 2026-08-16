@@ -15,7 +15,6 @@ from app.schemas import (
     IntentPlan,
     ProductCard,
     QueryPlan,
-    SINGLE_RECOMMENDATION_LIMIT,
 )
 from app.services.llm_client import LlmClient
 
@@ -169,7 +168,7 @@ class AnswerGenerator:
         if not ranked_products:
             raise RuntimeError("AnswerGenerator 没有可用于生成回答的候选商品。")
         products = []
-        for product, score in ranked_products[:SINGLE_RECOMMENDATION_LIMIT]:
+        for product, score in ranked_products:
             products.append(
                 {
                     "product_id": product.product_id,
@@ -189,7 +188,7 @@ class AnswerGenerator:
             "不得编造商品、价格、库存、优惠或功效。"
             "并说明推荐理由来自商品描述或用户评价。"
             "单一检索回答中，final_products 里的每个商品都是 Corrective Agent 已通过的正式推荐商品；"
-            f"单一检索最多推荐 {SINGLE_RECOMMENDATION_LIMIT} 个，必须按 final_recommendation_order 顺序逐一推荐全部商品，不要只挑 2-3 个，"
+            "必须按 final_recommendation_order 顺序逐一推荐全部商品，不要自行增加、删减或重排，"
             "不要把其中任何商品写成候补/可考虑/备选。"
             "如果用户问的是粗品类或上位商品词，例如护肤品、衣服、鞋子、裤子、饮料、零食、电脑、手机，"
             "不要把需求误写成某一个精确子类；如果 final_products 覆盖多个 sub_category，要按不同子类/用途清楚呈现多样化选择。"
@@ -200,6 +199,8 @@ class AnswerGenerator:
             "必须保持不确定措辞，不能把图片推测说成商品事实，也不能覆盖商品证据。"
             "extra_context.verified_external_evidence 只包含 EvidenceVerifier 放行的对比、知识或外部平台证据；"
             "可以用它补充用户明确要求的解释和对比，但不得用它新增 final_products、价格、库存或未经本地校验的商品推荐。"
+            "如果 extra_context.recommendation_selection.quantity_status=partial 或 constraint_conflict，"
+            "必须简短说明数量约束未完全满足及实际推荐数量，不得假装已经满足。"
             "\n\n# 输出格式 (markdown, 字数不限)\n"
             "必须严格按以下 markdown 格式输出，让前端解析渲染:\n"
             "\n"
