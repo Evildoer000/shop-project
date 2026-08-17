@@ -232,7 +232,7 @@ class SupervisorPlanCompiler:
             hard_dependencies = _unique([*hard_dependencies, root_node_id])
             optional_inputs = [
                 node_ids[dependency_id]
-                for dependency_id in task.optional_context_from
+                for dependency_id in task.optional_upstream_task_ids
                 if dependency_id in node_ids and node_ids[dependency_id] not in hard_dependencies
             ]
             graph.add_node(

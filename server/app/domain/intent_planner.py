@@ -3,15 +3,23 @@ from __future__ import annotations
 import inspect
 import json
 import re
+from copy import deepcopy
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import ValidationError
+
+from app.domain.context_reference_resolver import ContextReferenceResolver
 from app.domain.supervisor.capability_catalog import (
     CapabilityCatalog,
     build_default_capability_catalog,
 )
 from app.domain.supervisor.prompts import PromptRegistry, build_default_prompt_registry
+from app.domain.supervisor.validators import (
+    IntentPlanContractError,
+    validate_intent_plan_contract,
+)
 from app.schemas import (
     AgentTaskParameters,
     AgentTaskProposal,
@@ -26,7 +34,6 @@ from app.schemas import (
 from app.services.llm_client import LlmClient
 from app.services.structured_llm import (
     StructuredLlmValidationError,
-    generate_validated_json,
     parse_json_object,
 )
 
@@ -48,7 +55,6 @@ class IntentPlanner:
         "product_comparison",
         "product_qa",
         "shopping_knowledge",
-        "cart_action",
     }
     PRIORITIES = {"required", "optional"}
     TRIGGER_TYPES = {
@@ -88,12 +94,21 @@ class IntentPlanner:
         self.llm_client = llm_client or LlmClient(component="IntentPlanner")
         self.capability_catalog = capability_catalog or build_default_capability_catalog()
         self.prompt_registry = prompt_registry or build_default_prompt_registry()
+        self.context_reference_resolver = ContextReferenceResolver()
+        self.last_validation_attempts: list[dict[str, Any]] = []
+        self.last_normalizations: list[dict[str, Any]] = []
 
     async def stream_plan_with_summary(
         self,
         query: str,
         context: dict[str, Any] | None = None,
     ) -> AsyncGenerator[PlannerStreamEvent, None]:
+        self.last_validation_attempts = []
+        self.last_normalizations = []
+        yield PlannerStreamEvent(
+            kind="summary_delta",
+            content="正在识别意图、上下文引用和任务依赖。",
+        )
         system_prompt = self._system_prompt(context, tagged=True)
         user_prompt = self._user_prompt(query, context)
         parser = _TaggedPlannerStreamParser()
@@ -104,33 +119,52 @@ class IntentPlanner:
             operation="intent_planner.v3.stream_plan_with_summary",
         ):
             content_parts.append(delta)
-            for summary_delta in parser.feed(delta):
-                if summary_delta:
-                    yield PlannerStreamEvent(kind="summary_delta", content=summary_delta)
+            parser.feed(delta)
         parser.finish()
         content = "".join(content_parts)
         data = parse_json_object(self._json_text_from_tagged_content(content))
-        if data is None:
+        errors = (
+            ["输出不是可解析的 <json> JSON object。"]
+            if data is None
+            else self._validate_plan_data(data, query=query, context=context)
+        )
+        self._record_validation_attempt(1, content, errors)
+        if errors:
+            yield PlannerStreamEvent(
+                kind="summary_delta",
+                content="初次计划未通过结构校验，正在执行一次定向修复。",
+            )
+            repair_prompt = self._repair_user_prompt(
+                user_prompt,
+                content,
+                errors,
+            )
+            repaired_content = await self._generate_required(
+                self._system_prompt(context, tagged=False),
+                repair_prompt,
+                operation="intent_planner.v3.stream_plan_with_summary.structure_repair",
+            )
+            data = parse_json_object(repaired_content)
+            errors = (
+                ["修复输出不是可解析的 JSON object。"]
+                if data is None
+                else self._validate_plan_data(data, query=query, context=context)
+            )
+            self._record_validation_attempt(2, repaired_content, errors)
+            content = repaired_content
+        if data is None or errors:
             raise StructuredLlmValidationError(
-                "IntentPlanner returned invalid tagged JSON.",
-                errors=["输出不是可解析的 <json> JSON object。"],
-                data=None,
+                "IntentPlanner returned invalid V3 JSON after one repair.",
+                errors=errors,
+                data=data,
                 content=content,
             )
         summary = parser.summary.strip()
         if summary and not str(data.get("summary") or "").strip():
             data["summary"] = summary
-        errors = self._validate_plan_data(data)
-        if errors:
-            raise StructuredLlmValidationError(
-                "IntentPlanner returned invalid V3 JSON.",
-                errors=errors,
-                data=data,
-                content=content,
-            )
         yield PlannerStreamEvent(
             kind="plan",
-            intent_plan=self._parse_plan(query, data),
+            intent_plan=self._parse_plan(query, data, context=context),
         )
 
     async def plan(
@@ -138,16 +172,48 @@ class IntentPlanner:
         query: str,
         context: dict[str, Any] | None = None,
     ) -> IntentPlanV3:
-        data = await generate_validated_json(
-            self.llm_client,
-            self._system_prompt(context, tagged=False),
-            self._user_prompt(query, context),
-            validate=self._validate_plan_data,
-            error_message="IntentPlanner returned invalid V3 JSON.",
-            response_format=self.JSON_RESPONSE_FORMAT,
-            operation="intent_planner.v3.plan",
+        self.last_validation_attempts = []
+        self.last_normalizations = []
+        system_prompt = self._system_prompt(context, tagged=False)
+        original_user_prompt = self._user_prompt(query, context)
+        user_prompt = original_user_prompt
+        last_data: dict[str, Any] | None = None
+        last_content = ""
+        last_errors: list[str] = []
+        for attempt in range(1, 3):
+            last_content = await self._generate_required(
+                system_prompt,
+                user_prompt,
+                operation=(
+                    "intent_planner.v3.plan"
+                    if attempt == 1
+                    else "intent_planner.v3.plan.structure_repair"
+                ),
+            )
+            last_data = parse_json_object(last_content)
+            last_errors = (
+                ["输出不是可解析的 JSON object。"]
+                if last_data is None
+                else self._validate_plan_data(
+                    last_data,
+                    query=query,
+                    context=context,
+                )
+            )
+            self._record_validation_attempt(attempt, last_content, last_errors)
+            if last_data is not None and not last_errors:
+                return self._parse_plan(query, last_data, context=context)
+            user_prompt = self._repair_user_prompt(
+                original_user_prompt,
+                last_content,
+                last_errors,
+            )
+        raise StructuredLlmValidationError(
+            "IntentPlanner returned invalid V3 JSON after one repair.",
+            errors=last_errors,
+            data=last_data,
+            content=last_content,
         )
-        return self._parse_plan(query, data)
 
     def _system_prompt(self, context: dict[str, Any] | None, *, tagged: bool) -> str:
         output_rule = (
@@ -171,13 +237,14 @@ class IntentPlanner:
             "- 用户消息中每个可以独立完成、独立失败、独立回答的目标，都建立一个 intent。\n"
             "- intents 必须严格按用户表达顺序排列；最终答案会沿用此顺序。\n"
             "- 同一句话可以有任意多个独立意图。不要因为它们使用同一种 capability 就合并。\n"
-            "- 每个 intent 都必须包含 intent_id、intent_type、priority、goal、resolved_query。\n"
+            "- 每个 intent 都必须包含 intent_id、intent_type、goal、resolved_query；priority 省略时默认为 required，单一用户目标不得标成 optional。\n"
             "- 约束、上下文商品引用、商品需求和不确定性必须放在所属 intent 内，不得放到全局。\n"
+            "- 金额范围只能写入 intent.budget={minimum, maximum, scope, currency}；禁止把 [100,220] 这类数字数组塞进 constraint.value。\n"
             "- 单个商品目标可有一个 product_need 或不写；真正的组合、清单、从头到脚搭配才拆多个 product_needs。\n"
             "- product_needs 只表达业务商品目标，不得生成向量查询、BM25 查询、过滤器、top_k 或其它检索实现字段。\n\n"
             "## 推荐候选策略\n"
             "- 每个 product_recommendation intent 都要填写 recommendation_policy；它只描述候选来源、历史商品角色和用户要求的最终数量，不包含检索实现。\n"
-            "- candidate_source=context_only：用户明确要求只在本会话已推荐/已提到商品中筛选；必须填写真实 referenced_product_ids，且不要创建商品检索任务。\n"
+            "- candidate_source=context_only：用户明确要求只在本会话已推荐/已提到商品中筛选；必须选择可信 context_reference_keys，且不要创建商品检索任务。\n"
             "- candidate_source=context_plus_new：既要考虑上下文商品，也要补充新商品；必须创建对应商品推荐任务。\n"
             "- candidate_source=new_only：只需要新商品，或本轮没有可引用的上下文商品；创建对应商品推荐任务。\n"
             "- reference_policy=must_include：用户明确说‘算上/保留前面的商品’；eligible：历史商品与新商品一起参与筛选但不保证入选；comparison_only：历史商品只作比较背景，不进入正式推荐；没有引用时用 none。\n"
@@ -185,13 +252,18 @@ class IntentPlanner:
             "- ‘就在刚才推荐的商品里选两个有芦荟的’：context_only + eligible + 2 + exact，不创建 single_product_recommendation。\n"
             "- ‘算上前面两个，总共给我五个护手霜’：context_plus_new + must_include + 5 + exact，创建 single_product_recommendation。\n"
             "- ‘前面两个还可以，再给我一些符合新条件的备选’：通常 context_plus_new + eligible；只有明确说不要旧商品/只看新的时才用 new_only。\n"
-            "- referenced_product_ids 只能复制 context.recent_turns、session_summary 或可信证据中真实出现的 ID；不得按商品名编造 ID。\n\n"
+            "- 只能从 context.trusted_product_references.groups 复制 context_reference_keys。严禁输出 referenced_product_ids 或按商品名编造 ID；后端会把可信 key 映射为 ID。\n\n"
             "## 任务提案\n"
-            "- 每个 task_proposal 必须包含 task_id、capability、intent_ids、objective、depends_on、"
-            "optional_context_from、parameters、reason。\n"
+            "- 每个 task_proposal 必须包含 task_id、capability、单数 intent_id、objective、depends_on、"
+            "optional_upstream_task_ids、parameters、reason。\n"
             "- task_id 必须唯一。相同 capability 可以出现多次，例如两个独立知识任务必须是两个 task。\n"
-            "- depends_on 只表示没有上游结果就不能执行的硬依赖；optional_context_from 只表示可选增强。\n"
-            "- 每个业务任务通常只绑定一个 intent_id。跨意图依赖必须确实需要另一个任务的结果。\n"
+            "- depends_on 只表示没有上游任务结果就不能执行的硬依赖；optional_upstream_task_ids 只表示可选上游任务结果。\n"
+            "- depends_on 与 optional_upstream_task_ids 只能填写本次 task_proposals 中其他任务的 task_id；禁止填写当前任务自身。\n"
+            "- context_reference_keys 只填写可信历史商品引用，例如 ['latest:item:2', 'turn:403']。"
+            "optional_upstream_task_ids 的正确示例是 ['task_knowledge_001']。\n"
+            "- 禁止把 latest:item:2、turn:403、product:p_xxx 或任何历史商品引用放入 optional_upstream_task_ids/depends_on；"
+            "商品引用只能进入所属 intent.context_reference_keys，商品 ID 由后端可信解析，LLM 不直接生成。\n"
+            "- 每个业务任务只能绑定一个 intent_id。跨意图依赖必须确实需要另一个任务的结果。严禁输出 intent_ids 数组。\n"
             "- 不得提案 EvidenceVerifier、BundleOptimizer、Repair、AnswerGenerator 或 MemoryDistillation；这些由 Supervisor 管理。\n"
             "- 不得输出 required 或 expected_output_schema；必需性由 intent.priority 和依赖关系推导。\n\n"
             "## capability 边界\n"
@@ -201,20 +273,20 @@ class IntentPlanner:
             "- single_product_recommendation：一个商品目标，由 Agent 内部生成 RetrievalPlan。\n"
             "- multi_product_bundle：一个组合目标，product_needs 至少两个；各 need 后续由独立 Slot 任务检索。\n"
             "- comparison：只对已有商品和上游资料做精准对比；它可读取本地 product_detail，但不能联网或搜索平台。\n"
-            "- knowledge_research：交给商品信息与知识补充 Agent；它可以读取已知本地商品的 product_detail，也可以补充网页知识、原理、成分和选购依据，或把模糊目标收敛为商品概念。\n"
+            "- knowledge_research：交给商品信息与知识补充 Agent；parameters.knowledge_mode 必填。knowledge_answer 直接回答知识问题，product_evidence 为推荐/对比准备资料，concept_bridge 才负责把模糊效果收敛为商品概念。\n"
             "- commerce_research：只在用户明确要求淘宝、抖音或小红书商品/口碑时提案。\n\n"
             "## 联网边界\n"
             "以下情况可以提案 knowledge_research：用户明确要求联网/查资料；明确要求最新信息；"
             "明确询问原理、成分、规格、适用范围或选购知识；要求介绍已有商品；或者只描述效果、症状、用途，无法确定可检索商品类型，需要 knowledge_bridge。\n"
-            "product_qa 或商品介绍任务如果已经有 referenced_product_ids，应优先交给商品信息与知识补充 Agent 使用 product_detail；"
+            "product_qa 或商品介绍任务如果已经选择 context_reference_keys，应优先交给商品信息与知识补充 Agent 使用 product_detail；"
             "除非用户同时明确要求新商品推荐，否则不要额外创建 single_product_recommendation。\n"
             "商品类型已经明确且用户只要本地推荐时，不要为了补充常识而联网。\n"
-            "knowledge_bridge 的 parameters.trigger_type=knowledge_bridge，route_basis.target_clarity=vague_effect_or_use，"
-            "且 product_family 必须为空。知识结果返回后，同一个 IntentUnderstandingAgent 会只针对该 intent 修订路线。\n"
+            "只有 concept_bridge 才填写 parameters.knowledge_mode=concept_bridge 和 trigger_type=knowledge_bridge。"
+            "它的知识结果返回后，同一个 IntentUnderstandingAgent 会只针对该 intent 修订路线；knowledge_answer/product_evidence 直接进入原有下游。\n"
             "用户明确指定平台时，commerce_research.parameters.platforms 只填写用户点名的平台。\n\n"
             "## 上下文与图片\n"
             "当前 query > 最近对话 > 会话摘要。只有省略式追问、明确指代或继续上一轮时才继承上下文。\n"
-            "遇到‘这些、刚才的、前面两个、上一轮推荐的’等指代时，必须先从上下文商品记录解析 referenced_product_ids，再决定 recommendation_policy。\n"
+            "遇到‘这些、刚才的、前面两个、上一轮推荐的’或明确商品名时，只能选择 trusted_product_references 中对应的 key，再决定 recommendation_policy。\n"
             "图片只是输入模态；不要创建纯图片 Agent。商品推荐 Agent 会按请求元数据自行调用图片工具。\n\n"
             "## 典型拆分\n"
             "用户说『敏感肌买什么；喉咙不舒服买什么；下周去海边帮我从头到脚搭一套』："
@@ -256,13 +328,50 @@ class IntentPlanner:
         )
 
     def _output_contract(self) -> dict[str, Any]:
+        schema = deepcopy(IntentPlanV3.model_json_schema(mode="validation"))
+        internal_fields = {
+            "original_query",
+            "normalized_query",
+            "trusted_context_product_ids",
+            "references_resolved",
+            "referenced_product_ids",
+            "intent_ids",
+        }
+
+        def scrub(value: Any) -> None:
+            if isinstance(value, dict):
+                properties = value.get("properties")
+                if isinstance(properties, dict):
+                    for field in internal_fields:
+                        properties.pop(field, None)
+                    required = value.get("required")
+                    if isinstance(required, list):
+                        value["required"] = [
+                            field for field in required if field not in internal_fields
+                        ]
+                for item in value.values():
+                    scrub(item)
+            elif isinstance(value, list):
+                for item in value:
+                    scrub(item)
+
+        scrub(schema)
+        task_schema = (schema.get("$defs") or {}).get("AgentTaskProposal")
+        if isinstance(task_schema, dict):
+            required = list(task_schema.get("required") or [])
+            if "intent_id" not in required:
+                required.append("intent_id")
+            task_schema["required"] = required
+        return schema
+
+    def _legacy_output_contract(self) -> dict[str, Any]:
         return {
             "schema_version": "3.0",
             "summary": "short Chinese planning summary",
             "intents": [
                 {
                     "intent_id": "i1",
-                    "intent_type": "social_chat | product_recommendation | product_comparison | product_qa | shopping_knowledge | cart_action",
+                    "intent_type": "social_chat | product_recommendation | product_comparison | product_qa | shopping_knowledge",
                     "priority": "required | optional",
                     "goal": "one independently answerable business goal",
                     "resolved_query": "context-resolved natural-language goal",
@@ -317,7 +426,7 @@ class IntentPlanner:
                     "intent_ids": ["i1"],
                     "objective": "task-specific objective",
                     "depends_on": [],
-                    "optional_context_from": [],
+                    "optional_upstream_task_ids": [],
                     "parameters": {
                         "query": "task-specific research or lookup query",
                         "freshness": "any | recent | realtime",
@@ -336,7 +445,54 @@ class IntentPlanner:
             ],
         }
 
-    def _parse_plan(self, query: str, data: dict[str, Any]) -> IntentPlanV3:
+    def _parse_plan(
+        self,
+        query: str,
+        data: dict[str, Any],
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> IntentPlanV3:
+        payload = deepcopy(data)
+        payload["original_query"] = query
+        payload["normalized_query"] = query.strip()
+        plan = IntentPlanV3.model_validate(payload)
+        reference_context = (
+            (context or {}).get("trusted_product_references")
+            if isinstance(context, dict)
+            else None
+        )
+        trusted_ids = list(
+            reference_context.get("trusted_product_ids") or []
+        ) if isinstance(reference_context, dict) else []
+        resolved_intents: list[IntentItem] = []
+        for intent in plan.intents:
+            keys = list(dict.fromkeys(intent.context_reference_keys))
+            if not keys:
+                keys = self.context_reference_resolver.suggest_keys(
+                    f"{intent.goal} {intent.resolved_query}",
+                    reference_context,
+                )
+            referenced_ids, _ = self.context_reference_resolver.resolve_keys(
+                reference_context,
+                keys,
+            )
+            resolved_intents.append(
+                intent.model_copy(
+                    update={
+                        "context_reference_keys": keys,
+                        "referenced_product_ids": referenced_ids,
+                    }
+                )
+            )
+        return plan.model_copy(
+            update={
+                "intents": resolved_intents,
+                "trusted_context_product_ids": trusted_ids,
+                "references_resolved": True,
+            }
+        )
+
+    def _parse_plan_legacy(self, query: str, data: dict[str, Any]) -> IntentPlanV3:
         tasks = [
             self._task_proposal(item, index)
             for index, item in enumerate(data.get("task_proposals") or [], start=1)
@@ -479,7 +635,9 @@ class IntentPlanner:
             objective=str(value.get("objective") or value.get("reason") or "").strip(),
             reason=str(value.get("reason") or value.get("objective") or "").strip(),
             depends_on=self._strings(value.get("depends_on")),
-            optional_context_from=self._strings(value.get("optional_context_from")),
+            optional_upstream_task_ids=self._strings(
+                value.get("optional_upstream_task_ids")
+            ),
             parameters=AgentTaskParameters(
                 query=str(raw.get("query") or "").strip(),
                 freshness=(
@@ -552,7 +710,191 @@ class IntentPlanner:
             confidence=confidence,
         )
 
-    def _validate_plan_data(self, data: dict[str, Any]) -> list[str]:
+    def _validate_plan_data(
+        self,
+        data: dict[str, Any],
+        *,
+        query: str = "",
+        context: dict[str, Any] | None = None,
+    ) -> list[str]:
+        self.last_normalizations = self._normalize_trusted_dependency_references(
+            data,
+            context,
+        )
+        errors: list[str] = []
+        forbidden = sorted(self.FORBIDDEN_GLOBAL_FIELDS.intersection(data))
+        if forbidden:
+            errors.append(f"V3 top level contains removed fields: {forbidden}")
+        for index, raw_intent in enumerate(data.get("intents") or []):
+            if not isinstance(raw_intent, dict):
+                continue
+            if raw_intent.get("referenced_product_ids"):
+                errors.append(
+                    f"intents[{index}].referenced_product_ids is backend-derived; "
+                    "use context_reference_keys"
+                )
+        for index, raw_task in enumerate(data.get("task_proposals") or []):
+            if not isinstance(raw_task, dict):
+                continue
+            if "intent_ids" in raw_task:
+                errors.append(
+                    f"task_proposals[{index}].intent_ids was removed; use scalar intent_id"
+                )
+            if "optional_context_from" in raw_task:
+                errors.append(
+                    f"task_proposals[{index}].optional_context_from was renamed; "
+                    "use optional_upstream_task_ids"
+                )
+            for dependency_field in ("depends_on", "optional_upstream_task_ids"):
+                dependency_values = raw_task.get(dependency_field)
+                if not isinstance(dependency_values, list):
+                    continue
+                untrusted_references = [
+                    str(value).strip()
+                    for value in dependency_values
+                    if self._looks_like_context_reference(value)
+                ]
+                if untrusted_references:
+                    errors.append(
+                        f"task_proposals[{index}].{dependency_field} contains values that "
+                        "look like historical product references but are not trusted "
+                        f"context keys: {sorted(set(untrusted_references))}; "
+                        "put trusted keys in the owning intent.context_reference_keys"
+                    )
+            if raw_task.get("capability") == "knowledge_research":
+                parameters = raw_task.get("parameters")
+                if not isinstance(parameters, dict) or not parameters.get(
+                    "knowledge_mode"
+                ):
+                    errors.append(
+                        f"task_proposals[{index}].parameters.knowledge_mode is required"
+                    )
+        try:
+            plan = self._parse_plan(query or "validation_query", data, context=context)
+        except ValidationError as exc:
+            errors.extend(self._pydantic_errors(exc))
+            return list(dict.fromkeys(errors))
+
+        reference_context = (
+            (context or {}).get("trusted_product_references")
+            if isinstance(context, dict)
+            else None
+        )
+        for intent in plan.intents:
+            _, unknown_keys = self.context_reference_resolver.resolve_keys(
+                reference_context,
+                intent.context_reference_keys,
+            )
+            if unknown_keys:
+                errors.append(
+                    f"intent {intent.intent_id} uses unknown context_reference_keys: "
+                    f"{unknown_keys}"
+                )
+        try:
+            validate_intent_plan_contract(plan, self.capability_catalog)
+        except IntentPlanContractError as exc:
+            errors.extend(exc.errors)
+        return list(dict.fromkeys(errors))
+
+    def _normalize_trusted_dependency_references(
+        self,
+        data: dict[str, Any],
+        context: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        """Move only exact trusted history keys out of dependency fields.
+
+        A historical product reference is input context for the owning business
+        intent, never an edge in the Agent-step graph. Unknown values remain in
+        place so normal contract validation reports them instead of guessing.
+        """
+        reference_context = (
+            context.get("trusted_product_references")
+            if isinstance(context, dict)
+            else None
+        )
+        groups = (
+            reference_context.get("groups")
+            if isinstance(reference_context, dict)
+            else None
+        )
+        trusted_keys = {
+            str(group.get("key") or "").strip()
+            for group in (groups or [])
+            if isinstance(group, dict) and str(group.get("key") or "").strip()
+        }
+        if not trusted_keys:
+            return []
+
+        intents_by_id = {
+            str(item.get("intent_id") or "").strip(): item
+            for item in (data.get("intents") or [])
+            if isinstance(item, dict) and str(item.get("intent_id") or "").strip()
+        }
+        corrections: list[dict[str, Any]] = []
+        for task_index, raw_task in enumerate(data.get("task_proposals") or []):
+            if not isinstance(raw_task, dict):
+                continue
+            intent_id = str(raw_task.get("intent_id") or "").strip()
+            owning_intent = intents_by_id.get(intent_id)
+            if owning_intent is None:
+                continue
+            for field_name in ("depends_on", "optional_upstream_task_ids"):
+                values = raw_task.get(field_name)
+                if not isinstance(values, list):
+                    continue
+                retained: list[Any] = []
+                moved: list[str] = []
+                for value in values:
+                    normalized = str(value or "").strip()
+                    if normalized in trusted_keys:
+                        moved.append(normalized)
+                    else:
+                        retained.append(value)
+                if not moved:
+                    continue
+                existing = owning_intent.get("context_reference_keys")
+                if existing is not None and not isinstance(existing, list):
+                    # Preserve the malformed value so Pydantic reports it; do
+                    # not silently discard user/model data while normalizing.
+                    continue
+                raw_task[field_name] = retained
+                if existing is None:
+                    existing = []
+                    owning_intent["context_reference_keys"] = existing
+                added: list[str] = []
+                for reference_key in moved:
+                    if reference_key not in existing:
+                        existing.append(reference_key)
+                        added.append(reference_key)
+                corrections.append(
+                    {
+                        "code": "trusted_product_reference_moved",
+                        "task_index": task_index,
+                        "task_id": str(raw_task.get("task_id") or ""),
+                        "intent_id": intent_id,
+                        "source_field": field_name,
+                        "moved_reference_keys": moved,
+                        "added_to_context_reference_keys": added,
+                    }
+                )
+        return corrections
+
+    @staticmethod
+    def _looks_like_context_reference(value: Any) -> bool:
+        normalized = str(value or "").strip()
+        return normalized.startswith(
+            (
+                "latest:",
+                "turn:",
+                "product:",
+                "category:",
+                "session:",
+                "previous_turn",
+                "query_named_products",
+            )
+        )
+
+    def _validate_plan_data_legacy(self, data: dict[str, Any]) -> list[str]:
         errors: list[str] = []
         forbidden = sorted(self.FORBIDDEN_GLOBAL_FIELDS.intersection(data))
         if forbidden:
@@ -687,7 +1029,7 @@ class IntentPlanner:
             }:
                 retrieval_intents.update(str(value) for value in refs)
             hard = item.get("depends_on") or []
-            optional = item.get("optional_context_from") or []
+            optional = item.get("optional_upstream_task_ids") or []
             if not isinstance(hard, list) or not isinstance(optional, list):
                 errors.append(f"task {task_id or index} dependencies must be lists")
                 hard = []
@@ -769,6 +1111,77 @@ class IntentPlanner:
             if intent_id and intent_id not in covered_intents:
                 errors.append(f"required intent {intent_id} has no task proposal")
         return errors
+
+    def _pydantic_errors(self, exc: ValidationError) -> list[str]:
+        result: list[str] = []
+        for item in exc.errors(include_url=False):
+            location = ".".join(str(value) for value in item.get("loc") or [])
+            message = str(item.get("msg") or "validation failed")
+            result.append(f"{location}: {message}" if location else message)
+        return result
+
+    def _record_validation_attempt(
+        self,
+        attempt: int,
+        content: str,
+        errors: list[str],
+    ) -> None:
+        self.last_validation_attempts.append(
+            {
+                "attempt": attempt,
+                "valid": not errors,
+                "errors": list(errors)[:20],
+                "normalizations": list(self.last_normalizations),
+                "output_preview": str(content or "")[:1_200],
+            }
+        )
+
+    def _repair_user_prompt(
+        self,
+        original_user_prompt: str,
+        previous_output: str,
+        errors: list[str],
+    ) -> str:
+        previous_excerpt = self._repair_output_excerpt(previous_output)
+        return (
+            f"{original_user_prompt}\n\n"
+            "上一次输出未通过强类型契约。请只修正结构和字段值，保留用户的全部目标、"
+            "顺序、约束与合法依赖；只输出一个 JSON object，不要输出 Markdown。\n"
+            "字段边界再次强调：context_reference_keys 只能放可信历史商品引用；"
+            "depends_on 和 optional_upstream_task_ids 只能放本次计划中其他 task_proposals 的 task_id。"
+            "不要把商品 ID 或历史引用键当作上游任务。\n"
+            "校验错误：\n"
+            + "\n".join(f"- {error}" for error in errors[:30])
+            + "\n\n上一次输出：\n"
+            + previous_excerpt
+        )
+
+    def _repair_output_excerpt(self, previous_output: str) -> str:
+        """Keep all task edges visible to the repair call when possible."""
+        parsed = parse_json_object(previous_output)
+        if isinstance(parsed, dict):
+            focused = {
+                "schema_version": parsed.get("schema_version"),
+                "intents": parsed.get("intents") or [],
+                "task_proposals": parsed.get("task_proposals") or [],
+            }
+            return json.dumps(focused, ensure_ascii=False)[:12_000]
+        return previous_output[:12_000]
+
+    async def _generate_required(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        operation: str,
+    ) -> str:
+        call = self.llm_client.generate_required
+        kwargs: dict[str, Any] = {}
+        if self._supports_parameter(call, "response_format"):
+            kwargs["response_format"] = self.JSON_RESPONSE_FORMAT
+        if self._supports_parameter(call, "operation"):
+            kwargs["operation"] = operation
+        return await call(system_prompt, user_prompt, **kwargs)
 
     async def _generate_stream_required(
         self,

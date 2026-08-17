@@ -50,7 +50,7 @@ const runtime: RuntimeContext = {
 const webSearchClient = new BaiduWebSearchMcpClient({
   endpoint: process.env.BAIDU_WEB_SEARCH_MCP_URL || "",
   token: process.env.BAIDU_WEB_SEARCH_MCP_TOKEN || "",
-  toolName: process.env.BAIDU_WEB_SEARCH_MCP_TOOL_NAME || "web_search",
+  toolName: process.env.BAIDU_WEB_SEARCH_MCP_TOOL_NAME || "webSearch",
   timeoutMs: Number(process.env.BAIDU_WEB_SEARCH_MCP_TIMEOUT_MS || 30_000),
 });
 

@@ -48,6 +48,8 @@ class PolicyEvaluation(BaseModel):
     rejected_task_ids: list[str] = Field(default_factory=list)
     intent_statuses: list[IntentPolicyStatus] = Field(default_factory=list)
     uncovered_required_intent_ids: list[str] = Field(default_factory=list)
+    hard_errors: list[str] = Field(default_factory=list)
+    warnings: list[dict] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 
 
@@ -68,15 +70,26 @@ class SupervisorPolicyGate:
         try:
             validate_intent_plan_contract(plan, self.catalog)
         except IntentPlanContractError as exc:
-            return PolicyEvaluation(approved=False, errors=exc.errors)
+            return PolicyEvaluation(
+                approved=False,
+                hard_errors=exc.errors,
+                errors=exc.errors,
+            )
 
         decisions: dict[str, PolicyDecision] = {}
         selections: dict[str, str] = {}
+        warnings: list[dict] = []
+        hard_errors: list[str] = []
         for task in plan.task_proposals:
             decision = self._evaluate_task(plan, task)
             decisions[task.task_id] = decision
             if decision.approved:
                 selections[task.task_id] = decision.selected_agent_id
+                route_warning = decision.details.get("route_warning")
+                if isinstance(route_warning, dict):
+                    warnings.append(route_warning)
+            else:
+                hard_errors.append(f"{task.task_id}: {decision.reason}")
 
         # Reject only hard descendants of rejected tasks. Independent roots and
         # optional consumers remain executable.
@@ -100,6 +113,9 @@ class SupervisorPolicyGate:
                     decision="reject_hard_dependency",
                     details={"unavailable_dependency_ids": unavailable},
                 )
+                hard_errors.append(
+                    f"{task.task_id}: hard dependencies unavailable {unavailable}"
+                )
                 changed = True
 
         rejected_task_ids = [
@@ -121,32 +137,34 @@ class SupervisorPolicyGate:
             if task.task_id in selections
             and task.capability != "profile_preference"
             and any(
-                intent.intent_id in task.intent_ids and intent.priority == "required"
+                intent.intent_id == task.intent_id and intent.priority == "required"
                 for intent in plan.intents
             )
         ]
-        executable_required = [
-            status
-            for status in intent_statuses
-            if next(
-                intent.priority for intent in plan.intents if intent.intent_id == status.intent_id
+        for intent_id in uncovered_required:
+            warnings.append(
+                {
+                    "code": "required_intent_without_business_task",
+                    "intent_id": intent_id,
+                    "message": (
+                        "The required intent has no executable business task; "
+                        "AnswerGenerator will expose the unsupported branch instead of "
+                        "rejecting unrelated work."
+                    ),
+                }
             )
-            == "required"
-            and status.status != "unsupported"
-        ]
-        errors: list[str] = []
-        if not executable_required:
-            errors.append("no required intent has an executable task branch")
 
         return PolicyEvaluation(
-            approved=not errors,
+            approved=not hard_errors,
             decisions=[decisions[task.task_id] for task in plan.task_proposals],
             selections=selections,
             required_task_ids=required_task_ids,
             rejected_task_ids=rejected_task_ids,
             intent_statuses=intent_statuses,
             uncovered_required_intent_ids=uncovered_required,
-            errors=errors,
+            hard_errors=list(dict.fromkeys(hard_errors)),
+            warnings=warnings,
+            errors=list(dict.fromkeys(hard_errors)),
         )
 
     def _evaluate_task(
@@ -155,13 +173,6 @@ class SupervisorPolicyGate:
         task: AgentTaskProposal,
     ) -> PolicyDecision:
         route = self.route_policy.evaluate_task(plan, task)
-        if not route.approved:
-            return self._reject(
-                task,
-                route.reason,
-                decision="reject_route_policy",
-                details=route.details,
-            )
         definition = self.catalog.get(task.capability)
         if definition is None:
             return self._reject(task, "Capability is not registered.")
@@ -179,11 +190,31 @@ class SupervisorPolicyGate:
             approved=True,
             capability=task.capability,
             selected_agent_id=registration.manifest.agent_id,
-            reason="The task is intent-compatible and an enabled Agent provides the capability.",
+            reason=(
+                "The task passed execution-integrity checks and an enabled Agent provides the capability."
+            ),
             details={
-                "intent_ids": list(task.intent_ids),
+                "intent_id": task.intent_id,
                 "allowed_tools": list(registration.manifest.allowed_tools),
-                "route_policy": route.details,
+                "route_policy": {
+                    "approved": route.approved,
+                    "reason": route.reason,
+                    **route.details,
+                },
+                **(
+                    {
+                        "route_warning": {
+                            "code": "unusual_route",
+                            "task_id": task.task_id,
+                            "intent_id": task.intent_id,
+                            "capability": task.capability,
+                            "message": route.reason,
+                            "details": route.details,
+                        }
+                    }
+                    if not route.approved
+                    else {}
+                ),
             },
         )
 
@@ -197,20 +228,24 @@ class SupervisorPolicyGate:
             approved = [
                 task
                 for task in plan.task_proposals
-                if task.task_id in selections and intent.intent_id in task.intent_ids
+                if task.task_id in selections and intent.intent_id == task.intent_id
             ]
             rejected = [
                 task.task_id
                 for task in plan.task_proposals
-                if task.task_id not in selections and intent.intent_id in task.intent_ids
+                if task.task_id not in selections and intent.intent_id == task.intent_id
             ]
             capabilities = {task.capability for task in approved}
             if "clarification" in capabilities:
                 status = "needs_clarification"
                 reason = "This intent has a blocking clarification task."
-            elif (
-                capabilities == {"knowledge_research"}
-                and intent.route_basis.external_information_need == "knowledge_bridge"
+            elif capabilities == {"knowledge_research"} and any(
+                task.capability == "knowledge_research"
+                and task.task_id in selections
+                and task.intent_id == intent.intent_id
+                and str(getattr(task.parameters, "knowledge_mode", ""))
+                == "concept_bridge"
+                for task in plan.task_proposals
             ):
                 status = "awaiting_evidence"
                 reason = "Knowledge evidence must return before this intent is replanned."

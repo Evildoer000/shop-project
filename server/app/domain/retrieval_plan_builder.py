@@ -115,7 +115,6 @@ class RetrievalPlanBuilder:
                 if is_comparison
                 else []
             ),
-            cart_action=self._extract_cart_action(intent_plan.original_query),
             need_clarification=intent_plan.plan_type == "clarify",
             clarification_question=(
                 "你想优先找哪一类商品？比如防晒、洗面奶、耳机、外套或跑鞋。"
@@ -244,19 +243,6 @@ class RetrievalPlanBuilder:
             if not any(value != existing and value in existing for existing in result):
                 result.append(value)
         return result
-
-    def _extract_cart_action(self, query: str) -> str | None:
-        if "购物车" in query and any(word in query for word in ["看", "看看", "查询"]):
-            return "view"
-        if any(word in query for word in ["加购", "加入购物车"]):
-            return "add"
-        if "删" in query:
-            return "delete"
-        if "数量" in query or "改成" in query:
-            return "update_quantity"
-        if "下单" in query:
-            return "checkout"
-        return None
 
     def _compact(self, text: str) -> str:
         return " ".join(text.split())

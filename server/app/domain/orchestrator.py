@@ -14,6 +14,7 @@ from app.db.session import get_sessionmaker
 from app.domain.agents import BusinessAgentServices
 from app.domain.answer_generator import AnswerGenerator
 from app.domain.corrective_agent import CorrectiveAgentController
+from app.domain.context_reference_resolver import ContextReferenceResolver
 from app.domain.image_retrieval_worker import ImageRetrievalWorker
 from app.domain.image_search_tool import ImageSearchTool
 from app.domain.input_processor import InputProcessor
@@ -100,6 +101,7 @@ class EcommerceOrchestrator:
         self.corrective_agent = CorrectiveAgentController()
         self.retrieval_plan_builder = RetrievalPlanBuilder()
         self.memory_manager = MemoryManager(db)
+        self.context_reference_resolver = ContextReferenceResolver()
         self.product_repository = ProductRepository(db)
         self.profile_lookup_tool = ProfileLookupTool(db)
         self.retriever = LlamaIndexMilvusRetriever()
@@ -370,7 +372,7 @@ class EcommerceOrchestrator:
             yield self._timing_event(
                 self._finish_span(
                     planner_span,
-                    output_summary=intent_plan.model_dump(),
+                    output_summary=self._planner_observability_output(intent_plan),
                     metrics=self._planner_rule_metrics(intent_plan),
                 )
             )
@@ -390,7 +392,9 @@ class EcommerceOrchestrator:
                 )
                 planner_context = self._planner_context(
                     conversation_context,
+                    request.user_id,
                     request.session_id,
+                    query=query,
                     include_long_term=False,
                     image_attributes=image_attributes if image_path is not None else None,
                 )
@@ -428,7 +432,7 @@ class EcommerceOrchestrator:
                 yield self._timing_event(
                     self._finish_span(
                         planner_span,
-                        output_summary=intent_plan.model_dump(),
+                        output_summary=self._planner_observability_output(intent_plan),
                         metrics=self._planner_rule_metrics(intent_plan),
                     )
                 )
@@ -533,7 +537,9 @@ class EcommerceOrchestrator:
                     query,
                     self._planner_context(
                         conversation_context,
+                        request.user_id,
                         request.session_id,
+                        query=query,
                         include_long_term=False,
                         profile_memory=profile_memory,
                         image_attributes=image_attributes if image_path is not None else None,
@@ -543,7 +549,7 @@ class EcommerceOrchestrator:
                 yield self._timing_event(
                     self._finish_span(
                         refine_span,
-                        output_summary=intent_plan.model_dump(),
+                        output_summary=self._planner_observability_output(intent_plan),
                         metrics=self._planner_rule_metrics(intent_plan),
                     )
                 )
@@ -633,7 +639,7 @@ class EcommerceOrchestrator:
                     )
                 )
                 product_ids = loaded_ids
-                self._schedule_memory_update(
+                await self._schedule_memory_update(
                     request=request,
                     query=query,
                     answer_text="".join(answer_parts),
@@ -703,7 +709,7 @@ class EcommerceOrchestrator:
                     metrics={"first_token_latency_ms": self.span_recorder.first_token_latency_ms},
                 )
             )
-            self._schedule_memory_update(
+            await self._schedule_memory_update(
                 request=request,
                 query=query,
                 answer_text="".join(answer_parts),
@@ -879,7 +885,9 @@ class EcommerceOrchestrator:
 
             planner_context = self._planner_context(
                 conversation_context,
+                request.user_id,
                 request.session_id,
+                query=planner_query,
                 include_long_term=False,
             )
             planner_context["input_modalities"] = {
@@ -944,7 +952,7 @@ class EcommerceOrchestrator:
                 )
             planner_payload = self._finish_span(
                 planner_span,
-                output_summary=intent_plan.model_dump(),
+                output_summary=self._planner_observability_output(intent_plan),
                 metrics=self._planner_rule_metrics(intent_plan),
             )
             planner_span = None
@@ -1128,7 +1136,7 @@ class EcommerceOrchestrator:
                         )
                     planner_payload = self._finish_span(
                         planner_span,
-                        output_summary=intent_plan.model_dump(),
+                        output_summary=self._planner_observability_output(intent_plan),
                         metrics={
                             **self._planner_rule_metrics(intent_plan),
                             "replan_attempt": policy_replan_attempt,
@@ -1228,6 +1236,17 @@ class EcommerceOrchestrator:
                     self.span_recorder.finish_span(
                         planner_span,
                         status="failed",
+                        output_summary={
+                            "contract_validation_attempts": list(
+                                getattr(
+                                    self.intent_planner,
+                                    "last_validation_attempts",
+                                    [],
+                                )
+                            ),
+                            "validation_errors": list(exc.errors),
+                            "output_preview": str(exc.content or "")[:1_200],
+                        },
                         error_type="StructuredLlmValidationError",
                         error_message=str(exc),
                         termination_reason="planner_contract_invalid",
@@ -1346,7 +1365,7 @@ class EcommerceOrchestrator:
     ) -> Any:
         return await self.multi_need_coordinator.run_slot_isolated(slot, plan, intent_plan)
 
-    def _schedule_graph_memory(self, context: Any, answer_text: str) -> None:
+    async def _schedule_graph_memory(self, context: Any, answer_text: str) -> None:
         request = context.metadata.get("request")
         if not isinstance(request, ChatStreamRequest):
             return
@@ -1379,7 +1398,7 @@ class EcommerceOrchestrator:
                 reflections["legacy"] = self._reflection_summary(reflection)
         route = str(context.artifact("answer_route") or "no_product")
         product_ids = list(context.artifact("answer_product_ids") or [])
-        self._schedule_memory_update(
+        await self._schedule_memory_update(
             request=request,
             query=context.query,
             answer_text=answer_text,
@@ -1793,7 +1812,7 @@ class EcommerceOrchestrator:
             )
         )
 
-        self._schedule_memory_update(
+        await self._schedule_memory_update(
             request=request,
             query=query,
             answer_text="".join(answer_parts),
@@ -2063,7 +2082,7 @@ class EcommerceOrchestrator:
             )
         )
 
-        self._schedule_memory_update(
+        await self._schedule_memory_update(
             request=request,
             query=query,
             answer_text="".join(answer_parts),
@@ -2351,7 +2370,7 @@ class EcommerceOrchestrator:
             )
         )
 
-        self._schedule_memory_update(
+        await self._schedule_memory_update(
             request=request,
             query=query,
             answer_text="".join(answer_parts),
@@ -3114,8 +3133,10 @@ class EcommerceOrchestrator:
     def _planner_context(
         self,
         conversation_context: ConversationContext,
+        user_id: str,
         session_id: str,
         *,
+        query: str = "",
         include_long_term: bool = True,
         profile_memory: list[dict[str, Any]] | None = None,
         image_attributes: ImageAttributes | None = None,
@@ -3127,11 +3148,29 @@ class EcommerceOrchestrator:
         if image_attributes is not None:
             context["image_attributes"] = image_attributes.model_dump()
             context.setdefault("priority", []).append("image_attributes")
-        recent_evidence = self.evidence_cache.compact_recent(session_id)
+        reference_context = self.context_reference_resolver.build_context(
+            conversation_context.product_reference_ledger,
+            query=query,
+        )
+        if reference_context.get("groups"):
+            context["trusted_product_references"] = reference_context
+            context.setdefault("priority", []).append("trusted_product_references")
+        recent_evidence = self.evidence_cache.compact_recent(user_id, session_id)
         if recent_evidence:
             context["recent_evidence"] = recent_evidence
             context.setdefault("priority", []).append("recent_evidence")
         return context
+
+    def _planner_observability_output(
+        self,
+        intent_plan: IntentPlan | IntentPlanV3,
+    ) -> dict[str, Any]:
+        return {
+            **intent_plan.model_dump(),
+            "contract_validation_attempts": list(
+                getattr(self.intent_planner, "last_validation_attempts", [])
+            ),
+        }
 
     def _merge_profile_narrative(self, current: str, profile_memory: list[dict[str, Any]]) -> str:
         if not profile_memory:
@@ -3239,7 +3278,7 @@ class EcommerceOrchestrator:
                 metrics={"first_token_latency_ms": self.span_recorder.first_token_latency_ms},
             )
         )
-        self._schedule_memory_update(
+        await self._schedule_memory_update(
             request=request,
             query=query,
             answer_text="".join(answer_parts),
@@ -3319,7 +3358,7 @@ class EcommerceOrchestrator:
         yield self._decision_trace_event(trace)
         self.span_recorder.mark_first_token()
         yield {"type": "token", "content": answer_text}
-        self._schedule_memory_update(
+        await self._schedule_memory_update(
             request=request,
             query=query,
             answer_text=answer_text,
@@ -3420,7 +3459,10 @@ class EcommerceOrchestrator:
     ) -> OrchestratorDecision:
         requested_ids = [product_id for product_id in intent_plan.referenced_product_ids if product_id]
         recent_ids = self._recent_context_product_ids(conversation_context)
-        cache_evidence = self.evidence_cache.compact_recent(task.session_id)
+        cache_evidence = self.evidence_cache.compact_recent(
+            task.user_id,
+            task.session_id,
+        )
         cache_product_ids = {
             product_id
             for bundle in cache_evidence
@@ -3943,7 +3985,7 @@ class EcommerceOrchestrator:
                 return str(item.get("reason") or "")
         return ""
 
-    def _schedule_memory_update(
+    async def _schedule_memory_update(
         self,
         *,
         request: ChatStreamRequest,
@@ -3963,17 +4005,18 @@ class EcommerceOrchestrator:
                 or self.span_recorder.trace_schema_version
             ),
         }
+        await self._write_memory_update(
+            request=request,
+            query=query,
+            answer_text=answer_text,
+            route=route,
+            product_ids=product_ids,
+            intent_plan=intent_plan,
+            decision_trace=trace_with_run,
+            evidence_bundle=evidence_bundle,
+        )
         task = asyncio.create_task(
-            self._write_memory_update(
-                request=request,
-                query=query,
-                answer_text=answer_text,
-                route=route,
-                product_ids=product_ids,
-                intent_plan=intent_plan,
-                decision_trace=trace_with_run,
-                evidence_bundle=evidence_bundle,
-            )
+            self._summarize_memory(request.user_id, request.session_id)
         )
         task.add_done_callback(self._log_memory_task_result)
 
@@ -3997,9 +4040,11 @@ class EcommerceOrchestrator:
             trace_summary = self._compact_trace_for_memory(decision_trace)
             if selected_products:
                 trace_summary["selected_products"] = selected_products
-            if evidence_bundle is not None:
-                evidence_bundle.trace_summary = dict(trace_summary)
-                self.evidence_cache.put_turn_evidence(evidence_bundle)
+            trace_summary["product_references"] = self._product_reference_records(
+                product_ids,
+                selected_products,
+                evidence_bundle,
+            )
             manager.append_turn(
                 user_id=request.user_id,
                 session_id=request.session_id,
@@ -4010,9 +4055,59 @@ class EcommerceOrchestrator:
                 rewrite_summary=intent_plan.model_dump(),
                 trace_summary=trace_summary,
             )
-            await manager.summarize_if_needed(request.user_id, request.session_id, SessionSummarizer())
+            if evidence_bundle is not None:
+                evidence_bundle.trace_summary = dict(trace_summary)
+                self.evidence_cache.put_turn_evidence(evidence_bundle)
         finally:
             db.close()
+
+    async def _summarize_memory(self, user_id: str, session_id: str) -> None:
+        SessionLocal = get_sessionmaker()
+        db = SessionLocal()
+        try:
+            manager = MemoryManager(db)
+            await manager.summarize_if_needed(
+                user_id,
+                session_id,
+                SessionSummarizer(),
+            )
+        finally:
+            db.close()
+
+    def _product_reference_records(
+        self,
+        product_ids: list[str],
+        selected_products: list[dict[str, Any]],
+        evidence_bundle: EvidenceBundle | None,
+    ) -> list[dict[str, Any]]:
+        snapshots = {
+            str(item.get("product_id")): item
+            for item in selected_products
+            if item.get("product_id")
+        }
+        candidates = {
+            candidate.product_id: candidate
+            for candidate in (evidence_bundle.candidates if evidence_bundle else [])
+        }
+        result: list[dict[str, Any]] = []
+        for display_order, product_id in enumerate(self._dedupe(product_ids), start=1):
+            snapshot = snapshots.get(product_id, {})
+            candidate = candidates.get(product_id)
+            result.append(
+                {
+                    "product_id": product_id,
+                    "name": str(snapshot.get("name") or ""),
+                    "display_order": display_order,
+                    "role": "selected",
+                    "slot_id": str(candidate.slot_id if candidate is not None else ""),
+                    "category": str(
+                        snapshot.get("sub_category")
+                        or snapshot.get("category")
+                        or ""
+                    ),
+                }
+            )
+        return result
 
     def _selected_product_snapshots(self, db: Session, product_ids: list[str]) -> list[dict[str, Any]]:
         products = ProductRepository(db).get_by_ids(product_ids)
@@ -4036,6 +4131,8 @@ class EcommerceOrchestrator:
             "slot_coverage": summary.get("slot_coverage") or [],
             "combo_summary": summary.get("combo_summary") or {},
             "fallback_plan": summary.get("fallback_plan"),
+            "answer_branches": decision_trace.get("answer_branches") or [],
+            "reflections_by_intent": decision_trace.get("reflections_by_intent") or {},
         }
 
     def _dedupe(self, values: list[str]) -> list[str]:

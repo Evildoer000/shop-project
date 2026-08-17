@@ -59,7 +59,7 @@ export class BaiduWebSearchMcpClient {
   constructor(options: WebSearchClientOptions) {
     this.endpoint = options.endpoint.trim();
     this.token = options.token.trim();
-    this.toolName = options.toolName?.trim() || "web_search";
+    this.toolName = options.toolName?.trim() || "webSearch";
     this.timeoutMs = clamp(options.timeoutMs ?? 30_000, 1_000, 120_000);
   }
 
@@ -180,7 +180,12 @@ export function normalizeMcpWebSearchResult(
     if (!item) continue;
     if (item.type === "text" && typeof item.text === "string") {
       const parsed = parseJsonText(item.text);
-      if (parsed != null) payloads.push(parsed);
+      if (parsed != null) {
+        payloads.push(parsed);
+      } else {
+        const plainTextItems = parseBaiduTextResults(item.text);
+        if (plainTextItems.length) payloads.push({ items: plainTextItems });
+      }
     } else if (item.type === "resource_link") {
       payloads.push({ items: [item] });
     } else if (item.type === "resource") {
@@ -299,6 +304,20 @@ function parseJsonText(value: string): unknown | null {
   } catch {
     return null;
   }
+}
+
+function parseBaiduTextResults(value: string): Record<string, unknown>[] {
+  const text = value.replace(/\r\n/g, "\n").trim();
+  const pattern = /(?:^|\n)(?:details:\s*\n)?Title:\s*([^\n]+)\nContent:\s*([\s\S]*?)\nURL:\s*(https?:\/\/[^\s]+)(?=\s*(?:\n(?:details:\s*\n)?Title:|$))/g;
+  const items: Record<string, unknown>[] = [];
+  for (const match of text.matchAll(pattern)) {
+    const title = match[1]?.trim();
+    const snippet = match[2]?.trim();
+    const url = match[3]?.trim();
+    if (!title || !url) continue;
+    items.push({ title, snippet, url });
+  }
+  return items;
 }
 
 function textContentMessage(content: unknown[]): string {

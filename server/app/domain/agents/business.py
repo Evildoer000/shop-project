@@ -112,6 +112,9 @@ class BusinessAgentHandlers:
             {
                 "intent_plan": plan.model_dump(),
                 "summary": plan.summary,
+                "contract_validation_attempts": list(
+                    getattr(planner, "last_validation_attempts", [])
+                ),
                 "revision_intent_id": str((revision or {}).get("intent_id") or "")
                 if isinstance(revision, dict)
                 else "",
@@ -534,6 +537,9 @@ class BusinessAgentHandlers:
 
     async def knowledge_research(self, context: AgentExecutionContext) -> AgentResult:
         parameters = dict(context.node.metadata.get("parameters") or {})
+        knowledge_mode = str(
+            parameters.get("knowledge_mode") or "knowledge_answer"
+        )
         intent = self._target_intent(context)
         referenced_product_ids = list(
             dict.fromkeys(
@@ -734,6 +740,7 @@ class BusinessAgentHandlers:
         return AgentResult.success(
             {
                 "available": available,
+                "knowledge_mode": knowledge_mode,
                 "claim_count": len(claims),
                 "product_detail_count": len(local_products),
                 "product_details": local_products,
@@ -753,6 +760,7 @@ class BusinessAgentHandlers:
             evidence=[*local_product_evidence, *web_evidence, *knowledge_evidence],
             artifacts={
                 "knowledge_research": {
+                    "knowledge_mode": knowledge_mode,
                     "responses": responses,
                     "product_details": local_products,
                     "product_evidence": [
@@ -793,9 +801,7 @@ class BusinessAgentHandlers:
         referenced_product_ids: list[str],
     ) -> bool:
         mode = str(parameters.get("knowledge_mode") or "").strip().lower()
-        if mode in {"local", "local_product", "product_detail"}:
-            return False
-        if mode in {"web", "web_knowledge", "mixed"}:
+        if mode == "concept_bridge":
             return True
         trigger_type = str(parameters.get("trigger_type") or "none")
         external_need = (
@@ -811,6 +817,10 @@ class BusinessAgentHandlers:
             return True
         if external_need in {"explicit_web", "freshness_required", "knowledge_bridge"}:
             return True
+        if mode == "product_evidence" and referenced_product_ids:
+            return False
+        if mode == "knowledge_answer" and referenced_product_ids:
+            return False
         if intent is not None and intent.intent_type == "shopping_knowledge":
             return True
         return not referenced_product_ids
@@ -1519,7 +1529,9 @@ class BusinessAgentHandlers:
                 "intent_id": target_intent_id,
                 "priority": original_intent.priority,
                 "goal": original_intent.goal,
+                "budget": original_intent.budget,
                 "constraints": original_intent.constraints,
+                "context_reference_keys": original_intent.context_reference_keys,
                 "referenced_product_ids": original_intent.referenced_product_ids,
             }
         )
@@ -1532,13 +1544,14 @@ class BusinessAgentHandlers:
         bounded_tasks = [
             task.model_copy(
                 update={
+                    "intent_id": target_intent_id,
                     "intent_ids": [target_intent_id],
                     "depends_on": [
                         value for value in task.depends_on if value in allowed_ids
                     ],
-                    "optional_context_from": [
+                    "optional_upstream_task_ids": [
                         value
-                        for value in task.optional_context_from
+                        for value in task.optional_upstream_task_ids
                         if value in allowed_ids
                     ],
                 }
@@ -1551,6 +1564,8 @@ class BusinessAgentHandlers:
             summary=revised.summary,
             intents=[bounded_intent],
             task_proposals=bounded_tasks,
+            trusted_context_product_ids=original.trusted_context_product_ids,
+            references_resolved=original.references_resolved,
         )
 
     def _profile_aware_intent_plan(
@@ -1625,6 +1640,12 @@ class BusinessAgentHandlers:
         return slots
 
     def _intent_budget(self, intent: IntentItem) -> tuple[float | None, float | None, str]:
+        if intent.budget is not None:
+            return (
+                intent.budget.minimum,
+                intent.budget.maximum,
+                intent.budget.scope,
+            )
         minimum: float | None = None
         maximum: float | None = None
         scope = "unknown"

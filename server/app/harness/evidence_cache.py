@@ -91,16 +91,31 @@ class EvidenceCache(Protocol):
     def put_turn_evidence(self, bundle: EvidenceBundle) -> None:
         ...
 
-    def get_latest_evidence(self, session_id: str) -> EvidenceBundle | None:
+    def get_latest_evidence(self, user_id: str, session_id: str) -> EvidenceBundle | None:
         ...
 
-    def get_recent_evidence(self, session_id: str, limit: int = 20) -> list[EvidenceBundle]:
+    def get_recent_evidence(
+        self,
+        user_id: str,
+        session_id: str,
+        limit: int = 20,
+    ) -> list[EvidenceBundle]:
         ...
 
-    def get_turn_evidence(self, session_id: str, turn_id: str) -> EvidenceBundle | None:
+    def get_turn_evidence(
+        self,
+        user_id: str,
+        session_id: str,
+        turn_id: str,
+    ) -> EvidenceBundle | None:
         ...
 
-    def compact_recent(self, session_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    def compact_recent(
+        self,
+        user_id: str,
+        session_id: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
         ...
 
 
@@ -123,39 +138,65 @@ class InMemoryEvidenceCache:
         self.recent_turns = max(1, int(recent_turns))
         self.max_candidates_per_turn = max(1, int(max_candidates_per_turn))
         self._now = now or (lambda: datetime.now(timezone.utc))
-        self._by_session: dict[str, list[EvidenceBundle]] = {}
+        self._by_session: dict[tuple[str, str], list[EvidenceBundle]] = {}
 
     def put_turn_evidence(self, bundle: EvidenceBundle) -> None:
         normalized = self._normalize_bundle(bundle)
-        self._prune_session(normalized.session_id)
+        key = self._session_key(normalized.user_id, normalized.session_id)
+        self._prune_session(key)
         bundles = [
             existing
-            for existing in self._by_session.get(normalized.session_id, [])
+            for existing in self._by_session.get(key, [])
             if existing.turn_id != normalized.turn_id
         ]
         bundles.append(normalized)
         bundles.sort(key=lambda item: item.created_at)
-        self._by_session[normalized.session_id] = bundles[-self.recent_turns :]
+        self._by_session[key] = bundles[-self.recent_turns :]
 
-    def get_latest_evidence(self, session_id: str) -> EvidenceBundle | None:
-        self._prune_session(session_id)
-        bundles = self._by_session.get(session_id, [])
+    def get_latest_evidence(self, user_id: str, session_id: str) -> EvidenceBundle | None:
+        key = self._session_key(user_id, session_id)
+        self._prune_session(key)
+        bundles = self._by_session.get(key, [])
         return deepcopy(bundles[-1]) if bundles else None
 
-    def get_recent_evidence(self, session_id: str, limit: int = 20) -> list[EvidenceBundle]:
-        self._prune_session(session_id)
+    def get_recent_evidence(
+        self,
+        user_id: str,
+        session_id: str,
+        limit: int = 20,
+    ) -> list[EvidenceBundle]:
+        key = self._session_key(user_id, session_id)
+        self._prune_session(key)
         safe_limit = max(1, min(int(limit), self.recent_turns))
-        return deepcopy(self._by_session.get(session_id, [])[-safe_limit:])
+        return deepcopy(self._by_session.get(key, [])[-safe_limit:])
 
-    def get_turn_evidence(self, session_id: str, turn_id: str) -> EvidenceBundle | None:
-        self._prune_session(session_id)
-        for bundle in self._by_session.get(session_id, []):
+    def get_turn_evidence(
+        self,
+        user_id: str,
+        session_id: str,
+        turn_id: str,
+    ) -> EvidenceBundle | None:
+        key = self._session_key(user_id, session_id)
+        self._prune_session(key)
+        for bundle in self._by_session.get(key, []):
             if bundle.turn_id == turn_id:
                 return deepcopy(bundle)
         return None
 
-    def compact_recent(self, session_id: str, limit: int = 20) -> list[dict[str, Any]]:
-        return [bundle.compact() for bundle in self.get_recent_evidence(session_id, limit=limit)]
+    def compact_recent(
+        self,
+        user_id: str,
+        session_id: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        return [
+            bundle.compact()
+            for bundle in self.get_recent_evidence(
+                user_id,
+                session_id,
+                limit=limit,
+            )
+        ]
 
     def _normalize_bundle(self, bundle: EvidenceBundle) -> EvidenceBundle:
         normalized = deepcopy(bundle)
@@ -167,13 +208,16 @@ class InMemoryEvidenceCache:
         normalized.rejected_product_ids = self._dedupe(normalized.rejected_product_ids)[: self.max_candidates_per_turn]
         return normalized
 
-    def _prune_session(self, session_id: str) -> None:
-        bundles = self._by_session.get(session_id)
+    def _prune_session(self, key: tuple[str, str]) -> None:
+        bundles = self._by_session.get(key)
         if not bundles:
             return
         expires_before = self._to_utc(self._now()) - timedelta(seconds=self.ttl_seconds)
         active = [bundle for bundle in bundles if self._to_utc(bundle.created_at) >= expires_before]
-        self._by_session[session_id] = active[-self.recent_turns :]
+        self._by_session[key] = active[-self.recent_turns :]
+
+    def _session_key(self, user_id: str, session_id: str) -> tuple[str, str]:
+        return (str(user_id or ""), str(session_id or ""))
 
     def _to_utc(self, value: datetime) -> datetime:
         if value.tzinfo is None:

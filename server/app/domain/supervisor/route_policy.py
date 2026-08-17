@@ -106,13 +106,17 @@ class RoutePolicy:
         intent: IntentItem,
         task: AgentTaskProposal,
     ) -> RouteDecision:
-        external_need = intent.route_basis.external_information_need
-        supported_intent = intent.intent_type in {"product_qa", "shopping_knowledge"}
-        knowledge_bridge = (
-            external_need == "knowledge_bridge"
-            and intent.route_basis.target_clarity == "vague_effect_or_use"
-            and not intent.route_basis.product_family.strip()
+        knowledge_mode = str(
+            getattr(task.parameters, "knowledge_mode", "knowledge_answer")
         )
+        external_need = intent.route_basis.external_information_need
+        supported_intent = intent.intent_type in {
+            "product_qa",
+            "shopping_knowledge",
+            "product_comparison",
+            "product_recommendation",
+        }
+        knowledge_bridge = knowledge_mode == "concept_bridge"
         explicit_research = external_need in {"explicit_web", "freshness_required"}
         approved = supported_intent or knowledge_bridge or explicit_research
         if not approved:
@@ -125,6 +129,8 @@ class RoutePolicy:
             "freshness_required": "freshness_required",
             "knowledge_bridge": "knowledge_bridge",
         }.get(external_need)
+        if knowledge_bridge:
+            expected_trigger = "knowledge_bridge"
         if expected_trigger and task.parameters.trigger_type != expected_trigger:
             return RouteDecision(
                 False,

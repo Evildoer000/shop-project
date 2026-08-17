@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 SINGLE_RECOMMENDATION_LIMIT = 5
@@ -110,7 +110,6 @@ class QueryPlan(BaseModel):
     filters: list[str] = Field(default_factory=list)
     retrieval_strategy: QueryRetrievalStrategy = Field(default_factory=QueryRetrievalStrategy)
     compare_targets: list[str] = Field(default_factory=list)
-    cart_action: str | None = None
     need_clarification: bool = False
     clarification_question: str | None = None
 
@@ -151,7 +150,6 @@ IntentType = Literal[
     "product_comparison",
     "product_qa",
     "shopping_knowledge",
-    "cart_action",
 ]
 
 InputModality = Literal["text", "image", "audio"]
@@ -176,7 +174,11 @@ AgentCapability = Literal[
 ]
 
 
-class IntentRouteBasis(BaseModel):
+class PlannerStrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class IntentRouteBasis(PlannerStrictModel):
     """Planner-observed facts used by deterministic routing policy."""
 
     target_clarity: Literal[
@@ -197,7 +199,14 @@ class IntentRouteBasis(BaseModel):
     reason: str = ""
 
 
-class IntentConstraint(BaseModel):
+class IntentBudget(PlannerStrictModel):
+    minimum: float | None = Field(default=None, ge=0)
+    maximum: float | None = Field(default=None, ge=0)
+    scope: Literal["per_item", "total", "unknown"] = "unknown"
+    currency: Literal["CNY"] = "CNY"
+
+
+class IntentConstraint(PlannerStrictModel):
     name: str
     value: str | float | int | bool | list[str]
     strength: Literal["hard", "soft"] = "hard"
@@ -211,21 +220,21 @@ class IntentConstraint(BaseModel):
     reason: str = ""
 
 
-class IntentConstraintSet(BaseModel):
+class IntentConstraintSet(PlannerStrictModel):
     budget_min: float | None = None
     budget_max: float | None = None
     budget_scope: Literal["per_item", "total", "unknown"] = "unknown"
     items: list[IntentConstraint] = Field(default_factory=list)
 
 
-class IntentUncertainty(BaseModel):
+class IntentUncertainty(PlannerStrictModel):
     field: str
     description: str
     blocking: bool = False
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
-class IntentProductNeed(BaseModel):
+class IntentProductNeed(PlannerStrictModel):
     """A business product need; retrieval-engine details are deliberately absent."""
 
     need_id: str
@@ -236,7 +245,7 @@ class IntentProductNeed(BaseModel):
     exclusions: list[str] = Field(default_factory=list)
 
 
-class RecommendationPolicy(BaseModel):
+class RecommendationPolicy(PlannerStrictModel):
     """Intent-scoped rules for assembling and selecting recommendation candidates."""
 
     candidate_source: Literal[
@@ -260,13 +269,15 @@ class RecommendationPolicy(BaseModel):
     reason: str = ""
 
 
-class IntentItem(BaseModel):
+class IntentItem(PlannerStrictModel):
     intent_id: str
     intent_type: IntentType
     priority: IntentPriority = "required"
     goal: str
     resolved_query: str
+    budget: IntentBudget | None = None
     constraints: list[IntentConstraint] = Field(default_factory=list)
+    context_reference_keys: list[str] = Field(default_factory=list)
     referenced_product_ids: list[str] = Field(default_factory=list)
     recommendation_policy: RecommendationPolicy = Field(
         default_factory=RecommendationPolicy
@@ -314,7 +325,7 @@ class ResearchRequest(BaseModel):
     required: bool = False
 
 
-class AgentTaskParameters(BaseModel):
+class AgentTaskParameters(PlannerStrictModel):
     """Typed business inputs passed to one proposed Agent task."""
 
     query: str = ""
@@ -338,20 +349,132 @@ class AgentTaskParameters(BaseModel):
     product_need_ids: list[str] = Field(default_factory=list)
     referenced_product_ids: list[str] = Field(default_factory=list)
     comparison_dimensions: list[str] = Field(default_factory=list)
+    knowledge_mode: Literal[
+        "knowledge_answer",
+        "product_evidence",
+        "concept_bridge",
+    ] = "knowledge_answer"
 
 
-class AgentTaskProposal(BaseModel):
+class KnowledgeTaskParameters(PlannerStrictModel):
+    query: str
+    freshness: Literal["any", "recent", "realtime"] = "recent"
+    trigger_type: Literal[
+        "none",
+        "explicit_web_request",
+        "freshness_required",
+        "knowledge_bridge",
+    ] = "none"
+    trigger_text: str = ""
+    knowledge_mode: Literal[
+        "knowledge_answer",
+        "product_evidence",
+        "concept_bridge",
+    ]
+
+
+class ComparisonTaskParameters(PlannerStrictModel):
+    comparison_dimensions: list[str] = Field(default_factory=list)
+
+
+class RecommendationTaskParameters(PlannerStrictModel):
+    query: str = ""
+    product_need_ids: list[str] = Field(default_factory=list)
+
+
+class BundleTaskParameters(RecommendationTaskParameters):
+    pass
+
+
+class CommerceTaskParameters(PlannerStrictModel):
+    query: str
+    freshness: Literal["any", "recent", "realtime"] = "recent"
+    platforms: list[Literal["taobao", "douyin_ec", "xiaohongshu"]] = Field(
+        default_factory=list
+    )
+    trigger_type: Literal["explicit_platform_request"] = "explicit_platform_request"
+    trigger_text: str = ""
+
+
+class ClarificationTaskParameters(PlannerStrictModel):
+    missing_fields: list[str] = Field(default_factory=list)
+    question_goal: str = ""
+
+
+class ProfileTaskParameters(PlannerStrictModel):
+    query: str
+    profile_usage: Literal[
+        "intent_refinement",
+        "ranking_only",
+        "answer_personalization",
+    ] = "ranking_only"
+
+
+PlannerTaskParameters = (
+    KnowledgeTaskParameters
+    | ComparisonTaskParameters
+    | RecommendationTaskParameters
+    | BundleTaskParameters
+    | CommerceTaskParameters
+    | ClarificationTaskParameters
+    | ProfileTaskParameters
+)
+
+
+class AgentTaskProposal(PlannerStrictModel):
     task_id: str
     capability: AgentCapability
-    intent_ids: list[str] = Field(default_factory=list)
+    intent_id: str = ""
+    # Kept out of serialized Planner output while older runtime adapters migrate.
+    intent_ids: list[str] = Field(default_factory=list, exclude=True)
     objective: str
     reason: str
     depends_on: list[str] = Field(default_factory=list)
-    optional_context_from: list[str] = Field(default_factory=list)
-    parameters: AgentTaskParameters = Field(default_factory=AgentTaskParameters)
+    optional_upstream_task_ids: list[str] = Field(default_factory=list)
+    parameters: PlannerTaskParameters
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_input(cls, obj: Any) -> Any:
+        if isinstance(obj, dict):
+            obj = dict(obj)
+            legacy_ids = obj.get("intent_ids")
+            if not obj.get("intent_id") and isinstance(legacy_ids, list) and legacy_ids:
+                obj["intent_id"] = str(legacy_ids[0])
+            parameters = obj.get("parameters")
+            capability = obj.get("capability")
+            if isinstance(parameters, AgentTaskParameters):
+                parameters = parameters.model_dump(exclude_defaults=True)
+            if parameters is None:
+                parameters = {}
+            if capability == "knowledge_research" and isinstance(parameters, dict):
+                parameters.setdefault(
+                    "knowledge_mode",
+                    "concept_bridge"
+                    if parameters.get("trigger_type") == "knowledge_bridge"
+                    else "knowledge_answer",
+                )
+            if isinstance(parameters, dict):
+                parameter_model = {
+                    "knowledge_research": KnowledgeTaskParameters,
+                    "comparison": ComparisonTaskParameters,
+                    "single_product_recommendation": RecommendationTaskParameters,
+                    "multi_product_bundle": BundleTaskParameters,
+                    "commerce_research": CommerceTaskParameters,
+                    "clarification": ClarificationTaskParameters,
+                    "profile_preference": ProfileTaskParameters,
+                }.get(capability, AgentTaskParameters)
+                obj["parameters"] = parameter_model.model_validate(parameters)
+        return obj
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.intent_ids and self.intent_id:
+            self.intent_ids = [self.intent_id]
+        elif self.intent_ids and not self.intent_id:
+            self.intent_id = self.intent_ids[0]
 
 
-class IntentPlanV3(BaseModel):
+class IntentPlanV3(PlannerStrictModel):
     """Planner proposal consumed by the Supervisor; no global route or retrieval plan."""
 
     schema_version: Literal["3.0"] = "3.0"
@@ -360,6 +483,8 @@ class IntentPlanV3(BaseModel):
     summary: str = ""
     intents: list[IntentItem] = Field(default_factory=list)
     task_proposals: list[AgentTaskProposal] = Field(default_factory=list)
+    trusted_context_product_ids: list[str] = Field(default_factory=list, exclude=True)
+    references_resolved: bool = Field(default=False, exclude=True)
 
 
 class RetrievalIntentPlan(BaseModel):

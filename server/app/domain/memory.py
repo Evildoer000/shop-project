@@ -23,6 +23,8 @@ SUMMARY_MAX_TOKENS = 500
 ASSISTANT_MESSAGE_MAX_CHARS = 1600
 TURN_PRODUCT_IDS_LIMIT = 30
 TURN_SELECTED_PRODUCTS_LIMIT = 30
+PRODUCT_REFERENCE_TURN_LIMIT = 200
+PRODUCT_REFERENCE_ITEM_LIMIT = 500
 
 
 @dataclass
@@ -110,6 +112,7 @@ class ConversationContext:
     recent_turns: list[ConversationTurnView] = field(default_factory=list)
     long_term_profile: list[str] = field(default_factory=list)
     long_term_narrative: str = ""
+    product_reference_ledger: list[dict[str, Any]] = field(default_factory=list)
 
     def to_rewrite_context(
         self,
@@ -163,6 +166,7 @@ class ConversationContext:
             "long_term_narrative_chars": len(self.long_term_narrative),
             "pending_summary_turns": [turn.compact() for turn in self.pending_summary_turns],
             "recent_turns": [turn.compact() for turn in self.recent_turns],
+            "product_reference_count": len(self.product_reference_ledger),
         }
 
 
@@ -263,7 +267,60 @@ class MemoryManager:
             recent_turns=recent,
             long_term_profile=profile,
             long_term_narrative=self.load_profile_narrative(user_id) if include_long_term else "",
+            product_reference_ledger=self._build_product_reference_ledger(turns),
         )
+
+    def _build_product_reference_ledger(
+        self,
+        turns: list[ConversationTurnView],
+    ) -> list[dict[str, Any]]:
+        """Build a structured product ledger from persisted conversation turns."""
+        if not turns:
+            return []
+        latest_turn_id = turns[-1].turn_id
+        ledger: list[dict[str, Any]] = []
+        for turn in turns[-PRODUCT_REFERENCE_TURN_LIMIT:]:
+            stored = turn.trace_summary.get("product_references")
+            if isinstance(stored, list) and stored:
+                for item in stored:
+                    if not isinstance(item, dict) or not item.get("product_id"):
+                        continue
+                    ledger.append(
+                        {
+                            **item,
+                            "turn_id": turn.turn_id,
+                            "is_latest_conversation_turn": turn.turn_id == latest_turn_id,
+                        }
+                    )
+                continue
+
+            snapshots = {
+                str(item.get("product_id")): item
+                for item in turn._compact_selected_products()
+                if item.get("product_id")
+            }
+            for display_order, product_id in enumerate(turn.product_ids, start=1):
+                product_id = str(product_id or "").strip()
+                if not product_id:
+                    continue
+                snapshot = snapshots.get(product_id, {})
+                ledger.append(
+                    {
+                        "turn_id": turn.turn_id,
+                        "product_id": product_id,
+                        "name": str(snapshot.get("name") or ""),
+                        "display_order": display_order,
+                        "role": "selected",
+                        "slot_id": "",
+                        "category": str(
+                            snapshot.get("sub_category")
+                            or snapshot.get("category")
+                            or ""
+                        ),
+                        "is_latest_conversation_turn": turn.turn_id == latest_turn_id,
+                    }
+                )
+        return ledger[-PRODUCT_REFERENCE_ITEM_LIMIT:]
 
     def load_profile_narrative(self, user_id: str) -> str:
         path = self._profile_md_path(user_id)

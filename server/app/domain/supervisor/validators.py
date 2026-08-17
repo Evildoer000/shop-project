@@ -58,6 +58,25 @@ def validate_intent_plan_contract(
                         f"product need {need.need_id} long_term_profile constraints must be soft"
                     )
         policy = intent.recommendation_policy
+        if (
+            intent.budget is not None
+            and intent.budget.minimum is not None
+            and intent.budget.maximum is not None
+            and intent.budget.minimum > intent.budget.maximum
+        ):
+            errors.append(
+                f"intent {intent.intent_id} budget minimum cannot exceed maximum"
+            )
+        if plan.references_resolved:
+            unknown_references = sorted(
+                set(intent.referenced_product_ids)
+                - set(plan.trusted_context_product_ids)
+            )
+            if unknown_references:
+                errors.append(
+                    f"intent {intent.intent_id} references products outside the trusted "
+                    f"user/session context: {unknown_references}"
+                )
         if intent.intent_type == "product_recommendation":
             if (
                 policy.candidate_source in {"context_only", "context_plus_new"}
@@ -89,13 +108,34 @@ def validate_intent_plan_contract(
     known_tasks = set(task_ids)
     known_intents = set(intent_ids)
     dependencies = {item.task_id: item.depends_on for item in plan.task_proposals}
-    _validate_dependencies("task", dependencies, known_tasks, errors)
+    optional_dependencies = {
+        item.task_id: item.optional_upstream_task_ids
+        for item in plan.task_proposals
+    }
     _validate_dependency_references(
-        "task optional_context_from",
-        {item.task_id: item.optional_context_from for item in plan.task_proposals},
+        "task depends_on",
+        dependencies,
         known_tasks,
         errors,
     )
+    _validate_dependency_references(
+        "task optional_upstream_task_ids",
+        optional_dependencies,
+        known_tasks,
+        errors,
+    )
+    combined_dependencies = {
+        task_id: list(
+            dict.fromkeys(
+                [
+                    *dependencies.get(task_id, []),
+                    *optional_dependencies.get(task_id, []),
+                ]
+            )
+        )
+        for task_id in task_ids
+    }
+    _validate_dependency_graph("task", combined_dependencies, errors)
 
     for task in plan.task_proposals:
         definition = resolved_catalog.get(task.capability)
@@ -105,22 +145,24 @@ def validate_intent_plan_contract(
             errors.append(
                 f"task {task.task_id} cannot request Supervisor-managed capability {task.capability}"
             )
-        if len(task.intent_ids) != 1:
+        if len(task.intent_ids) != 1 or task.intent_ids[0] != task.intent_id:
             errors.append(
                 f"task {task.task_id} must belong to exactly one intent; split independent work into separate tasks"
             )
             continue
-        intent_id = task.intent_ids[0]
+        intent_id = task.intent_id
         if intent_id not in known_intents:
             errors.append(f"task {task.task_id} references unknown intent_id {intent_id}")
             continue
-        overlap = set(task.depends_on).intersection(task.optional_context_from)
+        overlap = set(task.depends_on).intersection(task.optional_upstream_task_ids)
         if overlap:
             errors.append(
                 f"task {task.task_id} cannot use the same dependency as hard and optional: {sorted(overlap)}"
             )
         intent = intent_by_id[intent_id]
-        selected_need_ids = task.parameters.product_need_ids
+        selected_need_ids = list(
+            getattr(task.parameters, "product_need_ids", []) or []
+        )
         unknown_needs = [
             need_id
             for need_id in selected_need_ids
@@ -150,19 +192,17 @@ def validate_intent_plan_contract(
                 f"context-only recommendation intent {intent_id} must not create "
                 f"product retrieval task {task.task_id}"
             )
-
-    covered_intents = {
-        intent_id
-        for task in plan.task_proposals
-        for intent_id in task.intent_ids
-    }
-    for intent in plan.intents:
-        if intent.priority != "required" or intent.intent_type == "social_chat":
-            continue
-        if _is_context_only_recommendation(intent):
-            continue
-        if intent.intent_id not in covered_intents:
-            errors.append(f"required intent {intent.intent_id} has no task proposal")
+        parameters = task.parameters
+        if task.capability in {"knowledge_research", "commerce_research"} and not str(
+            parameters.query or ""
+        ).strip():
+            errors.append(f"task {task.task_id} requires a task-specific query")
+        if task.capability == "profile_preference" and not str(
+            parameters.query or ""
+        ).strip():
+            errors.append(f"task {task.task_id} profile lookup requires a query")
+        if task.capability == "commerce_research" and not parameters.platforms:
+            errors.append(f"task {task.task_id} commerce research requires platforms")
 
     if errors:
         raise IntentPlanContractError(errors)
@@ -191,6 +231,14 @@ def _validate_dependencies(
     errors: list[str],
 ) -> None:
     _validate_dependency_references(label, dependencies, known_ids, errors)
+    _validate_dependency_graph(label, dependencies, errors)
+
+
+def _validate_dependency_graph(
+    label: str,
+    dependencies: dict[str, list[str]],
+    errors: list[str],
+) -> None:
     for node_id, dependency_ids in dependencies.items():
         if node_id in dependency_ids:
             errors.append(f"{label} {node_id} cannot depend on itself")

@@ -458,14 +458,17 @@ class SupervisorFlow:
         if registration is None:
             return result
         for intent in plan.intents:
-            if intent.route_basis.external_information_need != "knowledge_bridge":
-                continue
             knowledge_nodes = [
                 node
                 for node in graph.nodes
                 if node.capability == "knowledge_research"
                 and intent.intent_id in node.intent_ids
                 and node.status == "succeeded"
+                and str(
+                    (node.metadata.get("parameters") or {}).get("knowledge_mode")
+                    or ""
+                )
+                == "concept_bridge"
             ]
             if not knowledge_nodes:
                 continue
@@ -607,6 +610,8 @@ class SupervisorFlow:
                     "uncovered_intent_count": len(
                         evaluation.uncovered_required_intent_ids
                     ),
+                    "hard_error_count": len(evaluation.hard_errors),
+                    "warning_count": len(evaluation.warnings),
                 },
                 termination_reason=(
                     "policy_approved" if evaluation.approved else "policy_rejected"

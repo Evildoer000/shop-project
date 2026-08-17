@@ -72,7 +72,7 @@ def make_task(
     intent_id: str,
     *,
     depends_on: list[str] | None = None,
-    optional_context_from: list[str] | None = None,
+    optional_upstream_task_ids: list[str] | None = None,
     parameters: AgentTaskParameters | None = None,
 ) -> AgentTaskProposal:
     return AgentTaskProposal(
@@ -82,7 +82,7 @@ def make_task(
         objective=f"执行 {intent_id} 的 {capability}",
         reason="用户目标需要该能力",
         depends_on=depends_on or [],
-        optional_context_from=optional_context_from or [],
+        optional_upstream_task_ids=optional_upstream_task_ids or [],
         parameters=parameters or AgentTaskParameters(),
     )
 
@@ -315,7 +315,7 @@ def test_context_only_recommendation_compiles_directly_to_verifier() -> None:
     assert graph.metadata["branch_terminal_nodes"]["i_context"] == verifier.node_id
 
 
-def test_invalid_route_rejects_only_its_intent_when_another_required_branch_is_valid() -> None:
+def test_unusual_route_becomes_warning_without_blocking_independent_intents() -> None:
     valid = make_intent("i_valid", "推荐防晒", product_family="防晒霜")
     invalid = make_intent("i_invalid", "推荐耳机", product_family="耳机")
     plan = IntentPlanV3(
@@ -342,15 +342,16 @@ def test_invalid_route_rejects_only_its_intent_when_another_required_branch_is_v
 
     assert evaluation.approved is True
     assert evaluation.selections == {
-        "t_valid": "single_product_recommendation_agent"
+        "t_valid": "single_product_recommendation_agent",
+        "t_invalid": "product_knowledge_agent",
     }
-    assert evaluation.uncovered_required_intent_ids == ["i_invalid"]
+    assert evaluation.uncovered_required_intent_ids == []
     assert graph.get_node("proposal:t_valid") is not None
-    assert graph.get_node("proposal:t_invalid") is None
-    assert graph.metadata["intent_statuses"]["i_invalid"]["status"] == "unsupported"
+    assert graph.get_node("proposal:t_invalid") is not None
+    assert graph.metadata["intent_statuses"]["i_invalid"]["status"] == "ready"
 
 
-def test_hard_dependency_rejection_does_not_remove_independent_sibling() -> None:
+def test_unusual_root_and_its_dependency_remain_executable_with_warnings() -> None:
     intents = [
         make_intent("i_valid", "推荐防晒", product_family="防晒霜"),
         make_intent("i_bad", "解释不存在的研究路由", product_family="耳机"),
@@ -379,7 +380,6 @@ def test_hard_dependency_rejection_does_not_remove_independent_sibling() -> None
                 "comparison",
                 "i_compare",
                 depends_on=["t_bad"],
-                parameters=AgentTaskParameters(referenced_product_ids=["p1", "p2"]),
             ),
         ],
     )
@@ -387,10 +387,10 @@ def test_hard_dependency_rejection_does_not_remove_independent_sibling() -> None
     evaluation = SupervisorPlanCompiler().evaluate(plan)
 
     assert evaluation.approved is True
-    assert set(evaluation.selections) == {"t_valid"}
+    assert set(evaluation.selections) == {"t_valid", "t_bad", "t_descendant"}
     decisions = {item.subject_id: item for item in evaluation.decisions}
-    assert decisions["t_bad"].decision == "reject_route_policy"
-    assert decisions["t_descendant"].decision == "reject_hard_dependency"
+    assert decisions["t_bad"].approved is True
+    assert decisions["t_descendant"].approved is True
 
 
 def test_contract_rejects_cross_intent_task_coalescing() -> None:

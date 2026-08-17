@@ -30,7 +30,7 @@ def test_evidence_cache_expires_by_ttl() -> None:
     cache.put_turn_evidence(_bundle("t1", now[0]))
     now[0] = now[0] + timedelta(seconds=61)
 
-    assert cache.get_latest_evidence("s1") is None
+    assert cache.get_latest_evidence("u1", "s1") is None
 
 
 def test_evidence_cache_keeps_recent_20_and_truncates_candidates() -> None:
@@ -40,7 +40,7 @@ def test_evidence_cache_keeps_recent_20_and_truncates_candidates() -> None:
     for index in range(25):
         cache.put_turn_evidence(_bundle(f"t{index}", base_time + timedelta(seconds=index), candidate_count=25))
 
-    recent = cache.get_recent_evidence("s1", limit=50)
+    recent = cache.get_recent_evidence("u1", "s1", limit=50)
 
     assert [bundle.turn_id for bundle in recent] == [f"t{index}" for index in range(5, 25)]
     assert all(len(bundle.candidates) == 20 for bundle in recent)
@@ -52,12 +52,12 @@ def test_evidence_cache_returns_deep_copies() -> None:
     cache = InMemoryEvidenceCache(now=lambda: now)
     cache.put_turn_evidence(_bundle("t1", now))
 
-    latest = cache.get_latest_evidence("s1")
+    latest = cache.get_latest_evidence("u1", "s1")
     assert latest is not None
     latest.selected_product_ids.append("mutated")
     latest.candidates[0].compact_product["name"] = "mutated"
 
-    fresh = cache.get_latest_evidence("s1")
+    fresh = cache.get_latest_evidence("u1", "s1")
     assert fresh is not None
     assert fresh.selected_product_ids == ["p0", "p1"]
     assert fresh.candidates[0].compact_product == {}
@@ -68,7 +68,7 @@ def test_evidence_cache_get_turn_and_compact_recent() -> None:
     cache = InMemoryEvidenceCache(now=lambda: now)
     cache.put_turn_evidence(_bundle("t1", now))
 
-    assert cache.get_turn_evidence("s1", "t1") is not None
-    compact = cache.compact_recent("s1")
+    assert cache.get_turn_evidence("u1", "s1", "t1") is not None
+    compact = cache.compact_recent("u1", "s1")
     assert compact[0]["turn_id"] == "t1"
     assert compact[0]["displayed_product_ids"] == ["p0", "p1"]

@@ -918,7 +918,6 @@ def intent_label(value: Any) -> str:
     return {
         "recommendation": "商品推荐",
         "comparison": "商品对比",
-        "cart_action": "购物车操作",
     }.get(str(value), str(value or "-"))
 
 

@@ -1,10 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
+  BaiduWebSearchMcpClient,
   mapWebSearchFreshness,
   normalizeMcpWebSearchResult,
 } from "../src/webSearchMcp.js";
 
 describe("Baidu web-search MCP adapter", () => {
+  it("uses the tool name advertised by the Baidu MCP server", () => {
+    const client = new BaiduWebSearchMcpClient({ endpoint: "https://example.com/mcp", token: "test" });
+
+    expect(client.configuredToolName).toBe("webSearch");
+  });
+
   it("maps the internal freshness vocabulary to Baidu values", () => {
     expect(mapWebSearchFreshness("any")).toBeUndefined();
     expect(mapWebSearchFreshness("recent")).toBe("pm");
@@ -60,6 +67,46 @@ describe("Baidu web-search MCP adapter", () => {
         snippet: "文本摘要",
         source_id: "https://example.com/text",
         url: "https://example.com/text",
+      },
+    ]);
+  });
+
+  it("parses Baidu Title/Content/URL text blocks", () => {
+    const result = normalizeMcpWebSearchResult(
+      {
+        content: [
+          {
+            type: "text",
+            text: [
+              "details:",
+              "Title:第一条结果",
+              "Content:第一条摘要",
+              "URL:https://example.com/first",
+              "details:",
+              "Title:第二条结果",
+              "Content:第二条摘要可以跨行",
+              "继续保留在摘要中。",
+              "URL:https://example.com/second",
+            ].join("\n"),
+          },
+        ],
+      },
+      { query: "测试", count: 2, toolName: "webSearch" },
+    );
+
+    expect(result.available).toBe(true);
+    expect(result.items).toEqual([
+      {
+        title: "第一条结果",
+        snippet: "第一条摘要",
+        source_id: "https://example.com/first",
+        url: "https://example.com/first",
+      },
+      {
+        title: "第二条结果",
+        snippet: "第二条摘要可以跨行\n继续保留在摘要中。",
+        source_id: "https://example.com/second",
+        url: "https://example.com/second",
       },
     ]);
   });

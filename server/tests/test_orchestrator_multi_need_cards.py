@@ -3,6 +3,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 from app.db.models import Product
+from app.domain.context_reference_resolver import ContextReferenceResolver
 from app.domain.intent_planner import PlannerStreamEvent
 from app.domain.image_retrieval_worker import ImageRetrievalEvidence
 from app.domain.need_slot_schemas import MultiNeedSelection, MultiNeedState, NeedSlot, SlotCandidate
@@ -75,7 +76,12 @@ def make_orchestrator() -> EcommerceOrchestrator:
     recorder._persist_run = lambda: None  # type: ignore[method-assign]
     recorder._persist_span = lambda *args, **kwargs: None  # type: ignore[method-assign]
     orchestrator.span_recorder = recorder
+    orchestrator.context_reference_resolver = ContextReferenceResolver()
     return orchestrator
+
+
+async def noop_memory_update(**kwargs) -> None:
+    return None
 
 
 def test_multi_need_product_cards_include_final_combo_and_alternatives_deduped() -> None:
@@ -522,7 +528,10 @@ def test_stream_stops_with_failure_text_when_intent_planner_retry_exhausted() ->
     orchestrator.evidence_cache = InMemoryEvidenceCache()
     orchestrator.trace_recorder = TraceRecorder()
     memory_updates: list[dict] = []
-    orchestrator._schedule_memory_update = lambda **kwargs: memory_updates.append(kwargs)
+    async def capture_memory_update(**kwargs) -> None:
+        memory_updates.append(kwargs)
+
+    orchestrator._schedule_memory_update = capture_memory_update
 
     events = asyncio.run(
         _collect(
@@ -553,7 +562,7 @@ def test_stream_emits_planner_agent_update_before_answer_token_and_sanitizes_tra
     orchestrator.evidence_cache = InMemoryEvidenceCache()
     orchestrator.trace_recorder = TraceRecorder()
     orchestrator.answer_generator = FakeAnswerGenerator()
-    orchestrator._schedule_memory_update = lambda **kwargs: None
+    orchestrator._schedule_memory_update = noop_memory_update
 
     events = asyncio.run(
         _collect(
@@ -589,7 +598,7 @@ def test_stream_context_reference_emits_product_cards() -> None:
     orchestrator.evidence_cache = InMemoryEvidenceCache()
     orchestrator.trace_recorder = TraceRecorder()
     orchestrator.answer_generator = FakeAnswerGenerator()
-    orchestrator._schedule_memory_update = lambda **kwargs: None
+    orchestrator._schedule_memory_update = noop_memory_update
 
     events = asyncio.run(
         _collect(
@@ -631,7 +640,7 @@ def test_vlm_unavailable_still_runs_image_retrieval(tmp_path) -> None:
         )
     )
     orchestrator.answer_generator = FakeAnswerGenerator()
-    orchestrator._schedule_memory_update = lambda **kwargs: None
+    orchestrator._schedule_memory_update = noop_memory_update
 
     events = asyncio.run(
         _collect(
@@ -686,7 +695,7 @@ def test_pure_image_fast_path_skips_planner(tmp_path) -> None:
         )
     )
     orchestrator.answer_generator = FakeAnswerGenerator()
-    orchestrator._schedule_memory_update = lambda **kwargs: None
+    orchestrator._schedule_memory_update = noop_memory_update
 
     events = asyncio.run(
         _collect(
@@ -749,7 +758,7 @@ def test_stream_multi_need_emits_product_cards_for_over_budget_combo() -> None:
     orchestrator.budget_manager = BudgetManager()
     orchestrator.trace_recorder = TraceRecorder()
     orchestrator.evidence_cache = InMemoryEvidenceCache()
-    orchestrator._schedule_memory_update = lambda **kwargs: None
+    orchestrator._schedule_memory_update = noop_memory_update
     task = TurnTaskState(user_id="u1", session_id="s1")
     request = ChatStreamRequest(user_id="u1", session_id="s1", message=state.original_query)
 
